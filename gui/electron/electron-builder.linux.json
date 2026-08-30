@@ -1,0 +1,18 @@
+{
+  "extends": "electron-builder.base.json",
+  "linux": {
+    "target": "AppImage",
+    "icon": "assets/icon.png"
+  },
+  "publish": {
+    "provider": "github",
+    "owner": "dchen8525-dev",
+    "repo": "kcp-proxy-cpp"
+  },
+  "extraResources": [
+    {
+      "from": "../../bin/linux/kcp-proxy-client",
+      "to": "kcp-proxy-client"
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>KCP Proxy Client 图标候选</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    background: #f3f4f8;
+    color: #1a1a1a;
+    padding: 32px;
+  }
+  h1 { font-size: 22px; margin-bottom: 6px; }
+  p.tip { color: #666; font-size: 13px; margin-bottom: 24px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+    max-width: 1100px;
+  }
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    text-align: center;
+  }
+  .card img.big { width: 128px; height: 128px; border-radius: 26px; }
+  .card h2 { font-size: 15px; margin: 14px 0 4px; }
+  .card .desc { font-size: 12px; color: #777; margin-bottom: 14px; }
+  .small { display: flex; align-items: flex-end; justify-content: center; gap: 18px;
+           padding: 10px; background: #e9ecf2; border-radius: 8px; }
+  .small figure { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .small figcaption { font-size: 10px; color: #889; }
+  .dark-strip { display: flex; align-items: center; justify-content: center; gap: 14px;
+                margin-top: 8px; padding: 10px; background: #20242e; border-radius: 8px; }
+</style>
+</head>
+<body>
+  <h1>KCP Proxy Client — 图标候选方案</h1>
+  <p class="tip">每张卡片：大图预览 → 浅色背景 32/16px（桌面/窗口）→ 深色任务栏 16px（托盘实际观感）。挑好后告诉我编号即可。</p>
+  <div class="grid" id="grid"></div>
+  <script>
+    const icons = [
+      { n: 1, name: '盾牌闪电',   desc: '安全代理 + 高速传输，蓝色渐变', f: '1-shield-bolt' },
+      { n: 2, name: '霓虹闪电',   desc: '深色底 + 青蓝渐变闪电，科技感', f: '2-bolt-dark' },
+      { n: 3, name: '疾速隧道',   desc: '双箭头「快进」，代理转发意象', f: '3-fast-tunnel' },
+      { n: 4, name: '节点网络',   desc: '三节点组网，KCP 链路意象', f: '4-node-mesh' },
+      { n: 5, name: '盾牌锁孔',   desc: '加密加固，紫色渐变', f: '5-shield-keyhole' },
+      { n: 6, name: 'K 字圆标',   desc: '现代圆润 K 字标志，蓝紫渐变', f: '6-k-monogram' },
+    ];
+    const grid = document.getElementById('grid');
+    for (const i of icons) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img class="big" src="${i.f}-512.png" alt="${i.name}">
+        <h2>${i.n}. ${i.name}</h2>
+        <div class="desc">${i.desc}</div>
+        <div class="small">
+          <figure><img src="${i.f}-32.png" width="32" height="32"><figcaption>32px</figcaption></figure>
+          <figure><img src="${i.f}-16.png" width="16" height="16"><figcaption>16px</figcaption></figure>
+        </div>
+        <div class="dark-strip">
+          <figure><img src="${i.f}-32.png" width="32" height="32"><figcaption style="color:#99a">32px</figcaption></figure>
+          <figure><img src="${i.f}-16.png" width="16" height="16"><figcaption style="color:#99a">16px</figcaption></figure>
+        </div>`;
+      grid.appendChild(card);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "kcp-proxy-cpp",
+  "version": "0.4.5",
+  "builtin-baseline": "c5a15727ee70fddf0296f0d8aafc3f58916fefac",
+  "dependencies": [
+    "asio",
+    "openssl",
+    "kcp",
+    {
+      "name": "fmt",
+      "version>=": "10.0.0"
+    }
+  ]
+}

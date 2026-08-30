@@ -1,0 +1,81 @@
+# Build output (CMake)
+build/
+
+# vcpkg (tool and installed packages)
+vcpkg/
+vcpkg_installed/
+
+# Pre-built binaries (deploy scripts live in scripts/, root start.sh/start.bat)
+bin/
+
+# IDE
+.idea/
+
+# Executables and artifacts (build dir only)
+build/*.exe
+build/*.out
+build/*.o
+build/*.obj
+build/*.a
+build/*.lib
+build/*.dll
+build/*.so
+build/*.dylib
+
+# CMake generated (inside build/, but listed for safety)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Logs
+*.log
+
+# Release artifacts (built by scripts/package-*.sh / *.ps1)
+dist/
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.ccls-cache/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+
+# OS
+.DS_Store
+Thumbs.db
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Temporary files created during testing
+*.tmp
+*.bak
+deploy_remote.py
+ssh_cmd.py
+update_service.py
+
+# Electron GUI
+gui/electron/dist/
+gui/electron/node_modules/
+gui/windows/KcpProxyGui/bin/
+gui/windows/KcpProxyGui/obj/
+
+# Release packages (keep only in releases)
+*.zip
+*.deb
+*.AppImage
+*.dmg
+*.rpm
+
+# Agent workspace memory (private to the AI assistant, not project source)
+.workbuddy/
+
+# Local deploy helper (contains server credentials; kept out of the repo)
+scripts/deploy/sshrun.py
+# Icon candidate scratch renderer (points at a machine-local node_modules)
+gui/electron/assets/icon-candidates/render.js

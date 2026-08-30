@@ -1,0 +1,8 @@
+# Shell scripts must use LF
+*.sh text eol=lf
+
+# Windows batch files use CRLF
+*.bat text eol=crlf
+
+# Default: auto-detect
+* text=auto

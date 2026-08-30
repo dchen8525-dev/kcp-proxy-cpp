@@ -1,0 +1,450 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  /* Light theme (Win11 style) */
+  --bg-color: #f5f5f5;
+  --card-bg: #ffffff;
+  --text-color: #1a1a1a;
+  --text-dim: #616161;
+  --border-color: #e0e0e0;
+  --accent-color: #0078d4;
+  --accent-hover: #106ebe;
+  --success-color: #107c10;
+  --danger-color: #d42c2c;
+  --danger-hover: #b82424;
+  --input-bg: #ffffff;
+  --input-border: #d0d0d0;
+  --input-focus: #0078d4;
+  --titlebar-bg: #ffffff;
+  --btn-secondary-bg: rgba(0, 0, 0, 0.05);
+  --btn-secondary-hover: rgba(0, 0, 0, 0.08);
+  --btn-secondary-text: #1a1a1a;
+}
+
+/* Dark mode (follows system preference) */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-color: #1f1f1f;
+    --card-bg: #2d2d2d;
+    --text-color: #e8e8e8;
+    --text-dim: #a0a0a0;
+    --border-color: #3f3f3f;
+    --accent-color: #4cc2ff;
+    --accent-hover: #6ecfff;
+    --success-color: #6ccb5f;
+    --danger-color: #ff5f56;
+    --danger-hover: #ff7b74;
+    --input-bg: #1a1a1a;
+    --input-border: #4a4a4a;
+    --input-focus: #4cc2ff;
+    --titlebar-bg: #2d2d2d;
+    --btn-secondary-bg: rgba(255, 255, 255, 0.08);
+    --btn-secondary-hover: rgba(255, 255, 255, 0.12);
+    --btn-secondary-text: #e8e8e8;
+  }
+}
+
+body {
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg-color);
+  color: var(--text-color);
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Custom title bar */
+.title-bar {
+  height: 32px;
+  background: var(--titlebar-bg);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-left: 12px;
+  border-bottom: 1px solid var(--border-color);
+  -webkit-app-region: drag;
+}
+
+.title-bar-drag {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.subtitle {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.title-bar-controls {
+  display: flex;
+  -webkit-app-region: no-drag;
+}
+
+.title-btn {
+  width: 46px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: var(--text-color);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.title-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.title-btn.close:hover {
+  background: #e81123;
+  color: white;
+}
+
+/* The white-square glyph renders smaller than ─ / ✕ at 12px */
+.title-btn.maximize {
+  font-size: 14px;
+}
+
+/* Container */
+.container {
+  padding: 16px;
+  height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+/* Cards */
+.card {
+  background: var(--card-bg);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
+/* Form elements */
+.form-group {
+  margin-bottom: 12px;
+}
+
+.form-group:last-child {
+  margin-bottom: 0;
+}
+
+.form-group label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.form-row {
+  display: flex;
+  gap: 12px;
+}
+
+.form-group.half {
+  flex: 1;
+}
+
+input[type="text"],
+input[type="password"] {
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--input-border);
+  border-radius: 4px;
+  font-size: 13px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input[type="text"]:focus,
+input[type="password"]:focus {
+  outline: none;
+  border-color: var(--input-focus);
+  box-shadow: 0 0 0 1px var(--input-focus);
+}
+
+input[type="text"]:disabled,
+input[type="password"]:disabled {
+  background: var(--btn-secondary-bg);
+  color: var(--text-dim);
+}
+
+/* Checkbox */
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.checkbox-label input[type="checkbox"] {
+  display: none;
+}
+
+.checkbox-custom {
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--input-border);
+  border-radius: 3px;
+  margin-right: 8px;
+  position: relative;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+
+.checkbox-label input[type="checkbox"]:checked + .checkbox-custom {
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.checkbox-label input[type="checkbox"]:checked + .checkbox-custom::after {
+  content: '✓';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: white;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+/* Buttons */
+.action-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  background: var(--card-bg);
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.button-group {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  height: 32px;
+  /* 12px keeps all four action labels on one line at the default 520px
+     window width (16px would squeeze 保存设置 onto two lines). */
+  padding: 0 12px;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s, opacity 0.15s;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent-color);
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-secondary {
+  background: var(--btn-secondary-bg);
+  color: var(--btn-secondary-text);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--btn-secondary-hover);
+}
+
+.btn-danger {
+  background: var(--danger-color);
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-hover);
+}
+
+/* Status indicator */
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+}
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: background-color 0.3s;
+}
+
+.status-dot.running {
+  background: var(--success-color);
+  box-shadow: 0 0 6px var(--success-color);
+}
+
+.status-text {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Traffic statistics */
+.traffic-indicator {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.traffic-up {
+  color: #107c10;
+}
+
+.traffic-down {
+  color: var(--accent-color);
+}
+
+@media (prefers-color-scheme: dark) {
+  .traffic-up {
+    color: #6ccb5f;
+  }
+}
+
+/* Log container */
+.log-card {
+  flex: 1;
+  min-height: 150px;
+  display: flex;
+  flex-direction: column;
+}
+
+.log-card.collapsed {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.log-card.collapsed .log-container {
+  display: none;
+}
+
+.log-toggle {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.log-chevron {
+  font-size: 11px;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+}
+
+.log-card.collapsed .log-chevron {
+  transform: rotate(-90deg);
+}
+
+.log-container {
+  flex: 1;
+  background: #1e1e1e;
+  border-radius: 4px;
+  padding: 8px;
+  overflow-y: auto;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #d4d4d4;
+  /* body disables user-select globally; log text must stay copyable */
+  user-select: text;
+  cursor: text;
+}
+
+.log-entry {
+  margin-bottom: 2px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-entry.info {
+  color: #d4d4d4;
+}
+
+.log-entry.warn {
+  color: #ffa500;
+}
+
+.log-entry.error {
+  color: #f48771;
+}
+
+/* Scrollbar */
+.log-container::-webkit-scrollbar {
+  width: 8px;
+}
+
+.log-container::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+.log-container::-webkit-scrollbar-thumb {
+  background: #4d4d4d;
+  border-radius: 4px;
+}
+
+.log-container::-webkit-scrollbar-thumb:hover {
+  background: #5d5d5d;
+}
+
+/* Responsive */
+@media (max-width: 500px) {
+  .form-row {
+    flex-direction: column;
+  }
+
+  .form-group.half {
+    width: 100%;
+  }
+}

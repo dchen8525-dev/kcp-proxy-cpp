@@ -1,0 +1,207 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # never abort an in-flight release
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache vcpkg
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/vcpkg
+            ${{ github.workspace }}/vcpkg
+          key: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-
+
+      - name: Build core
+        run: ./build.sh
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Compute version
+        id: ver
+        run: |
+          VERSION=$(sed -nE 's/.*VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -1)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          test "${{ steps.ver.outputs.VERSION }}" = "${GITHUB_REF_NAME#v}" \
+            || { echo "Tag ${GITHUB_REF_NAME} != CMakeLists version ${{ steps.ver.outputs.VERSION }}" >&2; exit 1; }
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Package DEB
+        run: |
+          sudo apt-get install -y dpkg-dev
+          python3 scripts/package/package.py deb --arch amd64
+
+      - name: Package CLI (tar.gz)
+        run: python3 scripts/package/package.py standalone --os linux --arch x64
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: gui/electron/package-lock.json
+
+      - name: Build Electron AppImage
+        run: |
+          cd gui/electron
+          npm install
+          npx electron-builder --config electron-builder.linux.json --publish never -c.extraMetadata.version=${{ steps.ver.outputs.VERSION }}
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-release
+          path: |
+            dist/releases/*/*.deb
+            dist/releases/*/*.tar.gz
+            dist/releases/*/SHA256SUMS
+            gui/electron/dist/*.AppImage
+            gui/electron/dist/latest-linux.yml
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache vcpkg
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.LOCALAPPDATA }}\vcpkg
+            ${{ github.workspace }}\vcpkg
+          key: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-
+
+      - name: Build core
+        run: .\build_vs.bat
+        shell: cmd
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # No 7-Zip / bash needed: packaging is pure Python stdlib (zipfile).
+      - name: Package CLI (zip)
+        run: python scripts/package/package.py standalone --os windows --arch x64
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(sed -nE 's/.*VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -1)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: gui/electron/package-lock.json
+
+      - name: Install npm dependencies
+        run: |
+          cd gui/electron
+          npm install
+
+      # PowerShell/cmd mangled the -c.<dot> config-override args (electron-builder
+      # tried to open '.extraMetadata.version=...' as a file); Git Bash passes them intact.
+      - name: Build NSIS installer
+        shell: bash
+        run: |
+          cd gui/electron
+          npx electron-builder --config electron-builder.win.json --publish never -c.directories.output=dist-nsis -c.extraMetadata.version=${{ steps.ver.outputs.VERSION }}
+
+      - name: Build portable exe
+        shell: bash
+        run: |
+          cd gui/electron
+          npx electron-builder --config electron-builder.portable.json --publish never -c.directories.output=dist-portable -c.extraMetadata.version=${{ steps.ver.outputs.VERSION }}
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release
+          path: |
+            dist/releases/*/*.zip
+            dist/releases/*/SHA256SUMS
+            gui/electron/dist-nsis/*.exe
+            gui/electron/dist-nsis/latest.yml
+            gui/electron/dist-nsis/*.blockmap
+            gui/electron/dist-portable/*.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-release
+          path: artifacts/linux
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-release
+          path: artifacts/windows
+
+      - name: Merge SHA256SUMS
+        run: find artifacts -name SHA256SUMS -exec cat {} \; > SHA256SUMS
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            V=$(sed -nE 's/.*VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt | head -1)
+            echo "VERSION=v${V}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/linux/**/*.deb
+            artifacts/linux/**/*.tar.gz
+            artifacts/linux/**/*.AppImage
+            artifacts/linux/**/latest-linux.yml
+            artifacts/windows/**/*.exe
+            artifacts/windows/**/latest.yml
+            artifacts/windows/**/*.blockmap
+            artifacts/windows/**/*.zip
+            SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

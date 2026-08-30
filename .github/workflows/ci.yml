@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake pkg-config
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgGitCommitId: c5a15727ee70fddf0296f0d8aafc3f58916fefac
+        vcpkgJsonGlob: '**/vcpkg.json'
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+
+    - name: Build
+      run: cmake --build build --config Release -j$(nproc)
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure
+        ./kcp_proxy_test
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: linux-binaries
+        path: |
+          build/kcp-proxy-server
+          build/kcp-proxy-client
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgGitCommitId: c5a15727ee70fddf0296f0d8aafc3f58916fefac
+        vcpkgJsonGlob: '**/vcpkg.json'
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+    - name: Build
+      run: cmake --build build --config Release --parallel
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest -C Release --output-on-failure
+        .\Release\kcp_proxy_test.exe
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: windows-binaries
+        path: |
+          build/Release/kcp-proxy-server.exe
+          build/Release/kcp-proxy-client.exe
+          build/vcpkg_installed/x64-windows/bin/*.dll
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: |
+        brew install cmake openssl
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgGitCommitId: c5a15727ee70fddf0296f0d8aafc3f58916fefac
+        vcpkgJsonGlob: '**/vcpkg.json'
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+
+    - name: Build
+      run: cmake --build build --config Release -j$(sysctl -n hw.ncpu)
+
+    - name: Run tests
+      run: |
+        cd build
+        ctest --output-on-failure
+        ./kcp_proxy_test
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: macos-binaries
+        path: |
+          build/kcp-proxy-server
+          build/kcp-proxy-client

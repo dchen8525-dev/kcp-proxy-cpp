@@ -1,0 +1,26 @@
+---
+Checks: >-
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-named-parameter,
+  -modernize-use-trailing-return-type,
+  -modernize-return-braced-init-list
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/'
+FormatStyle: file
+
+CheckOptions:
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: 0
+  - key: bugprone-easily-swappable-parameters.MinimumLength
+    value: 4
+  - key: modernize-use-nullptr.IgnoreMacros
+    value: 'true'
+  - key: performance-unnecessary-value-param.AllowSmartPointers
+    value: 'false'
+---

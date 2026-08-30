@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'">
+  <title>KCP Proxy Client</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Custom title bar -->
+  <div class="title-bar">
+    <div class="title-bar-drag">
+      <span class="title">KCP Proxy Client</span>
+      <span class="subtitle">SOCKS5 · 加密 KCP 通道</span>
+    </div>
+    <div class="title-bar-controls">
+      <button class="title-btn minimize" id="btn-minimize" title="最小化">─</button>
+      <button class="title-btn maximize" id="btn-maximize" title="最大化/还原">□</button>
+      <button class="title-btn close" id="btn-close" title="关闭">✕</button>
+    </div>
+  </div>
+
+  <!-- Main content -->
+  <div class="container">
+    <!-- Server settings card -->
+    <div class="card">
+      <div class="card-title">服务器</div>
+      <div class="form-group">
+        <label for="serverHost">地址 (IP/域名)</label>
+        <input type="text" id="serverHost" placeholder="例如: example.com">
+      </div>
+      <div class="form-row">
+        <div class="form-group half">
+          <label for="serverPort">端口</label>
+          <input type="text" id="serverPort" placeholder="8388">
+        </div>
+        <div class="form-group half">
+          <label for="localPort">本地 SOCKS 端口</label>
+          <input type="text" id="localPort" placeholder="1080">
+        </div>
+      </div>
+    </div>
+
+    <!-- Key settings card -->
+    <div class="card">
+      <div class="card-title">密钥</div>
+      <div class="form-group">
+        <label for="keySuffix">密钥后缀（完整密钥 = 北京日期 + 后缀）</label>
+        <input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线">
+      </div>
+    </div>
+
+    <!-- Action area: options (left) + action buttons (right); settings auto-save -->
+    <div class="action-row">
+      <div class="checkbox-row">
+        <label class="checkbox-label">
+          <input type="checkbox" id="autoStart">
+          <span class="checkbox-custom"></span>
+          <span>开机自启</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="autoReconnect">
+          <span class="checkbox-custom"></span>
+          <span>断线重连</span>
+        </label>
+      </div>
+      <div class="button-group">
+        <button class="btn btn-secondary" id="btn-test">测试连接</button>
+        <button class="btn btn-primary" id="btn-start">启动代理</button>
+        <button class="btn btn-danger" id="btn-stop" disabled>停止代理</button>
+      </div>
+    </div>
+
+    <!-- Status + traffic indicator -->
+    <div class="status-row">
+      <div class="status-indicator">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="status-text" id="status-text">未运行</span>
+      </div>
+      <div class="traffic-indicator" id="traffic-indicator" hidden>
+        <span class="traffic-up">↑ 0 B</span>
+        <span class="traffic-down">↓ 0 B</span>
+      </div>
+    </div>
+
+    <!-- Log card (expanded by default; click the title to toggle) -->
+    <div class="card log-card" id="log-card">
+      <div class="card-title log-toggle" id="log-toggle" title="点击展开/收起日志">
+        日志 <span class="log-chevron">▾</span>
+      </div>
+      <div class="log-container" id="log-container"></div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

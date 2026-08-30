@@ -1,0 +1,21 @@
+{
+  "appId": "com.kcp-proxy.gui",
+  "productName": "KCP Proxy Client",
+  "copyright": "Copyright © 2024 kcp-proxy",
+  "directories": {
+    "output": "dist"
+  },
+  "files": [
+    "main.js",
+    "utils.js",
+    "preload.js",
+    "renderer.js",
+    "index.html",
+    "styles.css",
+    "package.json",
+    "assets/*.png",
+    "assets/*.ico"
+  ],
+  "npmRebuild": false,
+  "removePackageScripts": true
+}

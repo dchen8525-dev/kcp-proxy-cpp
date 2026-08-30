@@ -1,0 +1,8 @@
+node_modules/
+dist/
+out/
+.DS_Store
+*.log
+
+# Code signing certificate (contains private key)
+cert.pfx

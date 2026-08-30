@@ -1,0 +1,45 @@
+{
+  "extends": "electron-builder.base.json",
+  "compression": "maximum",
+  "win": {
+    "target": "nsis",
+    "icon": "assets/icon.png",
+    "artifactName": "KCP-Proxy-Client-${version}-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "allowElevation": true,
+    "installerIcon": "assets/icon.ico",
+    "uninstallerIcon": "assets/icon.ico",
+    "installerHeaderIcon": "assets/icon.ico",
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "KCP Proxy Client",
+    "deleteAppDataOnUninstall": false,
+    "runAfterFinish": true,
+    "installerLanguages": ["zh_CN", "en_US"],
+    "language": "2052",
+    "unicode": true
+  },
+  "publish": {
+    "provider": "github",
+    "owner": "dchen8525-dev",
+    "repo": "kcp-proxy-cpp"
+  },
+  "extraResources": [
+    {
+      "from": "../../bin/windows/kcp-proxy-client.exe",
+      "to": "kcp-proxy-client.exe"
+    },
+    {
+      "from": "../../bin/windows/libcrypto-3-x64.dll",
+      "to": "libcrypto-3-x64.dll"
+    },
+    {
+      "from": "../../bin/windows/libssl-3-x64.dll",
+      "to": "libssl-3-x64.dll"
+    }
+  ]
+}

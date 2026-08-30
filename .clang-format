@@ -1,0 +1,46 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+TabWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+AlignAfterOpenBracket: Align
+PointerAlignment: Right
+ReferenceAlignment: Right
+DerivePointerAlignment: false
+SortIncludes: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"kcp_proxy/'
+    Priority: 1
+  - Regex: '^"(address|logger|crypto|config|socks5|server|client|byte_view|time_util|cli_helpers)'
+    Priority: 1
+  - Regex: '^<fmt/'
+    Priority: 2
+  - Regex: '^<asio'
+    Priority: 2
+  - Regex: '^<openssl/'
+    Priority: 2
+  - Regex: '^<'
+    Priority: 3
+  - Regex: '^"(ikcp.h)'
+    Priority: 4
+Standard: c++17
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortLambdasOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterControlStatement: Always
+  AfterFunction: true
+  AfterClass: true
+  AfterStruct: true
+  AfterEnum: true
+  BeforeElse: true
+BinPackArguments: false
+BinPackParameters: false
+DeriveLineEnding: true
+UseTab: Never
+---

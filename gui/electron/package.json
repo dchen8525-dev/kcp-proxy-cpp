@@ -1,0 +1,28 @@
+{
+  "name": "kcp-proxy-gui",
+  "version": "0.4.7",
+  "description": "KCP Proxy Client GUI",
+  "main": "main.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dchen8525-dev/kcp-proxy-cpp.git"
+  },
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --config electron-builder.win.json",
+    "build:portable": "electron-builder --config electron-builder.portable.json",
+    "build:linux": "electron-builder --config electron-builder.linux.json",
+    "test": "node --test",
+    "check": "node --check main.js && node --check preload.js && node --check renderer.js && node --check utils.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^24.9.1"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  }
+}

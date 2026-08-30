@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh KCP proxy daily key
+After=kcp-proxy-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart kcp-proxy-server.service
