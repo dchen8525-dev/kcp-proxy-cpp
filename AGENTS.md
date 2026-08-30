@@ -6,7 +6,7 @@
 >
 > **C++ Project Status**:
 > - ✅ KCP dependency migrated to vcpkg (no longer a Git submodule)
-> - ✅ Version unified to 0.3.0 across all config files
+> - ✅ Version unified to 0.0.1 across all config files
 > - ✅ CI configuration updated (removed submodule references)
 > - ✅ Build scripts updated (removed submodule initialization)
 > - ✅ Documentation updated and sanitized
