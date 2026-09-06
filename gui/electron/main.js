@@ -162,9 +162,21 @@ function createWindow() {
 
   mainWindow.loadFile('index.html');
 
-  // Show window when ready
+  // Show window when ready. Only a login-time launch (the registry Run entry
+  // passes --hidden) starts minimized to the tray; a normal launch must show
+  // the main window. Previously the check was on the autoStart *setting*,
+  // which kept the window hidden forever on every launch once auto-start was
+  // enabled — the app appeared to never open.
   mainWindow.once('ready-to-show', () => {
-    if (!store.get('autoStart')) {
+    if (process.argv.includes('--hidden')) {
+      if (!store.get('hasHiddenOnce')) {
+        tray?.displayBalloon({
+          title: 'KCP Proxy Client',
+          content: '程序已随系统启动并最小化到系统托盘，点击托盘图标可打开主界面'
+        });
+        store.set('hasHiddenOnce', true);
+      }
+    } else {
       mainWindow.show();
     }
   });
@@ -246,10 +258,12 @@ function createTray() {
     },
     { type: 'separator' },
     {
+      id: 'tray-start',
       label: '启动代理',
       click: () => startProxy()
     },
     {
+      id: 'tray-stop',
       label: '停止代理',
       click: () => stopProxy()
     },
@@ -561,10 +575,14 @@ function updateStatus(running) {
   tray?.setImage(statusIcon.resize({ width: 16, height: 16 }));
   tray?.setToolTip(running ? 'KCP Proxy Client (运行中)' : 'KCP Proxy Client (未运行)');
 
-  // Update tray menu (trayMenu holds the Menu instance; see note above)
+  // Update tray menu. Address items by id, not by array index: the template
+  // grows over time and index-based access silently toggles the wrong item
+  // after any edit (this is exactly what happened to items[2]/items[3]).
   if (trayMenu) {
-    trayMenu.items[2].enabled = !running; // Start
-    trayMenu.items[3].enabled = running;  // Stop
+    const startItem = trayMenu.getMenuItemById('tray-start');
+    const stopItem = trayMenu.getMenuItemById('tray-stop');
+    if (startItem) startItem.enabled = !running;
+    if (stopItem) stopItem.enabled = running;
   }
 }
 
@@ -664,7 +682,11 @@ function setAutoStart(enable) {
     const regKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
     if (enable) {
-      spawn('reg', ['add', regKey, '/v', 'KcpProxyGui', '/t', 'REG_SZ', '/d', `"${exePath}"`, '/f'], {
+      // Append --hidden so a login-time launch starts minimized to the tray.
+      // A normal (user-initiated) launch carries no flag and still shows the
+      // main window — the ready-to-show handler keys off the flag, not off
+      // the autoStart setting.
+      spawn('reg', ['add', regKey, '/v', 'KcpProxyGui', '/t', 'REG_SZ', '/d', `"${exePath}" --hidden`, '/f'], {
         windowsHide: true
       }).on('error', (err) => sendLog(`设置开机自启失败: ${err.message}`, 'error'));
       sendLog('已设置开机自启', 'info');
@@ -833,7 +855,9 @@ ipcMain.handle('test-connection', async (event, host, port) => {
 
   const validationError = validateLaunchConfig({
     serverHost: h,
-    serverPort: store.get('serverPort'),
+    serverPort: p, // validate the port the user actually asked to test —
+                   // previously this read the saved value, so an unsaved
+                   // port change was validated against the stale port.
     localPort: store.get('localPort'),
     keyMode: 'daily',
     keySuffix: store.get('keySuffix')

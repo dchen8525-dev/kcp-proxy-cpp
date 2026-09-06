@@ -46,6 +46,11 @@ public:
     // KCP send-queue depth, used by the client's upstream backpressure.
     int wait_send() const { return kcp_.wait_send(); }
 
+    // Opaque external keepalive: whatever is assigned here is released
+    // together with the session, so owners can attach RAII resources (e.g. a
+    // session-cap ticket) without having to track every teardown path.
+    void set_keepalive(std::shared_ptr<void> keep) { keepalive_ = std::move(keep); }
+
     const asio::ip::udp::endpoint& server_addr() const { return server_addr_; }
 
     // Per-session strand so the client can run forwarding loops / KCP-state
@@ -85,6 +90,9 @@ private:
 
     // Reusable buffers to avoid per-packet heap allocation. The socket is
     // connect()ed to server_addr_, so receive() filters out foreign sources.
+    // External RAII resources attached via set_keepalive(); destroyed with the
+    // session so reference counting stays tied to real session lifetime.
+    std::shared_ptr<void> keepalive_;
     std::vector<uint8_t> udp_recv_buf_ = std::vector<uint8_t>(UDP_RECV_BUF_SIZE);
     // Fixed-size KCP recv buffer (avoid heap allocation on the hot path).
     alignas(64) std::array<uint8_t, FWD_BUF_SIZE> kcp_recv_buf_{};

@@ -20,11 +20,14 @@ KcpWrapper::KcpWrapper(uint32_t conv) {
 
 KcpWrapper::~KcpWrapper() {
     if (kcp_) {
-        // Detach the output callback BEFORE release so that any flush ikcp may
-        // perform during teardown can never re-enter our (already destroyed)
-        // std::function. Skywind3000's ikcp_release calls ikcp_flush internally,
-        // which would otherwise reach our c_output trampoline.
-        ikcp_setoutput(kcp_, nullptr);
+        // Neutralize the C++ callback BEFORE release, but keep the output
+        // function pointer installed. If this ikcp build flushes during
+        // teardown (some forks call ikcp_flush from ikcp_release), a cleared
+        // output pointer would trip ikcp's assert(kcp->output)/null-call;
+        // the static c_output trampoline with an empty output_cb_ is a safe
+        // no-op in every case, so teardown can never re-enter a destroyed
+        // std::function nor a null output function.
+        output_cb_ = nullptr;
         ikcp_release(kcp_);
         kcp_ = nullptr;
     }

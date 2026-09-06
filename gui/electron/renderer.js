@@ -201,13 +201,23 @@ async function startProxy() {
   }
 
   appendLog('正在启动代理...', 'info');
-  await window.electronAPI.startProxy();
+  try {
+    await window.electronAPI.startProxy();
+  } catch (err) {
+    // IPC failures (e.g. the client binary is missing) must surface in the
+    // UI instead of becoming an unhandled rejection with a dead button.
+    appendLog(`启动失败: ${err && err.message ? err.message : err}`, 'error');
+  }
 }
 
 // Stop proxy
 async function stopProxy() {
   appendLog('正在停止代理...', 'info');
-  await window.electronAPI.stopProxy();
+  try {
+    await window.electronAPI.stopProxy();
+  } catch (err) {
+    appendLog(`停止操作失败: ${err && err.message ? err.message : err}`, 'error');
+  }
 }
 
 // Update UI status

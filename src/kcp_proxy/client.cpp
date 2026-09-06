@@ -148,6 +148,24 @@ void KCPProxyClient::do_accept() {
 void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socket) {
     auto client = std::make_shared<asio::ip::tcp::socket>(std::move(client_socket));
 
+    // Session-cap guard. The ticket is attached to the KCP session via
+    // set_keepalive(), so the counter drops exactly when the session object
+    // is destroyed — no matter which teardown path ran (handshake failure,
+    // EOF, error, idle timeout).
+    if (active_sessions_.fetch_add(1, std::memory_order_relaxed) >=
+        MAX_CLIENT_SESSIONS) {
+        active_sessions_.fetch_sub(1, std::memory_order_relaxed);
+        LOG_WARNING("client", "connection limit reached (" +
+                    std::to_string(MAX_CLIENT_SESSIONS) + "), refusing connection");
+        std::error_code ignored;
+        client->close(ignored);
+        return;
+    }
+    auto session_ticket = std::shared_ptr<void>(
+        &active_sessions_, [](std::atomic<size_t>* counter) {
+            counter->fetch_sub(1, std::memory_order_relaxed);
+        });
+
     // Non-throwing overload: a local app that connects and immediately resets
     // the connection can make remote_endpoint() fail. The throwing overload
     // would propagate through io.run() and kill the entire proxy (all tunnels)
@@ -177,6 +195,8 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                                             Crypto::generate_session_salt());
     auto session = std::make_shared<KCPClientSession>(
         io_, server_endpoint_, crypto);
+    // Tie the session-cap ticket to the session's lifetime (see above).
+    session->set_keepalive(session_ticket);
 
     auto self = shared_from_this();
 
@@ -198,10 +218,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         if (handshake_cancelled->load()) return;
         if (!ok) {
             LOG_ERROR("client", "KCP connect failed");
-            handshake_cancelled->store(true);
-            std::error_code ignored;
-            handshake_deadline->cancel(ignored);
-            client->close(ignored);
+            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
             return;
         }
         LOG_INFO("client", "KCP session connected, reading SOCKS5 greeting");
@@ -213,9 +230,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                 if (handshake_cancelled->load()) return;
                 if (ec) {
                     LOG_DEBUG("client", "read greet header error (" + sock_err(ec) + ")");
-                    handshake_cancelled->store(true);
-                    std::error_code ignored;
-                    handshake_deadline->cancel(ignored);
+                    abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                     return;
                 }
                 uint8_t ver = (*greet_buf)[0];
@@ -229,10 +244,8 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                     (*ver_resp)[0] = 0x00;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
-                        [client, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
-                            handshake_cancelled->store(true);
-                            std::error_code ignored;
-                            handshake_deadline->cancel(ignored);
+                        [this, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
+                            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                         });
                     return;
                 }
@@ -242,10 +255,8 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                     (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
-                        [client, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
-                            handshake_cancelled->store(true);
-                            std::error_code ignored;
-                            handshake_deadline->cancel(ignored);
+                        [this, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
+                            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                         });
                     return;
                 }
@@ -257,9 +268,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                         if (handshake_cancelled->load()) return;
                         if (ec2) {
                             LOG_DEBUG("client", "read methods error (" + sock_err(ec2) + ")");
-                            handshake_cancelled->store(true);
-                            std::error_code ignored;
-                            handshake_deadline->cancel(ignored);
+                            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                             return;
                         }
 
@@ -273,9 +282,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                                 if (handshake_cancelled->load()) return;
                                 if (ec3) {
                                     LOG_DEBUG("client", "send greeting error (" + sock_err(ec3) + ")");
-                                    handshake_cancelled->store(true);
-                                    std::error_code ignored;
-                                    handshake_deadline->cancel(ignored);
+                                    abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                                     return;
                                 }
                                 read_socks5_request(client, session, handshake_deadline, handshake_cancelled);
@@ -298,9 +305,7 @@ void KCPProxyClient::read_socks5_request(
             if (handshake_cancelled->load()) return;
             if (ec) {
                 LOG_DEBUG("client", "read request header error (" + sock_err(ec) + ")");
-                handshake_cancelled->store(true);
-                std::error_code ignored;
-                handshake_deadline->cancel(ignored);
+                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                 return;
             }
 
@@ -313,9 +318,7 @@ void KCPProxyClient::read_socks5_request(
 
             if (version != SOCKS5_VERSION) {
                 LOG_ERROR("client", "bad version: " + std::to_string(version));
-                handshake_cancelled->store(true);
-                std::error_code ignored;
-                handshake_deadline->cancel(ignored);
+                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                 return;
             }
 
@@ -328,9 +331,7 @@ void KCPProxyClient::read_socks5_request(
             else if (atyp == SOCKS5_ATYP_IPV6) addr_bytes = 18;
             else {
                 LOG_ERROR("client", "bad atyp: " + std::to_string(atyp));
-                handshake_cancelled->store(true);
-                std::error_code ignored;
-                handshake_deadline->cancel(ignored);
+                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                 return;
             }
 
@@ -341,9 +342,7 @@ void KCPProxyClient::read_socks5_request(
                     if (handshake_cancelled->load()) return;
                     if (ec2) {
                         LOG_DEBUG("client", "read addr error (" + sock_err(ec2) + ")");
-                        handshake_cancelled->store(true);
-                        std::error_code ignored;
-                        handshake_deadline->cancel(ignored);
+                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                         return;
                     }
 
@@ -359,9 +358,7 @@ void KCPProxyClient::read_socks5_request(
                         uint8_t dlen = (*addr_buf)[0];
                         if (dlen == 0) {
                             LOG_ERROR("client", "empty domain in SOCKS5 request");
-                            handshake_cancelled->store(true);
-                            std::error_code ignored;
-                            handshake_deadline->cancel(ignored);
+                            abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                             return;
                         }
                         auto domain_buf = std::make_shared<std::vector<uint8_t>>(dlen + 2);
@@ -371,9 +368,7 @@ void KCPProxyClient::read_socks5_request(
                                 if (handshake_cancelled->load()) return;
                                 if (ec3) {
                                     LOG_DEBUG("client", "read domain error (" + sock_err(ec3) + ")");
-                                    handshake_cancelled->store(true);
-                                    std::error_code ignored;
-                                    handshake_deadline->cancel(ignored);
+                                    abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                                     return;
                                 }
                                 std::string h(domain_buf->data(), domain_buf->data() + dlen);
@@ -396,10 +391,13 @@ void KCPProxyClient::handle_sync_request(
 
     if (cmd != SOCKS5_CMD_CONNECT) {
         LOG_WARNING("client", "unsupported SOCKS5 cmd: " + std::to_string(cmd));
-        send_socks5_error(client_socket, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
-        handshake_cancelled->store(true);
-        std::error_code ignored;
-        handshake_deadline->cancel(ignored);
+        // The deadline stays armed while the error reply is in flight: if the
+        // local app stops reading, the reply write can stall forever, and the
+        // deadline is what closes the session in that case.
+        send_socks5_error(client_socket, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED,
+            [this, client_socket, session, handshake_deadline, handshake_cancelled] {
+                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+            });
         return;
     }
 
@@ -424,21 +422,25 @@ void KCPProxyClient::handle_sync_request(
         [this, client_socket, session, reply_buf, handshake_start, handshake_deadline, handshake_cancelled, self]
         (const std::error_code& ec, size_t bytes) {
             if (handshake_cancelled->load()) return;
+            // Send the error reply, then release the session once the write
+            // settles. The deadline stays armed during the reply write so a
+            // stalled write (local app stopped reading) is still cleaned up.
+            auto fail_with_reply = [this, client_socket, session, handshake_deadline,
+                                    handshake_cancelled](uint8_t reply) {
+                send_socks5_error(client_socket, reply,
+                    [this, client_socket, session, handshake_deadline, handshake_cancelled] {
+                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                    });
+            };
             if (ec || bytes == 0) {
                 LOG_ERROR("client", "recv SOCKS5 reply error: " + ec.message());
-                send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE);
-                handshake_cancelled->store(true);
-                std::error_code ignored;
-                handshake_deadline->cancel(ignored);
+                fail_with_reply(SOCKS5_REPLY_GENERAL_FAILURE);
                 return;
             }
 
             if (bytes < 2) {
                 LOG_ERROR("client", "SOCKS5 reply too short");
-                send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE);
-                handshake_cancelled->store(true);
-                std::error_code ignored;
-                handshake_deadline->cancel(ignored);
+                fail_with_reply(SOCKS5_REPLY_GENERAL_FAILURE);
                 return;
             }
 
@@ -448,10 +450,7 @@ void KCPProxyClient::handle_sync_request(
 
             if (reply_code != SOCKS5_REPLY_SUCCEEDED) {
                 LOG_WARNING("client", "SOCKS5 reply failed: " + std::to_string(reply_code));
-                send_socks5_error(client_socket, reply_code);
-                handshake_cancelled->store(true);
-                std::error_code ignored;
-                handshake_deadline->cancel(ignored);
+                fail_with_reply(reply_code);
                 return;
             }
 
@@ -631,13 +630,36 @@ void KCPProxyClient::forward_kcp_to_client(
 }
 
 void KCPProxyClient::send_socks5_error(
-    std::shared_ptr<asio::ip::tcp::socket> client_socket, uint8_t reply) {
+    std::shared_ptr<asio::ip::tcp::socket> client_socket, uint8_t reply,
+    std::function<void()> on_complete) {
     LOG_WARNING("client", "sending SOCKS5 error reply: " + std::to_string(reply));
     SOCKS5Response resp;
     resp.reply = reply;
     auto data = std::make_shared<std::vector<uint8_t>>(resp.build());
     asio::async_write(*client_socket, asio::buffer(*data),
-        [client_socket, data](const std::error_code&, size_t) {});
+        [client_socket, data, on_complete = std::move(on_complete)](const std::error_code&, size_t) {
+            // Best-effort reply: whatever the write outcome, the caller's
+            // cleanup callback must run so the session is always released.
+            if (on_complete) on_complete();
+        });
+}
+
+void KCPProxyClient::abort_handshake(
+    std::shared_ptr<asio::ip::tcp::socket> client_socket,
+    std::shared_ptr<KCPClientSession> session,
+    std::shared_ptr<asio::steady_timer> handshake_deadline,
+    std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
+    // Idempotent: several failure paths can converge here (e.g. the deadline
+    // fired while an error reply was still being written). The loser of the
+    // cancelled-flag race returns immediately. Mark cancelled first so
+    // in-flight handlers bail out, then cancel the deadline, then close BOTH
+    // ends — the KCP session owns the UDP socket and update timer, so closing
+    // it releases everything the handshake allocated.
+    if (handshake_cancelled->exchange(true)) return;
+    std::error_code ignored;
+    handshake_deadline->cancel(ignored);
+    if (client_socket) client_socket->close(ignored);
+    if (session) session->close();
 }
 
 } // namespace kcp_proxy

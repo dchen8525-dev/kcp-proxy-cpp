@@ -26,7 +26,7 @@ const SUFFIX_RE = /^[A-Za-z0-9._-]{8,128}$/;
 const FIXED_KEY_RE = /^[\x21-\x7e]{16,256}$/;
 
 function formatBytes(bytes) {
-  if (!bytes) return '0 B';
+  if (!bytes || bytes <= 0) return '0 B'; // 0, negative, NaN -> '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const value = bytes / Math.pow(1024, i);

@@ -23,6 +23,11 @@ constexpr int KCP_KEEPALIVE_SEC = 30;
 // peers are allowed to allocate a session. The hard cap also bounds total
 // memory if a fleet of legitimate clients is overwhelming us.
 constexpr size_t MAX_CONCURRENT_SESSIONS = 4096;
+// Client-side cap on concurrent SOCKS5 connections. The client spawns one KCP
+// session + UDP socket per local TCP connection with no other bound; without
+// this cap, a busy (or malfunctioning) local app can exhaust file descriptors
+// and memory, amplifying any session leak. Mirrors the server-side guard.
+constexpr size_t MAX_CLIENT_SESSIONS = 512;
 // Global budget on new-session authentication attempts per second. Unknown
 // sources are only ever charged a full AEAD decrypt here, so a garbage UDP
 // flood must not be able to pin the server's CPU on decrypts. 500 legitimate

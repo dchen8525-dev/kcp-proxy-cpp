@@ -121,11 +121,15 @@ bool is_restricted_target(const asio::ip::address& addr) {
         if (o0 == 169 && o1 == 254) return true;               // 169.254.0.0/16
         if (o0 == 172 && (o1 & 0xF0) == 16) return true;       // 172.16.0.0/12
         if (o0 == 192 && o1 == 168) return true;               // 192.168.0.0/16
-        if (o0 == 192 && o1 == 0 && o2 <= 2) return true;      // 192.0.0.0/24 + 192.0.2.0/24
+        // 192.0.0.0/24 (IETF protocol assignments) and 192.0.2.0/24
+        // (TEST-NET-1). Note o2 must be exactly 0 or 2 — the previous
+        // `o2 <= 2` also swallowed 192.0.1.0/24, which is globally routable.
+        if (o0 == 192 && o1 == 0 && (o2 == 0 || o2 == 2)) return true;
+        if (o0 == 192 && o1 == 88 && o2 == 99) return true;    // 192.88.99.0/24 6to4 relay anycast (deprecated)
         if (o0 == 198 && (o1 == 18 || o1 == 19)) return true;  // 198.18.0.0/15
         if (o0 == 198 && o1 == 51 && o2 == 100) return true;   // 198.51.100.0/24
         if (o0 == 203 && o1 == 0 && o2 == 113) return true;    // 203.0.113.0/24
-        if (o0 == 255) return true;                            // 255.255.255.255/32
+        if (o0 >= 240) return true;                            // 240.0.0.0/4 reserved (class E)
         return false;
     }
     if (addr.is_v6()) {

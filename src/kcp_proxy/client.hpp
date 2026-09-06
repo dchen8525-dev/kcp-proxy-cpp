@@ -6,6 +6,7 @@
 #include <asio.hpp>
 #include <atomic>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -47,6 +48,8 @@ private:
     asio::steady_timer traffic_timer_;
     std::atomic<bool> running_{false};
     std::atomic<bool> start_failed_{false};
+    // Live SOCKS5 connections, enforced against MAX_CLIENT_SESSIONS.
+    std::atomic<size_t> active_sessions_{0};
 
     void do_resolve();
     void do_accept();
@@ -54,6 +57,17 @@ private:
     // context so main() can exit with a non-zero code instead of hanging.
     void fail_startup(const std::string& message);
     void handle_client_connection(asio::ip::tcp::socket client_socket);
+
+    // Tear down a failed SOCKS5 handshake: mark cancelled, cancel the deadline
+    // timer, and close BOTH the local TCP socket and the KCP session. Every
+    // handshake failure path must go through this — previously the failure
+    // paths only cancelled the deadline, whose callback was the sole cleanup
+    // owner and returns early on operation_aborted, so the KCP session (plus
+    // its UDP socket and update timer) leaked until the idle timeout.
+    void abort_handshake(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                         std::shared_ptr<KCPClientSession> session,
+                         std::shared_ptr<asio::steady_timer> handshake_deadline,
+                         std::shared_ptr<std::atomic<bool>> handshake_cancelled);
 
     void start_traffic_reporter();
     void report_traffic();
@@ -78,7 +92,8 @@ private:
                                std::shared_ptr<std::vector<uint8_t>> buf = {});
 
     void send_socks5_error(std::shared_ptr<asio::ip::tcp::socket> client_socket,
-                           uint8_t reply);
+                           uint8_t reply,
+                           std::function<void()> on_complete = {});
 };
 
 } // namespace kcp_proxy
