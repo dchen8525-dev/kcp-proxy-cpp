@@ -30,7 +30,8 @@ KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host,
     : io_(io), server_host_(std::move(server_host)), server_port_(server_port),
       key_(std::move(key)), listen_host_(std::move(listen_host)),
       listen_port_(listen_port),
-      tcp_acceptor_(io_), udp_resolver_(io_), traffic_timer_(io) {
+      tcp_acceptor_(io_), udp_resolver_(io_), traffic_timer_(io),
+      update_tick_timer_(io) {
 }
 
 KCPProxyClient::~KCPProxyClient() {
@@ -46,6 +47,7 @@ void KCPProxyClient::stop() {
     running_ = false;
     std::error_code ec;
     tcp_acceptor_.close(ec);
+    update_tick_timer_.cancel(ec);
     LOG_INFO("client", "stopped");
     wipe_key();
 }
@@ -123,6 +125,9 @@ void KCPProxyClient::do_resolve() {
                      listen_host_ + ":" + std::to_string(listen_port_));
 
             start_traffic_reporter();
+            // Start the shared KCP update tick (one 10ms timer for all
+            // client sessions).
+            do_update_tick(std::error_code{});
             do_accept();
         });
 }
@@ -143,6 +148,48 @@ void KCPProxyClient::do_accept() {
             handle_client_connection(std::move(socket));
             do_accept();
         });
+}
+
+void KCPProxyClient::do_update_tick(const std::error_code& ec) {
+    if (ec || !running_.load()) return;
+
+    // Re-arm FIRST so the 10ms cadence is independent of the snapshot and
+    // dispatch work below. The timer chain also pins the client (via self)
+    // in the io_context for as long as it runs.
+    update_tick_timer_.expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS));
+    auto self = shared_from_this();
+    update_tick_timer_.async_wait([this, self](const std::error_code& e) {
+        do_update_tick(e);
+    });
+
+    // Snapshot + prune: copy weak refs out under the lock and drop entries
+    // whose session object is already destroyed. This doubles as the only
+    // deregistration mechanism, so no teardown path needs a cleanup hook.
+    tick_snapshot_.clear();
+    {
+        std::unique_lock<std::shared_mutex> lock(tick_sessions_mutex_);
+        tick_snapshot_.reserve(tick_sessions_.size());
+        for (auto it = tick_sessions_.begin(); it != tick_sessions_.end();) {
+            if (it->second.expired()) {
+                it = tick_sessions_.erase(it);
+            } else {
+                tick_snapshot_.push_back(it->second);
+                ++it;
+            }
+        }
+    }
+
+    // Dispatch without holding the lock. Each handler re-locks its weak_ptr
+    // inside the session strand, so a session destroyed while queued is
+    // skipped and never kept alive artificially by the tick.
+    for (const auto& w : tick_snapshot_) {
+        if (auto session = w.lock()) {
+            std::weak_ptr<KCPClientSession> ws = session;
+            asio::dispatch(session->strand(), [ws]() mutable {
+                if (auto s = ws.lock()) s->on_update_tick();
+            });
+        }
+    }
 }
 
 void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socket) {
@@ -197,6 +244,14 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         io_, server_endpoint_, crypto);
     // Tie the session-cap ticket to the session's lifetime (see above).
     session->set_keepalive(session_ticket);
+    // Register for the shared KCP update tick. Weak ref only: the entry
+    // expires with the session object and is pruned by the next tick, so
+    // every teardown path (handshake failure, EOF, idle timeout, stop) is
+    // covered without an explicit deregistration hook.
+    {
+        std::unique_lock<std::shared_mutex> lock(tick_sessions_mutex_);
+        tick_sessions_[session.get()] = session;
+    }
 
     auto self = shared_from_this();
 

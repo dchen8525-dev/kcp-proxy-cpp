@@ -17,7 +17,6 @@ KCPClientSession::KCPClientSession(asio::io_context& io,
       server_addr_(std::move(server_addr)),
       crypto_(std::move(crypto)),
       kcp_(conv),
-      update_timer_(strand_),
       connect_timer_(strand_) {
     last_activity_us_.store(now_us());
     last_rx_us_.store(now_us());
@@ -72,7 +71,6 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
         connect_pending_.store(true);
         touch_activity();
 
-        do_update(std::error_code{});
         do_udp_receive();
 
         auto ack_buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
@@ -164,7 +162,6 @@ void KCPClientSession::on_close() {
     connect_pending_.store(false);
 
     std::error_code ignored;
-    update_timer_.cancel(ignored);
     connect_timer_.cancel(ignored);
 
     try {
@@ -252,8 +249,8 @@ void KCPClientSession::on_async_read_some(asio::mutable_buffer buffer,
     try_fulfill_read();
 }
 
-void KCPClientSession::do_update(const std::error_code& ec) {
-    if (ec || !running_.load()) return;
+void KCPClientSession::on_update_tick() {
+    if (!running_.load()) return;
 
     // Session-level liveness. KCP never times out on the client side: without
     // this, a server crash or a key rotation on the server leaves the local app
@@ -275,7 +272,7 @@ void KCPClientSession::do_update(const std::error_code& ec) {
     kcp_.flush();
     if (pending_read_handler_) try_fulfill_read();
 
-    // Application-layer keepalive (see KCPSession::do_update for rationale).
+    // Application-layer keepalive (see KCPSession::on_update_tick for rationale).
     // Fixed cadence, independent of received activity: a healthy peer must
     // always hear from us every KCP_KEEPALIVE_SEC or its idle sweep would reap
     // our session even though the tunnel is fine.
@@ -293,13 +290,11 @@ void KCPClientSession::do_update(const std::error_code& ec) {
         }
     }
 
-    // Fixed 10ms cadence (see KCPSession::do_update for why we don't use
-    // ikcp_check to sleep longer when idle).
-    update_timer_.expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS));
-    auto self = shared_from_this();
-    update_timer_.async_wait([self](const std::error_code& e) {
-        self->do_update(e);
-    });
+    // Re-arm is NOT done here: this method is driven by KCPProxyClient's
+    // single shared 10ms tick timer (do_update_tick), which collapses N
+    // per-session timer-heap entries into one. Fixed 10ms cadence -- we
+    // intentionally do NOT use ikcp_check to sleep longer when idle (see
+    // KCPSession::on_update_tick).
 }
 
 void KCPClientSession::do_udp_receive() {

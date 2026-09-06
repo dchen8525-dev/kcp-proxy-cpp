@@ -29,7 +29,8 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
     : io_(io), port_(port), host_(std::move(host)),
       key_(key),
       udp_socket_(io_),
-      cleanup_timer_(io_) {}
+      cleanup_timer_(io_),
+      update_tick_timer_(io_) {}
 
 KCPServer::~KCPServer() {
     stop();
@@ -67,6 +68,9 @@ void KCPServer::start() {
         do_cleanup(ec);
     });
 
+    // Start the shared KCP update tick (10ms, one timer for all sessions).
+    do_update_tick(std::error_code{});
+
     LOG_INFO("server", "listening on " + host_ + ":" + std::to_string(port_));
     LOG_INFO("server", "diagnostics udp_bind=" + host_ +
              " udp_port=" + std::to_string(port_) +
@@ -89,6 +93,7 @@ void KCPServer::stop() {
     std::error_code ignored;
     udp_socket_.close(ignored);
     cleanup_timer_.cancel(ignored);
+    update_tick_timer_.cancel(ignored);
 
     std::unordered_map<std::string, std::shared_ptr<KCPSession>> drained_sessions;
     std::unordered_map<std::string, ClientConnection> drained_conns;
@@ -686,7 +691,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         // When the upstream target closes, keep the session alive
                         // until the target data already queued in KCP's send
                         // buffer has been delivered to the client (see
-                        // handle_target_closed / KCPSession::do_update), then
+                        // handle_target_closed / KCPSession::on_update_tick), then
                         // close. This prevents truncating large responses whose
                         // tail is still in flight when the target closes.
                         session->set_drained_callback([this, sid]() {
@@ -999,6 +1004,47 @@ void KCPServer::close_connection(const std::string& session_id, const char* call
     }
     if (session_to_stop) {
         session_to_stop->stop();
+    }
+}
+
+void KCPServer::do_update_tick(const std::error_code& ec) {
+    if (ec || !running_) return;
+
+    // Re-arm FIRST: the 10ms cadence must not stretch by the snapshot +
+    // dispatch work below. The single timer chain also pins the server
+    // (via self) in the io_context for as long as it runs.
+    update_tick_timer_.expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS));
+    auto self = shared_from_this();
+    update_tick_timer_.async_wait([this, self](const std::error_code& e) {
+        do_update_tick(e);
+    });
+
+    // Phase 1: snapshot weak refs under the shared lock. Copying weak_ptr is
+    // cheap and the lock is held only for the copy, so the UDP receive path
+    // (which inserts sessions) and the cleanup sweep (which erases them)
+    // never wait behind per-session dispatches.
+    tick_snapshot_.clear();
+    {
+        std::shared_lock<std::shared_mutex> lock(sessions_mutex_);
+        tick_snapshot_.reserve(sessions_.size());
+        for (const auto& [sid, session] : sessions_) {
+            tick_snapshot_.emplace_back(session);
+        }
+    }
+
+    // Phase 2: dispatch WITHOUT holding the lock. lock() on a dead weak_ptr
+    // (session erased since the snapshot) returns null and is skipped, so a
+    // session dying mid-tick can neither crash the tick nor be resurrected.
+    // The dispatched handler re-locks inside the session strand: capture by
+    // weak_ptr so a session queued behind a congested strand is not kept
+    // alive artificially by the tick.
+    for (const auto& w : tick_snapshot_) {
+        if (auto session = w.lock()) {
+            std::weak_ptr<KCPSession> ws = session;
+            asio::dispatch(session->strand(), [ws]() mutable {
+                if (auto s = ws.lock()) s->on_update_tick();
+            });
+        }
     }
 }
 

@@ -43,6 +43,12 @@ public:
     void start();
     void stop();
 
+    // One KCP update/flush/keepalive cycle. Runs ONLY inside strand_. Public
+    // solely so KCPServer's shared update tick (do_update_tick) can invoke
+    // it after dispatching onto the session strand; nothing else should call
+    // it -- the tick owns the cadence.
+    void on_update_tick();
+
     // Inputs may be called from any io_context thread; the body is dispatched
     // onto the per-session strand so KCP itself never sees concurrent access.
     // `after` (if set) runs on the strand immediately after the packet has been
@@ -103,7 +109,7 @@ public:
     // session must stay alive until that data is delivered to the client
     // (wait_send() == 0); tearing down early would drop it and truncate the
     // stream. mark_target_closed() records the condition and the drained
-    // callback (if set) is invoked once by do_update when the buffer drains.
+    // callback (if set) is invoked once by on_update_tick when the buffer drains.
     bool is_target_closed() const { return target_closed_.load(); }
     void mark_target_closed() { target_closed_.store(true); }
     void set_drained_callback(std::function<void()> cb) { drained_cb_ = std::move(cb); }
@@ -139,7 +145,10 @@ private:
     std::function<void(std::vector<uint8_t>)> send_callback_;
 
     KcpWrapper kcp_;
-    asio::steady_timer update_timer_;
+    // NOTE: there is intentionally NO per-session update timer here. KCP
+    // updates are driven by KCPServer's single shared 10ms tick (see
+    // do_update_tick), which collapses 4096 per-session timer-heap entries
+    // into one timer. on_update_tick() below runs inside strand_ only.
 
     // Packed atomic flags to reduce cache line contention
     std::atomic<uint8_t> state_flags_{0};
@@ -162,7 +171,7 @@ private:
     // Set once the upstream target TCP connection has closed (see
     // is_target_closed()/mark_target_closed()). While it is set, the session
     // keeps flushing queued target data to the client and does not start the
-    // client->target forward loop; do_update invokes drained_cb_ once the KCP
+    // client->target forward loop; on_update_tick invokes drained_cb_ once the KCP
     // send buffer empties.
     std::atomic<bool> target_closed_{false};
     std::function<void()> drained_cb_;
@@ -185,7 +194,6 @@ private:
     void on_send(byte_view data);
     void on_async_read_some(asio::mutable_buffer buffer,
                             std::function<void(std::error_code, size_t)> handler);
-    void do_update(const std::error_code& ec);
     void handle_kcp_output(byte_view data);
     void try_fulfill_read();
 

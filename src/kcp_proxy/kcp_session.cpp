@@ -18,8 +18,7 @@ KCPSession::KCPSession(asio::io_context& io, uint32_t conv,
       session_id_(std::move(session_id)),
       remote_addr_(std::move(remote_addr)),
       crypto_(std::move(crypto)),
-      kcp_(conv),
-      update_timer_(strand_) {
+      kcp_(conv) {
     // Mark the session running immediately (synchronously). Previously running_
     // was only flipped true inside the strand-dispatched start() lambda, leaving
     // a window where a freshly inserted session looked "not running" to a
@@ -51,9 +50,9 @@ void KCPSession::start() {
     auto self = shared_from_this();
     asio::dispatch(strand_, [self]() {
         // running_ is already true (set in the constructor); this lambda just
-        // kicks off the per-session KCP update loop and records the start.
+        // records the start. KCP updates are driven by the server's shared
+        // tick timer, not by a per-session loop.
         self->touch_activity();
-        self->do_update(std::error_code{});
         LOG_INFO("kcp_session", self->session_id_ + ": started");
     });
 }
@@ -63,8 +62,6 @@ void KCPSession::stop() {
     asio::dispatch(strand_, [self]() {
         const uint8_t old = self->state_flags_.fetch_and(static_cast<uint8_t>(~RUNNING));
         if ((old & RUNNING) == 0) return;
-        std::error_code ignored;
-        self->update_timer_.cancel(ignored);
 
         // Clear send callback FIRST to prevent any further output during flush.
         // This ensures no packets are sent after session closes, avoiding
@@ -251,8 +248,8 @@ void KCPSession::mark_handshake_done() {
     LOG_INFO("kcp_session", session_id_ + ": handshake done");
 }
 
-void KCPSession::do_update(const std::error_code& ec) {
-    if (ec || (state_flags_.load() & RUNNING) == 0) return;
+void KCPSession::on_update_tick() {
+    if ((state_flags_.load() & RUNNING) == 0) return;
 
     kcp_.update(now_kcp_ms());
     kcp_.flush();
@@ -300,15 +297,13 @@ void KCPSession::do_update(const std::error_code& ec) {
         return;
     }
 
-    // Fixed 10ms cadence. Note: we intentionally do NOT use ikcp_check() to
-    // sleep longer when idle -- with the vendored ikcp, ikcp_update always
-    // advances ts_flush to current+interval, so ikcp_check returns ~10ms ahead
-    // even when idle; there is no idle-sleep win to be had.
-    update_timer_.expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS));
-    auto self = shared_from_this();
-    update_timer_.async_wait([self](const std::error_code& e) {
-        self->do_update(e);
-    });
+    // Re-arm is NOT done here. This method is driven by KCPServer's single
+    // shared 10ms tick timer (do_update_tick), which collapses N per-session
+    // timer-heap entries into one. Fixed 10ms cadence: we intentionally do
+    // NOT use ikcp_check() to sleep longer when idle -- with the vendored
+    // ikcp, ikcp_update always advances ts_flush to current+interval, so
+    // ikcp_check returns ~10ms ahead even when idle; there is no idle-sleep
+    // win to be had.
 }
 
 void KCPSession::handle_kcp_output(byte_view data) {

@@ -8,7 +8,10 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace kcp_proxy {
 
@@ -51,7 +54,18 @@ private:
     // Live SOCKS5 connections, enforced against MAX_CLIENT_SESSIONS.
     std::atomic<size_t> active_sessions_{0};
 
+    // Shared KCP update tick: one 10ms timer for ALL client sessions (same
+    // design as KCPServer::do_update_tick). The registry stores weak refs
+    // keyed by raw pointer; expired entries are pruned during the tick, so
+    // no teardown path needs an explicit deregistration hook. The snapshot
+    // buffer is reused every tick (never reallocated in steady state).
+    asio::steady_timer update_tick_timer_;
+    std::unordered_map<KCPClientSession*, std::weak_ptr<KCPClientSession>> tick_sessions_;
+    std::shared_mutex tick_sessions_mutex_;
+    std::vector<std::weak_ptr<KCPClientSession>> tick_snapshot_;
+
     void do_resolve();
+    void do_update_tick(const std::error_code& ec);
     void do_accept();
     // Log a fatal startup error, remember it for startup_ok(), and stop the io
     // context so main() can exit with a non-zero code instead of hanging.

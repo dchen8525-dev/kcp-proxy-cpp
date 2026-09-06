@@ -13,6 +13,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kcp_proxy {
 
@@ -49,6 +50,19 @@ private:
     std::unordered_map<std::string, ClientConnection> connections_;
 
     asio::steady_timer cleanup_timer_;
+    // Single shared KCP update timer. Drives ikcp_update/flush for EVERY
+    // session on a fixed 10ms cadence, replacing one steady_timer per
+    // session. With N sessions the old design churned N timer-heap entries
+    // every 10ms (O(N log N) heap ops, cache-hostile at N=4096); this
+    // collapses that to exactly one timer. The tick re-arms FIRST so the
+    // cadence never stretches with the per-tick snapshot work.
+    asio::steady_timer update_tick_timer_;
+    // Reused snapshot buffer for the tick: weak refs copied out of sessions_
+    // under the shared_mutex, then dispatched WITHOUT holding the lock.
+    // weak_ptr (not shared_ptr) so a session erased from the map between
+    // snapshots is skipped at dispatch time instead of being kept alive;
+    // lock() success yields a temporary strong ref valid for this tick only.
+    std::vector<std::weak_ptr<KCPSession>> tick_snapshot_;
     std::atomic<bool> running_{false};
     // Read-mostly session table: UDP packet routing does map lookups far more
     // often than it mutates them, so a shared_mutex lets concurrent readers
@@ -104,9 +118,10 @@ private:
     // Graceful teardown of the upstream TCP side: mark the session's target as
     // closed, close the target socket, and stop the client->target loop. The
     // session stays alive until the KCP send buffer drains to the client (see
-    // KCPSession::do_update / set_drained_callback), then close_connection runs.
+    // KCPSession::on_update_tick / set_drained_callback), then close_connection runs.
     void handle_target_closed(std::shared_ptr<KCPSession> session,
                               std::shared_ptr<asio::ip::tcp::socket> tcp_socket);
+    void do_update_tick(const std::error_code& ec);
     void do_cleanup(const std::error_code& ec);
     // Takes ownership of the (already encrypted) datagram so the UDP send can
     // move it without a second copy.

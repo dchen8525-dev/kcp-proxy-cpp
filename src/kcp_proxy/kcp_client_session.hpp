@@ -32,6 +32,12 @@ public:
     void connect(std::function<void(bool)> handler);
     void close();
 
+    // One KCP update/flush/keepalive/idle-timeout cycle. Runs ONLY inside
+    // strand_. Public solely so KCPProxyClient's shared update tick
+    // (do_update_tick) can invoke it after dispatching onto the session
+    // strand; nothing else should call it -- the tick owns the cadence.
+    void on_update_tick();
+
     void send_data(byte_view data);
     void async_read_some(asio::mutable_buffer buffer,
                          std::function<void(std::error_code, size_t)> handler);
@@ -66,7 +72,10 @@ private:
     std::optional<asio::ip::udp::socket> udp_socket_;
     KcpWrapper kcp_;
 
-    asio::steady_timer update_timer_;
+    // NOTE: no per-session update timer. KCP updates are driven by
+    // KCPProxyClient's single shared 10ms tick (do_update_tick), collapsing
+    // N per-session timer-heap entries into one timer. on_update_tick()
+    // below runs inside strand_ only.
     asio::steady_timer connect_timer_;
 
     std::atomic<bool> running_{false};
@@ -106,7 +115,6 @@ private:
     void on_receive(byte_view packet);
     void on_async_read_some(asio::mutable_buffer buffer,
                             std::function<void(std::error_code, size_t)> handler);
-    void do_update(const std::error_code& ec);
     void do_udp_receive();
     void handle_kcp_output(byte_view data);
     void try_fulfill_read();
