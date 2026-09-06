@@ -69,6 +69,10 @@ option(KCP_PROXY_ENABLE_NATIVE_TUNE
 if(MSVC)
     target_compile_options(kcp_proxy_lib PRIVATE
         /W4           # Higher warning level
+        /wd4324       # C4324: padding from intentional alignas(64) cache-line
+                      # isolation on crypto keys / hot buffers -- suppress at
+                      # compiler level; header #pragma push/disable is not
+                      # reliable here under precompiled headers.
         /O2           # Optimization level
         /GL           # Whole program optimization
         /Gy           # Enable function-level linking
