@@ -6,7 +6,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         CACHE STRING "Vcpkg toolchain file")
 endif()
 
-project(kcp_proxy VERSION 0.0.1 LANGUAGES C CXX)
+project(kcp_proxy VERSION 0.0.2 LANGUAGES C CXX)
 
 # Default build type and compile_commands.json export
 if(NOT CMAKE_BUILD_TYPE)
