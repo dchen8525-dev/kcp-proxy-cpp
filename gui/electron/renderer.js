@@ -126,8 +126,10 @@ function setupIPCHandlers() {
   });
 
   window.electronAPI.onUpdateStatus((data) => {
-    if (data.status === 'available' || data.status === 'downloaded') {
-      appendLog(`发现新版本: ${data.version}，请稍后在设置中更新`, 'info');
+    if (data.status === 'available') {
+      appendLog(`发现新版本: ${data.version}，正在后台自动下载...`, 'info');
+    } else if (data.status === 'downloaded') {
+      appendLog(`新版本 ${data.version} 已下载，重启后生效`, 'info');
     }
   });
 
