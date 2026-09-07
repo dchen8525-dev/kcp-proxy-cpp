@@ -211,7 +211,6 @@ KCP-Proxy-Client-Windows-v0.0.1.zip (106MB)
 #### GUI特性
 
 - ✅ 系统托盘支持（关闭窗口不退出）
-- ✅ 开机自启动选项
 - ✅ 实时日志显示
 - ✅ 托盘快速启动/停止
 - ✅ 配置自动保存
@@ -445,7 +444,7 @@ kcp-proxy-cpp/
 **GUI客户端**：
 - `gui/electron/` - **主GUI**，基于Electron，支持Windows/Linux/macOS
   - 现代化界面，系统托盘支持
-  - 开机自启动，实时日志显示
+  - 系统托盘支持，实时日志显示
 
 **构建与发布**：
 - `build/` - CMake构建目录，包含中间产物

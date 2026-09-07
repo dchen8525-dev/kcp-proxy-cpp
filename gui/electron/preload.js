@@ -32,7 +32,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Events (auto-cleanup on each registration)
   onStatusUpdate: (callback) => safeOn('status-update', callback),
   onLog: (callback) => safeOn('log', callback),
-  onConfigUpdated: (callback) => safeOn('config-updated', callback),
   onTrafficUpdate: (callback) => safeOn('traffic-update', callback),
   onUpdateStatus: (callback) => safeOn('update-status', callback),
   onMaximizeState: (callback) => safeOn('maximize-state', callback),

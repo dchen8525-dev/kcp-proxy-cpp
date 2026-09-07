@@ -4,7 +4,6 @@ const elements = {
   serverPort: document.getElementById('serverPort'),
   localPort: document.getElementById('localPort'),
   keySuffix: document.getElementById('keySuffix'),
-  autoStart: document.getElementById('autoStart'),
   autoReconnect: document.getElementById('autoReconnect'),
   btnTest: document.getElementById('btn-test'),
   btnStart: document.getElementById('btn-start'),
@@ -62,7 +61,6 @@ function populateForm(config) {
   elements.serverPort.value = config.serverPort || '8388';
   elements.localPort.value = config.localPort || '1080';
   elements.keySuffix.value = config.keySuffix || '';
-  elements.autoStart.checked = config.autoStart || false;
   elements.autoReconnect.checked = config.autoReconnect !== false;
 }
 
@@ -94,7 +92,6 @@ function setupEventListeners() {
   for (const id of ['serverHost', 'serverPort', 'localPort', 'keySuffix']) {
     elements[id].addEventListener('change', saveSettings);
   }
-  elements.autoStart.addEventListener('change', saveSettings);
   elements.autoReconnect.addEventListener('change', saveSettings);
 
   // Log panel: expanded by default, the title toggles it
@@ -113,15 +110,7 @@ function setupIPCHandlers() {
     appendLog(data.message, data.level);
   });
 
-  window.electronAPI.onConfigUpdated((newConfig) => {
-    // Only the tray can currently change settings outside this form (the 开机自启
-    // checkbox). Sync just that, instead of repopulating the whole form which
-    // would clobber in-progress input in the other fields.
-    config = newConfig;
-    elements.autoStart.checked = Boolean(newConfig.autoStart);
-  });
-
-  window.electronAPI.onTrafficUpdate((data) => {
+    window.electronAPI.onTrafficUpdate((data) => {
     updateTraffic(data);
   });
 
@@ -147,7 +136,6 @@ async function saveSettings() {
     serverPort: elements.serverPort.value.trim() || '8388',
     localPort: elements.localPort.value.trim() || '1080',
     keySuffix: elements.keySuffix.value.trim(),
-    autoStart: elements.autoStart.checked,
     autoReconnect: elements.autoReconnect.checked
   };
 

@@ -67,10 +67,10 @@ const store = new ConfigStore({
   serverPort: '8388',
   localPort: '1080',
   keySuffix: '',
-  autoStart: false,
   autoReconnect: true, // Auto reconnect on disconnect
   reconnectDelay: 3000, // Delay before reconnect (ms)
-  maxReconnectAttempts: 10 // Max reconnect attempts (0 = unlimited)
+  maxReconnectAttempts: 10, // Max reconnect attempts (0 = unlimited)
+  legacyAutoStartCleared: false // One-time cleanup of the removed 开机自启 registry entry
 });
 
 // ── File-backed log (rotation at ~1MB, keeps one backup) ──
@@ -162,11 +162,11 @@ function createWindow() {
 
   mainWindow.loadFile('index.html');
 
-  // Show window when ready. Only a login-time launch (the registry Run entry
-  // passes --hidden) starts minimized to the tray; a normal launch must show
-  // the main window. Previously the check was on the autoStart *setting*,
-  // which kept the window hidden forever on every launch once auto-start was
-  // enabled — the app appeared to never open.
+  // Show the window when ready. A launch carrying --hidden starts minimized
+  // to the tray; that flag is only ever passed by a legacy "开机自启"
+  // registry Run entry left behind by an older build (cleared on startup, see
+  // removeLegacyAutoStartEntry). A normal, user-initiated launch must always
+  // show the main window.
   mainWindow.once('ready-to-show', () => {
     if (process.argv.includes('--hidden')) {
       if (!store.get('hasHiddenOnce')) {
@@ -266,17 +266,6 @@ function createTray() {
       id: 'tray-stop',
       label: '停止代理',
       click: () => stopProxy()
-    },
-    { type: 'separator' },
-    {
-      label: '开机自启',
-      type: 'checkbox',
-      checked: store.get('autoStart'),
-      click: (menuItem) => {
-        store.set('autoStart', menuItem.checked);
-        setAutoStart(menuItem.checked);
-        mainWindow?.webContents.send('config-updated', store.store);
-      }
     },
     { type: 'separator' },
     {
@@ -672,53 +661,13 @@ function handleClientLine(line) {
   sendLog(message || text, level);
 }
 
-// Set auto-start on boot (Windows: reg.exe, no external dependency)
-function setAutoStart(enable) {
-  if (process.platform !== 'win32') return;
-
-  try {
-    const appFolder = path.dirname(app.getPath('exe'));
-    const exePath = path.join(appFolder, app.getName() + '.exe');
-    const regKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
-
-    if (enable) {
-      // Append --hidden so a login-time launch starts minimized to the tray.
-      // A normal (user-initiated) launch carries no flag and still shows the
-      // main window — the ready-to-show handler keys off the flag, not off
-      // the autoStart setting.
-      spawn('reg', ['add', regKey, '/v', 'KcpProxyGui', '/t', 'REG_SZ', '/d', `"${exePath}" --hidden`, '/f'], {
-        windowsHide: true
-      }).on('error', (err) => sendLog(`设置开机自启失败: ${err.message}`, 'error'));
-      sendLog('已设置开机自启', 'info');
-    } else {
-      spawn('reg', ['delete', regKey, '/v', 'KcpProxyGui', '/f'], {
-        windowsHide: true
-      }).on('error', (err) => sendLog(`取消开机自启失败: ${err.message}`, 'error'));
-      sendLog('已取消开机自启', 'info');
-    }
-  } catch (err) {
-    sendLog(`开机自启操作失败: ${err.message}`, 'warn');
-  }
-}
-
 // IPC handlers
 ipcMain.handle('get-config', () => store.store);
 
 ipcMain.handle('save-config', (event, config) => {
-  // Detect a change before overwriting the stored value.
-  const autoStartChanged = 'autoStart' in config
-    && Boolean(config.autoStart) !== Boolean(store.get('autoStart'));
-
   Object.keys(config).forEach(key => {
     store.set(key, config[key]);
   });
-
-  // The main-window "开机自启" checkbox saves through this handler; apply the
-  // Windows registry change here too (the tray checkbox calls setAutoStart
-  // itself, and this keeps both paths in sync).
-  if (autoStartChanged) {
-    setAutoStart(Boolean(config.autoStart));
-  }
   return true;
 });
 
@@ -977,11 +926,7 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   setupAutoUpdater();
-
-  // Auto-start if configured
-  if (store.get('autoStart')) {
-    startProxy();
-  }
+  removeLegacyAutoStartEntry();
 });
 
 app.on('window-all-closed', () => {
