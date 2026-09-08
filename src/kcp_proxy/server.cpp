@@ -706,6 +706,17 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                     auto start_forwarding = [this, sid, session, tcp_socket, self]() {
                         {
                             std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
+                            // Identity check: if this session was already
+                            // replaced (endpoint reuse on client reconnect) while
+                            // the connect was in flight, do NOT re-insert the old
+                            // socket under the new session's key -- the new
+                            // session owns the endpoint now. Dropping our refs
+                            // here closes the stale socket.
+                            auto sit = sessions_.find(sid);
+                            if (sit == sessions_.end() || sit->second != session) {
+                                LOG_DEBUG("server", sid + ": connect completed for a replaced session, discarding");
+                                return;
+                            }
                             connections_[sid] = ClientConnection{
                                 sid,
                                 tcp_socket,
@@ -718,8 +729,13 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         // handle_target_closed / KCPSession::on_update_tick), then
                         // close. This prevents truncating large responses whose
                         // tail is still in flight when the target closes.
-                        session->set_drained_callback([this, sid]() {
-                            close_connection(sid, "target_drained");
+                        // weak_ptr: the callback lives on the session itself, a
+                        // strong capture would be a self-reference cycle. If it
+                        // has expired, this session is gone and the sid (if
+                        // present) belongs to a newer one -- skip the teardown.
+                        session->set_drained_callback([this, sid,
+                                                       w = std::weak_ptr<KCPSession>(session)]() {
+                            if (auto s = w.lock()) close_connection(sid, "target_drained", s);
                         });
                         forward_tcp_to_kcp(sid, session, tcp_socket);
                         // Eagerly arm the kcp->tcp direction so data that queued
@@ -738,7 +754,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                     LOG_ERROR("server", "FAIL_STAGE=TCP_WRITE_FAILED ERROR=initial_payload_" +
                                               write_ec.message() + " CLIENT_ENDPOINT=" + sid +
                                               " TARGET=-");
-                                    close_connection(sid, "initial_payload_write");
+                                    close_connection(sid, "initial_payload_write", session);
                                     return;
                                 }
                                 start_forwarding();
@@ -808,12 +824,14 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
               " running=" + std::to_string(session->is_running()));
     if (!tcp_socket || !tcp_socket->is_open()) {
         LOG_ERROR("server", session_id + ": forward_tcp_to_kcp - socket not open");
-        close_connection(session_id, "tcp2kcp_no_socket");
+        close_connection(session_id, "tcp2kcp_no_socket", session);
         return;
     }
     if (!session->is_running()) {
         LOG_ERROR("server", session_id + ": forward_tcp_to_kcp - session not running");
-        close_connection(session_id, "tcp2kcp_session_stopped");
+        // Pass the owner: this is often a stopped-but-replaced session whose
+        // backpressure retry fires after a new session took over the endpoint.
+        close_connection(session_id, "tcp2kcp_session_stopped", session);
         return;
     }
 
@@ -941,7 +959,7 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
                     LOG_WARNING("server", "FAIL_STAGE=KCP_NO_RECV ERROR=zero_bytes CLIENT_ENDPOINT=" +
                                 sid + " TARGET=-");
                 }
-                close_connection(sid, "kcp2tcp_read");
+                close_connection(sid, "kcp2tcp_read", session);
                 return;
             }
 
@@ -1003,13 +1021,27 @@ void KCPServer::handle_target_closed(std::shared_ptr<KCPSession> session,
     session->set_forward_read_pending(false);
 }
 
-void KCPServer::close_connection(const std::string& session_id, const char* caller) {
-    LOG_INFO("server", session_id + ": close_connection from " + std::string(caller));
-
+void KCPServer::close_connection(const std::string& session_id, const char* caller,
+                                 const std::shared_ptr<KCPSession>& owner) {
     std::shared_ptr<asio::ip::tcp::socket> sock_to_close;
     std::shared_ptr<KCPSession> session_to_stop;
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
+
+        // Identity check: a teardown queued by a session that was already
+        // replaced (client reconnect reusing the endpoint) or idle-reaped must
+        // not tear down the NEWER session registered under the same sid. With
+        // an owner, only proceed when the map still holds that exact session.
+        if (owner) {
+            auto sit = sessions_.find(session_id);
+            if (sit == sessions_.end() || sit->second != owner) {
+                LOG_DEBUG("server", session_id + ": close_connection from " + std::string(caller) +
+                          " skipped - session already replaced");
+                return;
+            }
+        }
+        LOG_INFO("server", session_id + ": close_connection from " + std::string(caller));
+
         auto it = connections_.find(session_id);
         if (it != connections_.end()) {
             sock_to_close = std::move(it->second.tcp_socket);

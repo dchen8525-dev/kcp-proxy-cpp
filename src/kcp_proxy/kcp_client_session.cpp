@@ -319,7 +319,10 @@ void KCPClientSession::on_update_tick() {
             kcp_.peek_size() <= 0) {
             const auto* kb = reinterpret_cast<const uint8_t*>(KCP_CONTROL_KEEPALIVE);
             size_t klen = std::strlen(KCP_CONTROL_KEEPALIVE);
-            if (kcp_.send(byte_view(kb, klen)) == 0) {
+            // ikcp_send returns the number of bytes queued (>= 0) on success,
+            // NOT 0 -- compare against < 0 or the throttle never engages and a
+            // keepalive is injected on every 10ms tick once the interval passes.
+            if (kcp_.send(byte_view(kb, klen)) >= 0) {
                 last_keepalive_us_.store(now);
                 LOG_DEBUG("kcp_client", "keepalive sent");
             }

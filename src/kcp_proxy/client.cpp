@@ -527,6 +527,15 @@ void KCPProxyClient::handle_sync_request(
                 (const std::error_code& ec2, size_t) {
                     if (ec2) {
                         LOG_ERROR("client", "send reply error: " + ec2.message());
+                        // The handshake deadline was already cancelled and the
+                        // forward loops never start, so nothing else would ever
+                        // tear this session down: the keepalive keeps refreshing
+                        // the peer's idle clock and the session leaks (socket +
+                        // tick entry) until the client hits its session cap.
+                        // Close both sides, matching every other error path.
+                        session->close();
+                        std::error_code ignored;
+                        client_socket->close(ignored);
                         return;
                     }
                     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

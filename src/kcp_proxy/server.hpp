@@ -114,7 +114,14 @@ private:
                             std::shared_ptr<KCPSession> session,
                             std::shared_ptr<asio::ip::tcp::socket> tcp_socket,
                             std::shared_ptr<std::vector<uint8_t>> buf = {});
-    void close_connection(const std::string& session_id, const char* caller);
+    // Tears down the session + target connection registered under session_id.
+    // When `owner` is non-null, the maps are only touched if the current entry
+    // IS that session: a teardown queued by a replaced/idle-reaped session must
+    // never kill a newer session that reuses the same endpoint (NAT port reuse
+    // on client reconnect). owner == nullptr keeps the legacy unconditional
+    // behavior for defensive paths that have no session at hand.
+    void close_connection(const std::string& session_id, const char* caller,
+                          const std::shared_ptr<KCPSession>& owner = nullptr);
     // Graceful teardown of the upstream TCP side: mark the session's target as
     // closed, close the target socket, and stop the client->target loop. The
     // session stays alive until the KCP send buffer drains to the client (see

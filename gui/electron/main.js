@@ -919,6 +919,21 @@ function setupAutoUpdater() {
   autoUpdater.checkForUpdatesAndNotify();
 }
 
+// One-time cleanup for the 开机自启 feature removed in a previous release:
+// older builds wrote a KcpProxyGui entry under HKCU ...\Run that would keep
+// launching the app with --hidden at login. Delete it once on startup; the
+// store flag avoids running reg.exe on every launch afterwards. reg delete
+// exits non-zero when the key is absent (the common case for fresh installs),
+// which is not an error here.
+function removeLegacyAutoStartEntry() {
+  if (process.platform !== 'win32' || store.get('legacyAutoStartCleared')) return;
+  store.set('legacyAutoStartCleared', true);
+  const regKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+  spawn('reg', ['delete', regKey, '/v', 'KcpProxyGui', '/f'], {
+    windowsHide: true
+  }).on('error', (err) => sendLog(`清除遗留开机自启项失败: ${err.message}`, 'warn'));
+}
+
 app.whenReady().then(() => {
   // Remove default application menu (File/Edit/View...) — we have a custom title bar
   Menu.setApplicationMenu(null);
