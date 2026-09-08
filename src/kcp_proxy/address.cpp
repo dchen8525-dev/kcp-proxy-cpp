@@ -172,6 +172,16 @@ bool is_restricted_target(const asio::ip::address& addr) {
                 return true;
             }
         }
+        // NAT64 well-known prefix (64:ff9b::/96, RFC 6052) and the local-use
+        // variant (64:ff9b:1::/48, RFC 8215): the translated IPv4 sits in
+        // bytes 12-15. Without this, 64:ff9b::7f00:0001 (= 127.0.0.1) slips
+        // past the IPv4 blocks wherever the host has NAT64 routing.
+        if (bytes[0] == 0x00 && bytes[1] == 0x64 &&
+            bytes[2] == 0xff && bytes[3] == 0x9b &&
+            bytes[4] == 0x00 && (bytes[5] == 0x00 || bytes[5] == 0x01) &&
+            is_restricted_target(embedded_v4(12))) {
+            return true;
+        }
         // IPv4-compatible ::a.b.c.d (deprecated ::/96): tail bytes ARE the
         // IPv4 address. :: and ::1 are already caught by the checks below.
         {

@@ -118,7 +118,7 @@ function setupIPCHandlers() {
     if (data.status === 'available') {
       appendLog(`发现新版本: ${data.version}，正在后台自动下载...`, 'info');
     } else if (data.status === 'downloaded') {
-      appendLog(`新版本 ${data.version} 已下载，重启后生效`, 'info');
+      appendLog(`新版本 ${data.version} 已下载，右键系统托盘图标选择"安装更新并重启"完成升级`, 'info');
     }
   });
 

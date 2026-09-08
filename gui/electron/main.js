@@ -267,6 +267,17 @@ function createTray() {
       label: '停止代理',
       click: () => stopProxy()
     },
+    {
+      // Only shown once an update has finished downloading (see the
+      // update-downloaded handler). Installing on plain quit is the
+      // autoInstallOnAppQuit fallback; this is the explicit path.
+      id: 'tray-install-update',
+      label: '安装更新并重启',
+      visible: false,
+      click: () => {
+        installPendingUpdate();
+      }
+    },
     { type: 'separator' },
     {
       label: '退出',
@@ -844,7 +855,7 @@ ipcMain.handle('check-for-updates', async () => {
 
 ipcMain.handle('quit-and-install', async () => {
   if (autoUpdater) {
-    autoUpdater.quitAndInstall();
+    installPendingUpdate();
     return true;
   }
   return false;
@@ -891,6 +902,10 @@ function setupAutoUpdater() {
   }
 
   autoUpdater.autoDownload = true;
+  // Belt and braces: default is true, but make the intent explicit -- if an
+  // update was downloaded, quitting the app (tray 退出 / window-all-closed)
+  // runs the NSIS installer instead of just throwing the download away.
+  autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.on('checking-for-update', () => {
     sendLog('正在检查更新...', 'info');
   });
@@ -910,13 +925,37 @@ function setupAutoUpdater() {
     mainWindow?.webContents.send('update-status', { status: 'error' });
   });
   autoUpdater.on('update-downloaded', (info) => {
-    sendLog(`新版本已下载: ${info.version}，重启后生效`, 'info');
+    sendLog(`新版本已下载: ${info.version}，可通过系统托盘"安装更新并重启"完成升级`, 'info');
+    const item = trayMenu?.getMenuItemById('tray-install-update');
+    if (item) item.visible = true;
     mainWindow?.webContents.send('update-status', {
       status: 'downloaded',
       version: info.version
     });
   });
   autoUpdater.checkForUpdatesAndNotify();
+}
+
+// Install a downloaded update. The proxy child process must be stopped FIRST:
+// on Windows quitAndInstall() ends the app via app.exit(0), which bypasses
+// before-quit, so nothing else would reap kcp-proxy-client.exe and it would
+// linger holding the local SOCKS port. isManualStop suppresses the reconnect
+// that the child's 'close' event would otherwise schedule.
+function installPendingUpdate() {
+  isManualStop = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (clientProcess) {
+    try { clientProcess.kill(); } catch (err) { sendLog(`停止代理失败: ${err.message}`, 'warn'); }
+  }
+  app.isQuitting = true;
+  if (autoUpdater) {
+    autoUpdater.quitAndInstall();
+  } else {
+    app.quit();
+  }
 }
 
 // One-time cleanup for the 开机自启 feature removed in a previous release:

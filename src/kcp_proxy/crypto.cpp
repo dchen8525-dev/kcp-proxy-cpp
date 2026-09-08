@@ -225,9 +225,17 @@ void Crypto::commit_replay_window(uint64_t counter) {
     }
     if (counter > highest_received_) {
         uint64_t shift = counter - highest_received_;
-        if (shift >= REPLAY_WINDOW_BITS) {
-            // Jumped far past the window: everything previously seen is now
+        if (shift > REPLAY_WINDOW_BITS) {
+            // Jumped past the window: everything previously seen is now
             // outside the window, so drop the bitmap entirely.
+            //
+            // NOTE: strictly `>`, not `>=`. check_replay_window() accepts
+            // offset <= REPLAY_WINDOW_BITS (bit index REPLAY_WINDOW_BITS-1),
+            // so the old highest is still inside the window when shift ==
+            // REPLAY_WINDOW_BITS exactly. Resetting here would "forget" that
+            // packet and let a genuine duplicate be delivered again. The else
+            // branch below handles that case correctly: bitset <<= N is
+            // well-defined (all zero) and set(shift-1) marks the old highest.
             replay_window_.reset();
         } else {
             // Slide the window left by `shift` and mark the just-accepted

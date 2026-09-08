@@ -614,10 +614,19 @@ void KCPProxyClient::forward_client_to_kcp(
     client_socket->async_read_some(asio::buffer(*buf),
         asio::bind_executor(session->strand(),
         [this, self, client_socket, session, buf](const std::error_code& ec, size_t bytes) mutable {
+            if (ec == asio::error::eof) {
+                LOG_INFO("client", "client disconnected (EOF)");
+                // Half-close, mirroring the server's target-EOF path: the local
+                // app finished its request but the response may still be in
+                // flight (server KCP send buffer / target). Stop the upstream
+                // loop only; the session and the downstream direction stay
+                // alive, and forward_kcp_to_client closes both once the server
+                // tears the session down (KCP EOF) or an error arrives.
+                // Closing the session here would truncate large responses.
+                return;
+            }
             if (ec || bytes == 0) {
-                if (ec == asio::error::eof) {
-                    LOG_INFO("client", "client disconnected (EOF)");
-                } else if (ec == asio::error::operation_aborted) {
+                if (ec == asio::error::operation_aborted) {
                     LOG_DEBUG("client", "client read cancelled");
                 } else if (ec) {
                     LOG_ERROR("client", "client read error: " + ec.message());

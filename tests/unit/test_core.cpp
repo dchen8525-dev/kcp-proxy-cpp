@@ -116,6 +116,26 @@ void test_crypto_roundtrip_and_failures() {
     expect_throw([&] { (void)window_server.decrypt(byte_view(too_old_packet.data(), too_old_packet.size())); },
                  "packet older than replay window should be rejected");
 
+    // Boundary regression: a single packet that advances the window by EXACTLY
+    // REPLAY_WINDOW_BITS. The old highest is still inside the window
+    // (offset == bits), so a replay of it must be rejected. The old
+    // `shift >= bits` reset "forgot" it and delivered the duplicate.
+    {
+        auto e_salt = Crypto::generate_session_salt();
+        Crypto edge_client(key, NONCE_DIR_CLIENT, e_salt);
+        Crypto edge_server(key, NONCE_DIR_SERVER);
+        auto edge_pkt = edge_client.encrypt(byte_view(plain.data(), plain.size()));
+        (void)edge_server.decrypt(byte_view(edge_pkt.data(), edge_pkt.size()));
+        std::vector<uint8_t> jump;
+        for (size_t i = 0; i < REPLAY_WINDOW_BITS; ++i) {
+            jump = edge_client.encrypt(byte_view(plain.data(), plain.size()));
+        }
+        // Decrypt only the LAST packet: a single commit with shift == window bits.
+        (void)edge_server.decrypt(byte_view(jump.data(), jump.size()));
+        expect_throw([&] { (void)edge_server.decrypt(byte_view(edge_pkt.data(), edge_pkt.size())); },
+                     "replay at exactly the window edge should be rejected");
+    }
+
     auto oo_salt = Crypto::generate_session_salt();
     Crypto out_of_order_client(key, NONCE_DIR_CLIENT, oo_salt);
     Crypto out_of_order_server(key, NONCE_DIR_SERVER);
@@ -292,6 +312,17 @@ void test_restricted_targets() {
                 "v4-compatible embedding 192.168.1.1");
     expect_true(!is_restricted_target(asio::ip::make_address("::0101:0101")),
                 "v4-compatible embedding public 1.1.1.1 allowed");
+
+    // NAT64 well-known prefix 64:ff9b::/96 (and local-use 64:ff9b:1::/48)
+    // embed the translated IPv4 in the last 4 bytes.
+    expect_true(is_restricted_target(asio::ip::make_address("64:ff9b::7f00:0001")),
+                "NAT64 embedding 127.0.0.1");
+    expect_true(is_restricted_target(asio::ip::make_address("64:ff9b::c0a8:0101")),
+                "NAT64 embedding 192.168.1.1");
+    expect_true(is_restricted_target(asio::ip::make_address("64:ff9b:1::0a00:0001")),
+                "NAT64 local-use embedding 10.0.0.1");
+    expect_true(!is_restricted_target(asio::ip::make_address("64:ff9b::0101:0101")),
+                "NAT64 embedding public 1.1.1.1 allowed");
 
     // Regular IPv6 classes unchanged.
     expect_true(is_restricted_target(asio::ip::make_address("::1")), "v6 loopback");
