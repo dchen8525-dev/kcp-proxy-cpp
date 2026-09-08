@@ -22,6 +22,16 @@ struct SessionMetrics {
     std::atomic<uint64_t> encrypt_errors{0};
     std::atomic<uint64_t> decrypt_errors{0};
 
+    // UDP datagram level (used for peer-to-peer loss localization): every
+    // encrypted datagram handed to the peer counts as one TX, every datagram
+    // that reaches decrypt counts as one RX. replay_dropped counts decrypted
+    // duplicates discarded by the anti-replay window (i.e. peer retransmissions).
+    std::atomic<uint64_t> udp_tx_packets{0};
+    std::atomic<uint64_t> udp_tx_bytes{0};
+    std::atomic<uint64_t> udp_rx_packets{0};
+    std::atomic<uint64_t> udp_rx_bytes{0};
+    std::atomic<uint64_t> replay_dropped{0};
+
     void reset() {
         packets_sent.store(0);
         packets_received.store(0);
@@ -29,6 +39,11 @@ struct SessionMetrics {
         bytes_received.store(0);
         encrypt_errors.store(0);
         decrypt_errors.store(0);
+        udp_tx_packets.store(0);
+        udp_tx_bytes.store(0);
+        udp_rx_packets.store(0);
+        udp_rx_bytes.store(0);
+        replay_dropped.store(0);
     }
 };
 
@@ -136,6 +151,9 @@ public:
     // Performance metrics
     const SessionMetrics& metrics() const { return metrics_; }
 
+    // Single-line UDP/decrypt counters for loss localization (see stats_summary()).
+    std::string stats_summary() const;
+
 private:
     asio::io_context& io_;
     asio::strand<asio::io_context::executor_type> strand_;
@@ -162,6 +180,8 @@ private:
     static constexpr uint8_t CONNECT_PENDING = 0x20;
 
     std::atomic<int64_t> last_activity_us_{0}; // steady_clock micros since epoch
+    // Throttle for the periodic (DEBUG) UDP stats line, to avoid per-tick spam.
+    std::atomic<int64_t> last_stats_us_{0};
     // Keepalive send throttle. Distinct from last_activity_us_: sending a
     // keepalive must NOT refresh the activity clock, otherwise a session whose
     // peer has gone away would keep itself alive forever and evade the idle

@@ -85,11 +85,27 @@ void KCPSession::stop() {
             });
         }
         LOG_INFO("kcp_session", self->session_id_ + ": stopped");
+        LOG_INFO("kcp_session", self->stats_summary());
     });
 }
 
 void KCPSession::touch_activity() {
     last_activity_us_.store(now_us());
+}
+
+std::string KCPSession::stats_summary() const {
+    const auto& m = metrics_;
+    return fmt::format(
+        "{}: stats tx_pkt={} tx_bytes={} rx_pkt={} rx_bytes={} "
+        "replay_dropped={} decrypt_err={} encrypt_err={}",
+        session_id_,
+        m.udp_tx_packets.load(std::memory_order_relaxed),
+        m.udp_tx_bytes.load(std::memory_order_relaxed),
+        m.udp_rx_packets.load(std::memory_order_relaxed),
+        m.udp_rx_bytes.load(std::memory_order_relaxed),
+        m.replay_dropped.load(std::memory_order_relaxed),
+        m.decrypt_errors.load(std::memory_order_relaxed),
+        m.encrypt_errors.load(std::memory_order_relaxed));
 }
 
 void KCPSession::receive_data(byte_view encrypted_data, std::function<void()> after) {
@@ -111,9 +127,12 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
         return;
     }
     std::error_code ec = crypto_->decrypt_into(byte_view(encrypted.data(), encrypted.size()), decrypt_buf_);
+    metrics_.udp_rx_packets.fetch_add(1, std::memory_order_relaxed);
+    metrics_.udp_rx_bytes.fetch_add(encrypted.size(), std::memory_order_relaxed);
     if (ec == crypto_errors::errc::replay) {
         // Normal UDP reordering / duplicate: drop quietly, never treat as an
         // error and never advance the replay window (already handled in Crypto).
+        metrics_.replay_dropped.fetch_add(1, std::memory_order_relaxed);
         LOG_DEBUG("kcp_session", fmt::format("{}: replay/stale packet dropped", session_id_));
         return;
     }
@@ -251,6 +270,18 @@ void KCPSession::mark_handshake_done() {
 void KCPSession::on_update_tick() {
     if ((state_flags_.load() & RUNNING) == 0) return;
 
+    // Periodic (throttled) stats at DEBUG so peer-to-peer loss asymmetry is
+    // visible over time without spamming INFO (see AGENTS.md #8).
+    {
+        static constexpr int64_t STATS_INTERVAL_US = 30 * 1000000;
+        const int64_t now = now_us();
+        int64_t last = last_stats_us_.load();
+        if ((now - last) >= STATS_INTERVAL_US &&
+            last_stats_us_.compare_exchange_strong(last, now)) {
+            LOG_DEBUG("kcp_session", stats_summary());
+        }
+    }
+
     kcp_.update(now_kcp_ms());
     kcp_.flush();
     if (pending_read_handler_) {
@@ -323,6 +354,8 @@ void KCPSession::handle_kcp_output(byte_view data) {
     }
     LOG_DEBUG("kcp_session", fmt::format("{}: encrypted -> {} bytes -> send_callback",
               session_id_, encrypted.size()));
+    metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
+    metrics_.udp_tx_bytes.fetch_add(encrypted.size(), std::memory_order_relaxed);
     send_callback_(std::move(encrypted));
 }
 

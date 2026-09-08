@@ -71,7 +71,6 @@ private:
     std::shared_ptr<Crypto> crypto_;
     std::optional<asio::ip::udp::socket> udp_socket_;
     KcpWrapper kcp_;
-
     // NOTE: no per-session update timer. KCP updates are driven by
     // KCPProxyClient's single shared 10ms tick (do_update_tick), collapsing
     // N per-session timer-heap entries into one timer. on_update_tick()
@@ -94,6 +93,15 @@ private:
     // KCP_KEEPALIVE_SEC.
     std::atomic<int64_t> last_keepalive_us_{0};
 
+    // UDP datagram + decrypt counters for peer-to-peer loss localization.
+    std::atomic<uint64_t> udp_tx_packets{0};
+    std::atomic<uint64_t> udp_tx_bytes{0};
+    std::atomic<uint64_t> udp_rx_packets{0};
+    std::atomic<uint64_t> udp_rx_bytes{0};
+    std::atomic<uint64_t> replay_dropped{0};
+    // Throttle for the periodic (DEBUG) stats line, to avoid per-tick spam.
+    std::atomic<int64_t> last_stats_us_{0};
+
     asio::mutable_buffer pending_read_buffer_{nullptr, 0};
     std::function<void(std::error_code, size_t)> pending_read_handler_;
 
@@ -111,6 +119,7 @@ private:
     void on_connect(std::function<void(bool)> handler);
     void send_connect_hello();
     void on_close();
+    std::string stats_summary() const;
     void on_send(byte_view data);
     void on_receive(byte_view packet);
     void on_async_read_some(asio::mutable_buffer buffer,

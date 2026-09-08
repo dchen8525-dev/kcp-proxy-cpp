@@ -66,6 +66,21 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
             throw std::runtime_error("UDP connect failed: " + connect_ec.message());
         }
 
+        // Raise the kernel UDP send/receive buffers. Oversized kernel buffers
+        // prevent the OS from silently dropping datagrams during bursts (which
+        // KCP would otherwise misread as network loss and retransmit a window).
+        std::error_code opt_ec;
+        udp_socket_->set_option(asio::socket_base::receive_buffer_size(
+                                    UDP_SO_RCVBUF_BYTES), opt_ec);
+        if (opt_ec) {
+            LOG_WARNING("kcp_client", "failed to set SO_RCVBUF: " + opt_ec.message());
+        }
+        udp_socket_->set_option(asio::socket_base::send_buffer_size(
+                                    UDP_SO_SNDBUF_BYTES), opt_ec);
+        if (opt_ec) {
+            LOG_WARNING("kcp_client", "failed to set SO_SNDBUF: " + opt_ec.message());
+        }
+
         running_.store(true);
         connected_.store(false);
         connect_pending_.store(true);
@@ -185,6 +200,15 @@ void KCPClientSession::on_close() {
     }
 
     LOG_INFO("kcp_client", "closed");
+    LOG_INFO("kcp_client", stats_summary());
+}
+
+std::string KCPClientSession::stats_summary() const {
+    return "stats tx_pkt=" + std::to_string(udp_tx_packets.load(std::memory_order_relaxed)) +
+           " tx_bytes=" + std::to_string(udp_tx_bytes.load(std::memory_order_relaxed)) +
+           " rx_pkt=" + std::to_string(udp_rx_packets.load(std::memory_order_relaxed)) +
+           " rx_bytes=" + std::to_string(udp_rx_bytes.load(std::memory_order_relaxed)) +
+           " replay_dropped=" + std::to_string(replay_dropped.load(std::memory_order_relaxed));
 }
 
 void KCPClientSession::send_data(byte_view data) {
@@ -251,6 +275,18 @@ void KCPClientSession::on_async_read_some(asio::mutable_buffer buffer,
 
 void KCPClientSession::on_update_tick() {
     if (!running_.load()) return;
+
+    // Periodic (throttled) stats at DEBUG so peer-to-peer loss asymmetry is
+    // visible over time without spamming INFO (see AGENTS.md #8).
+    {
+        static constexpr int64_t STATS_INTERVAL_US = 30 * 1000000;
+        const int64_t now = now_us();
+        int64_t last = last_stats_us_.load();
+        if ((now - last) >= STATS_INTERVAL_US &&
+            last_stats_us_.compare_exchange_strong(last, now)) {
+            LOG_DEBUG("kcp_client", stats_summary());
+        }
+    }
 
     // Session-level liveness. KCP never times out on the client side: without
     // this, a server crash or a key rotation on the server leaves the local app
@@ -328,9 +364,12 @@ void KCPClientSession::do_udp_receive() {
 
 void KCPClientSession::on_receive(byte_view packet) {
     if (!running_.load()) return;
+    udp_rx_packets.fetch_add(1, std::memory_order_relaxed);
+    udp_rx_bytes.fetch_add(packet.size(), std::memory_order_relaxed);
     std::error_code ec = crypto_->decrypt_into(packet, decrypt_buf_);
     if (ec == crypto_errors::errc::replay) {
         // Normal UDP reordering / duplicate: drop quietly.
+        replay_dropped.fetch_add(1, std::memory_order_relaxed);
         LOG_DEBUG("kcp_client", "replay/stale packet discarded (UDP reordering)");
         return;
     }
@@ -372,6 +411,9 @@ void KCPClientSession::handle_kcp_output(byte_view data) {
     LOG_DEBUG("kcp_client", "encrypted -> " + std::to_string(send_buf->size()) +
              " bytes, sending UDP to " + server_addr_.address().to_string() + ":" +
              std::to_string(server_addr_.port()));
+
+    udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
+    udp_tx_bytes.fetch_add(send_buf->size(), std::memory_order_relaxed);
 
     auto self = shared_from_this();
     udp_socket_->async_send(

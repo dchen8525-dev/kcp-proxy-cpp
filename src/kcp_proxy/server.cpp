@@ -60,6 +60,30 @@ void KCPServer::start() {
                                  std::to_string(port_) + ": " + ec.message());
     }
 
+    // Raise the kernel UDP send/receive buffers. Oversized kernel buffers prevent
+    // the OS from silently dropping datagrams during bursts (which KCP would
+    // otherwise misread as network loss and retransmit a whole window of).
+    std::error_code opt_ec;
+    udp_socket_.set_option(asio::socket_base::receive_buffer_size(
+                               UDP_SO_RCVBUF_BYTES), opt_ec);
+    if (opt_ec) {
+        LOG_WARNING("server", "failed to set SO_RCVBUF: " + opt_ec.message());
+    }
+    udp_socket_.set_option(asio::socket_base::send_buffer_size(
+                               UDP_SO_SNDBUF_BYTES), opt_ec);
+    if (opt_ec) {
+        LOG_WARNING("server", "failed to set SO_SNDBUF: " + opt_ec.message());
+    }
+    // Effective sizes (the OS may clamp to its own cap, so report what we got).
+    asio::socket_base::receive_buffer_size eff_rcv;
+    asio::socket_base::send_buffer_size eff_snd;
+    udp_socket_.get_option(eff_rcv, opt_ec);
+    std::string eff_rcv_str = opt_ec ? "?" : std::to_string(eff_rcv.value());
+    udp_socket_.get_option(eff_snd, opt_ec);
+    std::string eff_snd_str = opt_ec ? "?" : std::to_string(eff_snd.value());
+    LOG_INFO("server", "UDP socket buffers so_rcvbuf=" + eff_rcv_str +
+             " so_sndbuf=" + eff_snd_str);
+
     running_ = true;
 
     cleanup_timer_.expires_after(std::chrono::seconds(30));

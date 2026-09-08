@@ -44,6 +44,16 @@ constexpr size_t UDP_RECV_BUF_SIZE = 4096;
 constexpr size_t FWD_BUF_SIZE = 16384;
 constexpr size_t SOCKS5_REPLY_BUF_SIZE = 512;
 
+// UDP socket kernel buffer sizes (SO_RCVBUF / SO_SNDBUF). The OS defaults are
+// typically far too small for KCP over a lossy WAN link: when the kernel buffer
+// overflows, the OS silently drops UDP datagrams, which KCP then mistakes for
+// network loss and triggers whole-window retransmission (surfacing as a burst of
+// "replay/stale rejected" on the peer). Raising the buffers removes that class of
+// self-inflicted loss. 4 MB is generous for a proxy whose per-session rate is
+// bounded by the downstream TCP + backpressure.
+constexpr int UDP_SO_RCVBUF_BYTES = 4 * 1024 * 1024;
+constexpr int UDP_SO_SNDBUF_BYTES = 4 * 1024 * 1024;
+
 // Backpressure: stop reading from the local TCP socket when KCP's send buffer
 // has more segments than this. Prevents unbounded memory growth when the
 // network is slower than the source. The threshold must stay comfortably below
