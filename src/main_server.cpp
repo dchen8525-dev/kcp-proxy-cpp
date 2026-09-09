@@ -17,9 +17,9 @@ static void print_usage(const char* prog) {
               << "  -k, --key KEY          Encryption key (min 16 chars; alternatively\n"
               << "                         set the KCP_PROXY_KEY environment variable)\n"
               << "  -T, --threads N        io_context worker threads (default: 1).\n"
-              << "                         Each session holds a 10ms update timer, so under\n"
-              << "                         heavy load 2-4 threads spread that work across\n"
-              << "                         cores. Thread safety comes from per-session strands\n"
+              << "                         KCP updates run on a single shared 10ms tick;\n"
+              << "                         extra threads spread UDP/TCP I/O across cores.\n"
+              << "                         Thread safety comes from per-session strands\n"
               << "                         and the shared_mutex-protected session map.\n"
               << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n";
 }

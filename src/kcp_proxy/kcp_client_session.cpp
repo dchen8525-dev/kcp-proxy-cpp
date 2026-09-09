@@ -172,17 +172,25 @@ void KCPClientSession::close() {
 }
 
 void KCPClientSession::on_close() {
-    if (!running_.exchange(false)) return;
+    if (!running_.load()) return;
+
+    // Best-effort final flush BEFORE clearing running_: handle_kcp_output()
+    // drops everything once running_ is false, so flushing after the exchange
+    // would be a no-op. This gives queued segments (e.g. the last bytes of a
+    // response) one chance to reach the server before the socket closes.
+    // It is still best-effort: the UDP socket closes immediately below, so only
+    // segments that flush synchronously into async sends actually leave.
+    try {
+        kcp_.update(now_kcp_ms());
+        kcp_.flush();
+    } catch (...) {}
+
+    running_.store(false);
     connected_.store(false);
     connect_pending_.store(false);
 
     std::error_code ignored;
     connect_timer_.cancel(ignored);
-
-    try {
-        kcp_.update(now_kcp_ms());
-        kcp_.flush();
-    } catch (...) {}
 
     if (udp_socket_ && udp_socket_->is_open()) {
         udp_socket_->close(ignored);

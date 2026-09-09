@@ -349,14 +349,20 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             }
         }
         session = std::make_shared<KCPSession>(io_, 1, addr, std::move(session_crypto), sid);
+        // Set the send callback BEFORE publishing the session into sessions_.
+        // The shared update tick can dispatch on_update_tick (and therefore
+        // handle_kcp_output, which reads send_callback_) onto any thread the
+        // moment the session becomes visible in the map; with -T > 1, setting
+        // the callback after insertion would race with that read (the callback
+        // is a plain std::function, not atomic). Publishing under the write
+        // lock after full initialization keeps the handoff safe.
+        auto self = shared_from_this();
+        session->set_send_callback([self, addr](std::vector<uint8_t> data) {
+            self->send_to_client(addr, std::move(data));
+        });
         sessions_[sid] = session;
         total_sessions = sessions_.size();
     }
-
-    auto self = shared_from_this();
-    session->set_send_callback([self, addr](std::vector<uint8_t> data) {
-        self->send_to_client(addr, std::move(data));
-    });
 
     session->start();
     // Feed the already-decrypted bytes straight into ikcp.
@@ -517,6 +523,10 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
                     session->session_id() + " TARGET=" + request.host +
                     ":" + std::to_string(request.port));
         send_socks5_reply(session, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
+        // Same as the other failure paths: the client sees the reply and tears
+        // the KCP session down, so don't leave it parked in the table until the
+        // 60s idle sweep.
+        session->stop();
     }
     return true;  // complete (success or handled error)
 }

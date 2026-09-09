@@ -73,6 +73,10 @@ void KCPProxyClient::do_resolve() {
                 fail_startup("resolve error: " + ec.message());
                 return;
             }
+            if (results.empty()) {
+                fail_startup("no endpoints resolved for " + server_host_);
+                return;
+            }
             auto selected = results.begin();
             for (auto it = results.begin(); it != results.end(); ++it) {
                 if (it->endpoint().address().is_v4()) {
