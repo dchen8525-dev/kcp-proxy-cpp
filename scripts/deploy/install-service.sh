@@ -225,7 +225,7 @@ echo "Enabling and starting $SERVICE_NAME ..."
 systemctl enable "$SERVICE_NAME" >/dev/null
 systemctl restart "$SERVICE_NAME"
 
-# ---------- systemd timer: refresh the daily key every six hours ----------
+# ---------- systemd timer: refresh the daily key at 00/06/12/18 local ----------
 TIMER_SERVICE="kcp-proxy-server-key-refresh.service"
 TIMER_UNIT="kcp-proxy-server-key-refresh.timer"
 cat > "/etc/systemd/system/$TIMER_SERVICE" << 'EOF'
@@ -239,11 +239,18 @@ ExecStart=/bin/systemctl restart kcp-proxy-server.service
 EOF
 cat > "/etc/systemd/system/$TIMER_UNIT" << 'EOF'
 [Unit]
-Description=Refresh KCP proxy daily key every six hours
+Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 local)
 
 [Timer]
-OnBootSec=6h
-OnUnitActiveSec=6h
+# Calendar schedule, deliberately NOT OnBootSec/OnUnitActiveSec. A monotonic
+# elapse whose time has already passed when the timer is (re)started is dropped
+# by systemd (Persistent= only applies to OnCalendar=), leaving the timer
+# "active (elapsed)" with no next trigger. The server then keeps whatever
+# Beijing-date key it started with, so every client fails DECRYPT_FAILED until
+# someone restarts the service by hand.
+# 0/6:00 = 00:00, 06:00, 12:00, 18:00 local, so the key follows the Beijing
+# date change within a second instead of up to six hours later.
+OnCalendar=*-*-* 0/6:00:00
 Persistent=true
 
 [Install]
@@ -251,6 +258,16 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now "$TIMER_UNIT"
+
+# Verify the timer actually armed: an empty next-elapse means it will never fire
+# again and the daily key would silently freeze.
+TIMER_NEXT=$(systemctl show "$TIMER_UNIT" -p NextElapseUSecRealtime --value 2>/dev/null || true)
+if [ -z "$TIMER_NEXT" ]; then
+    echo "ERROR: $TIMER_UNIT has no next scheduled run, so the daily key will" >&2
+    echo "       not rotate and clients will break after the next date change." >&2
+    echo "       Check with: systemctl list-timers $TIMER_UNIT" >&2
+    exit 1
+fi
 
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
 echo
@@ -267,7 +284,9 @@ echo "  Stop:    systemctl stop $SERVICE_NAME"
 echo "  Restart: systemctl restart $SERVICE_NAME"
 echo
 echo "Note: the key is re-derived from the Beijing date on every (re)start."
-echo "A cron job restarts the service every 6 hours; after a restart crosses"
-echo "midnight (Beijing), clients must be restarted too."
+echo "A systemd timer restarts the service at 00:00/06:00/12:00/18:00 local"
+echo "time, so the server key follows the Beijing date change within seconds."
+echo "A client process started before midnight still holds the previous day's"
+echo "key, so restart the client as well after the date changes."
 echo
 systemctl status "$SERVICE_NAME" --no-pager || true

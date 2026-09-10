@@ -1,9 +1,16 @@
 [Unit]
-Description=Refresh KCP proxy daily key every six hours
+Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 local)
 
 [Timer]
-OnBootSec=6h
-OnUnitActiveSec=6h
+# Calendar schedule, deliberately NOT OnBootSec/OnUnitActiveSec. A monotonic
+# elapse whose time has already passed when the timer is (re)started is dropped
+# by systemd (Persistent= only applies to OnCalendar=), leaving the timer
+# "active (elapsed)" with no next trigger. The server then keeps whatever
+# Beijing-date key it started with, so every client fails DECRYPT_FAILED until
+# someone restarts the service by hand.
+# 0/6:00 = 00:00, 06:00, 12:00, 18:00 local, so the key follows the Beijing
+# date change within a second instead of up to six hours later.
+OnCalendar=*-*-* 0/6:00:00
 Persistent=true
 
 [Install]

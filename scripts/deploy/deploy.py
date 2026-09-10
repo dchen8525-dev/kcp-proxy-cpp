@@ -315,8 +315,10 @@ def main():
         print(f"Then point your app at SOCKS5 {listen_host}:{listen_port}.")
         print()
         print("NOTE: the key is re-derived from the Beijing date on every")
-        print("service (re)start, and a cron job restarts the service every")
-        print("6 hours. After a restart crosses midnight, restart your client.")
+        print("service (re)start, and a systemd timer restarts the service at")
+        print("00:00/06:00/12:00/18:00 local time. A client process started")
+        print("before midnight keeps the previous day's key, so restart the")
+        print("client too once the date changes.")
         print("=" * 60)
 
 
