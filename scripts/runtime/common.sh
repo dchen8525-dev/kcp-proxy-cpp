@@ -12,6 +12,8 @@ SERVER_HOST="0.0.0.0"
 CLIENT_LISTEN_HOST="127.0.0.1"
 CLIENT_LISTEN_PORT=1080
 LOG_LEVEL="INFO"
+# Server log file (stdout+stderr). Empty LOG_FILE in server.env = journald only.
+LOG_FILE="/var/log/kcp-proxy/server.log"
 
 # ---------- install paths (server side) ----------
 INSTALL_DIR="/usr/local/bin/kcp-proxy"

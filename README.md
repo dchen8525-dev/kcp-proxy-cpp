@@ -154,7 +154,8 @@ sudo systemctl status kcp-proxy-server
 **配置说明**：
 - 服务自动监听 UDP 8388 端口
 - 密钥配置：`/etc/kcp-proxy/server.env`
-- 日志查看：`journalctl -u kcp-proxy-server -f`
+- 日志文件：`/var/log/kcp-proxy/server.log`（stdout+stderr 追加写入；超过 10 MiB 时在下次重启时轮转为 `.1`，仅保留一代。可在 `server.env` 中修改 `LOG_FILE` 路径，置空则只输出到 journald）
+- 日志查看：`journalctl -u kcp-proxy-server -f`（启动横幅等 systemd 输出），或 `tail -f /var/log/kcp-proxy/server.log`
 - 默认密钥：Beijing Date (YYYYMMDD) + suffix
 
 #### 方法2：从源码部署

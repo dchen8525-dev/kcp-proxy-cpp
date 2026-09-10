@@ -55,6 +55,8 @@ CMAKE_VERSION_RE = re.compile(r"VERSION\s+(\d+\.\d+\.\d+)")
 SERVER_PORT = 8388
 SERVER_HOST = "0.0.0.0"
 LOG_LEVEL = "INFO"
+LOG_DIR = "/var/log/kcp-proxy"
+LOG_FILE = f"{LOG_DIR}/server.log"
 INSTALL_DIR = "/usr/local/bin/kcp-proxy"
 ENV_DIR = "/etc/kcp-proxy"
 ENV_FILE = f"{ENV_DIR}/server.env"
@@ -193,20 +195,44 @@ def new_stage_dir(prefix: str) -> Path:
 WRAPPER_SH = """\
 #!/bin/sh
 # Wrapper: derives daily key = YYYYMMDD (Beijing time) + SUFFIX.
-# SUFFIX/PORT/HOST/LOG_LEVEL come from EnvironmentFile=/etc/kcp-proxy/server.env
+# SUFFIX/PORT/HOST/LOG_LEVEL/LOG_FILE come from EnvironmentFile=/etc/kcp-proxy/server.env
 set -eu
 
 SUFFIX="${SUFFIX:?SUFFIX not set - check /etc/kcp-proxy/server.env}"
 PORT="${PORT:-8388}"
 HOST="${HOST:-0.0.0.0}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+# Empty LOG_FILE = log to journald only. Otherwise stdout+stderr are appended
+# to the file. The key-refresh timer restarts the service every 6h, so the
+# 10 MiB rotation below runs every 6h and keeps one .1 generation.
+LOG_FILE="${LOG_FILE:-}"
+SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
 
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
 KEY="${DATE_BEIJING}${SUFFIX}"
 
 # Never log the full key - only the date portion and suffix length.
 echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}"
-exec /usr/local/bin/kcp-proxy/kcp-proxy-server -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+
+# Probe writability in a subshell: a failed redirection on a special builtin
+# would abort the wrapper, but here it just fails the probe.
+if [ -n "$LOG_FILE" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
+    if [ -f "$LOG_FILE" ]; then
+        size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' \\t' || echo 0)
+        if [ "$size" -gt 10485760 ]; then
+            mv -f "$LOG_FILE" "$LOG_FILE.1"
+        fi
+    fi
+    {
+        echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT} ==="
+        exec "$SERVER_BIN" -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+    } >> "$LOG_FILE" 2>&1
+fi
+
+if [ -n "$LOG_FILE" ]; then
+    echo "WARNING: LOG_FILE=$LOG_FILE is not writable - logging to journald instead" >&2
+fi
+exec "$SERVER_BIN" -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
 """
 
 SERVER_ENV = f"""\
@@ -216,6 +242,10 @@ SUFFIX=
 PORT={SERVER_PORT}
 HOST={SERVER_HOST}
 LOG_LEVEL={LOG_LEVEL}
+# Server log file (stdout+stderr). Empty = log to journald only.
+# Must stay under {LOG_DIR} unless you also extend ReadWritePaths
+# in the systemd unit (ProtectSystem=strict blocks everything else).
+LOG_FILE={LOG_FILE}
 """
 
 SYSTEMD_UNIT = f"""\
@@ -243,6 +273,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# Allow writes to LOG_FILE's directory (see server.env); '-' = optional path
+ReadWritePaths=-{LOG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -260,6 +292,21 @@ case "$1" in
         if ! id "$SERVICE_USER" >/dev/null 2>&1; then
             useradd --system --no-create-home --shell /sbin/nologin "$SERVICE_USER"
         fi
+
+        # log directory for LOG_FILE (default {LOG_FILE}). A LOG_FILE customized
+        # inside {LOG_DIR} is honored; anything else falls back to the default,
+        # so chown stays scoped to the dedicated log directory.
+        LOG_FILE={LOG_FILE}
+        if [ -f {ENV_FILE} ]; then
+            configured=$(grep -E '^LOG_FILE=' {ENV_FILE} | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
+            case "$configured" in
+                {LOG_DIR}/*) LOG_FILE="$configured" ;;
+            esac
+        fi
+        LOG_DIR=$(dirname "$LOG_FILE")
+        mkdir -p "$LOG_DIR"
+        chown "$SERVICE_USER" "$LOG_DIR"
+        chmod 755 "$LOG_DIR"
 
         # defensively migrate from a legacy @template unit
         if [ -f /etc/systemd/system/kcp-proxy-server@.service ]; then
@@ -309,6 +356,9 @@ case "$1" in
         ;;
     purge)
         rm -rf {ENV_DIR}
+        # remove the default log directory; a LOG_FILE customized to a location
+        # outside {LOG_DIR} is deliberately left untouched
+        rm -rf {LOG_DIR}
         ;;
 esac
 exit 0

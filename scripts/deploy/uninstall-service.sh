@@ -67,6 +67,12 @@ rm -rf "$INSTALL_DIR"
 if [ "$PURGE" -eq 1 ]; then
     [ "$ENV_DIR" = "/etc/kcp-proxy" ] || { echo "Refusing unexpected ENV_DIR: $ENV_DIR" >&2; exit 1; }
     rm -rf "$ENV_DIR"
+    LOG_DIR="$(dirname "${LOG_FILE:-/var/log/kcp-proxy/server.log}")"
+    if [ "$LOG_DIR" = "/var/log/kcp-proxy" ]; then
+        rm -rf "$LOG_DIR"
+    else
+        echo "Keeping custom log directory: $LOG_DIR"
+    fi
 fi
 
 # Remove service user

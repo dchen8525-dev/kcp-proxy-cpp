@@ -51,7 +51,7 @@ Key is derived via HKDF-SHA256 into AES-128-GCM keys (see README 协议与加密
 - Packaging: `python3 scripts/package/package.py standalone` (tar.gz on linux/macos, zip on windows) and `python3 scripts/package/package.py deb`. Archive permissions come from an explicit table in `package.py`, never from `stat()` — Windows has no Unix mode bits.
 - `scripts/runtime/common.sh` is the single source of truth for ports and suffix validation — `start.sh` and `install-service.sh` source it, `deploy.py` parses it.
 - One-command deploy: `./deploy.sh user@host` (thin forwarder to `scripts/deploy/deploy.py`, Python3 stdlib + system ssh/scp, cross-platform).
-- Server side: fixed unit name `kcp-proxy-server.service` (no @template), suffix stored in `/etc/kcp-proxy/server.env` (mode 600), runs as `kcpproxy` system user.
+- Server side: fixed unit name `kcp-proxy-server.service` (no @template), suffix stored in `/etc/kcp-proxy/server.env` (mode 600), runs as `kcpproxy` system user. Logs append to `LOG_FILE` from server.env (default `/var/log/kcp-proxy/server.log`; empty = journald only) — rotated to `.1` past 10 MiB at each restart; the unit carves the dir out of ProtectSystem via `ReadWritePaths=-/var/log/kcp-proxy`.
 - Key = Beijing date (YYYYMMDD) + suffix, re-derived on each service (re)start. A root crontab entry (`0 */6 * * *`, marker `# kcp-proxy-server`) restarts the service every 6 hours so the key rolls over shortly after midnight; clients must restart after the key changes. Uninstall removes the cron entry.
 
 ## Architecture

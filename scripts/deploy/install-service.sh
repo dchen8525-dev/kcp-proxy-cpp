@@ -28,6 +28,7 @@ else
     SERVER_PORT=8388
     SERVER_HOST="0.0.0.0"
     LOG_LEVEL="INFO"
+    LOG_FILE="/var/log/kcp-proxy/server.log"
     INSTALL_DIR="/usr/local/bin/kcp-proxy"
     ENV_DIR="/etc/kcp-proxy"
     ENV_FILE="$ENV_DIR/server.env"
@@ -73,6 +74,24 @@ validate_suffix "$SUFFIX"
 KEY_LEN=$((8 + ${#SUFFIX}))
 check_key_len "$(printf '%*s' "$KEY_LEN" '' | tr ' ' x)"
 
+# ---------- log file: existing env file wins, else default ----------
+# The service can only write under /var/log/kcp-proxy (ReadWritePaths in the
+# unit, and chown must stay scoped to that directory), so enforce it here.
+LOG_FILE=""
+if [ -f "$ENV_FILE" ]; then
+    LOG_FILE=$(grep -E '^LOG_FILE=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '\r' || true)
+fi
+case "$LOG_FILE" in
+    /var/log/kcp-proxy/*) ;;
+    "")
+        LOG_FILE="/var/log/kcp-proxy/server.log" ;;
+    *)
+        echo "Warning: LOG_FILE must stay under /var/log/kcp-proxy (the only" >&2
+        echo "directory the service can write); using the default instead." >&2
+        LOG_FILE="/var/log/kcp-proxy/server.log" ;;
+esac
+LOG_DIR=$(dirname "$LOG_FILE")
+
 # ---------- migrate from legacy @template unit, if present ----------
 if [ -f /etc/systemd/system/kcp-proxy-server@.service ]; then
     echo "Found legacy kcp-proxy-server@.service — migrating to $SERVICE_NAME ..."
@@ -108,28 +127,62 @@ SUFFIX=$SUFFIX
 PORT=$SERVER_PORT
 HOST=$SERVER_HOST
 LOG_LEVEL=$LOG_LEVEL
+# Server log file (stdout+stderr). Empty = log to journald only.
+# Must stay under /var/log/kcp-proxy unless you also extend ReadWritePaths
+# in the systemd unit (ProtectSystem=strict blocks everything else).
+LOG_FILE=$LOG_FILE
 EOF
 mv -f "$tmp_env" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
+
+# ---------- log directory (parent of LOG_FILE, writable by the service user) ----------
+echo "Preparing log directory: $LOG_DIR ..."
+mkdir -p "$LOG_DIR"
+chown "$SERVICE_USER" "$LOG_DIR"
+chmod 755 "$LOG_DIR"
 
 # ---------- wrapper (derives daily key, never logs the full key) ----------
 cat > "$INSTALL_DIR/kcp-proxy-server-wrapper.sh" << 'WRAPPER'
 #!/usr/bin/env bash
 # Wrapper: derives daily key = YYYYMMDD (Beijing time) + SUFFIX.
-# SUFFIX/PORT/HOST/LOG_LEVEL come from EnvironmentFile=/etc/kcp-proxy/server.env
+# SUFFIX/PORT/HOST/LOG_LEVEL/LOG_FILE come from EnvironmentFile=/etc/kcp-proxy/server.env
 set -euo pipefail
 
 SUFFIX="${SUFFIX:?SUFFIX not set — check /etc/kcp-proxy/server.env}"
 PORT="${PORT:-8388}"
 HOST="${HOST:-0.0.0.0}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+# Empty LOG_FILE = log to journald only. Otherwise stdout+stderr are appended
+# to the file. The key-refresh timer restarts the service every 6h, so the
+# 10 MiB rotation below runs every 6h and keeps one .1 generation.
+LOG_FILE="${LOG_FILE:-}"
+SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
 
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
 KEY="${DATE_BEIJING}${SUFFIX}"
 
 # Never log the full key — only the date portion and suffix length.
 echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}"
-exec /usr/local/bin/kcp-proxy/kcp-proxy-server -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+
+# Probe writability in a subshell: a failed redirection on a special builtin
+# would abort the wrapper, but here it just fails the probe.
+if [ -n "$LOG_FILE" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
+    if [ -f "$LOG_FILE" ]; then
+        size=$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' \t' || echo 0)
+        if [ "$size" -gt 10485760 ]; then
+            mv -f "$LOG_FILE" "$LOG_FILE.1"
+        fi
+    fi
+    {
+        echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT} ==="
+        exec "$SERVER_BIN" -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+    } >> "$LOG_FILE" 2>&1
+fi
+
+if [ -n "$LOG_FILE" ]; then
+    echo "WARNING: LOG_FILE=$LOG_FILE is not writable — logging to journald instead" >&2
+fi
+exec "$SERVER_BIN" -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
 WRAPPER
 chmod 755 "$INSTALL_DIR/kcp-proxy-server-wrapper.sh"
 
@@ -159,6 +212,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# Allow writes to LOG_FILE's directory (see server.env); '-' = optional path
+ReadWritePaths=-$LOG_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -206,6 +261,8 @@ echo
 echo "Commands:"
 echo "  Status:  systemctl status $SERVICE_NAME"
 echo "  Logs:    journalctl -u $SERVICE_NAME -f"
+echo "  Logfile: $LOG_FILE (rotates to .1 past 10 MiB; empty LOG_FILE in"
+echo "           $ENV_FILE = journald only)"
 echo "  Stop:    systemctl stop $SERVICE_NAME"
 echo "  Restart: systemctl restart $SERVICE_NAME"
 echo
