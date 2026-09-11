@@ -78,7 +78,9 @@ server 日志呈现完整生命周期（会话创建 / 关闭、SOCKS5 目标、
 - 安卓第 2–4 项未做（用户忽略）。
 - 第 1 项若将来要统一 `clang-format` 风格：本机未装 LLVM / `clang-format`（VS18 仅含 MSVC），需另装或用
   IDE 格式化；当前代码已可读，非阻塞。
-- `build/CMakeCache.txt` 的本地修改不提交（`gitignore`）。他人在新机器**首次** `configure` 仍可能踩
-  vcpkg / VS18 检测坑——建议把「`VCPKG_MANIFEST_INSTALL=OFF` + 显式编译器路径 + `unset` 代理」固化进
-  `build_vs.bat` 或在 README / CI 注明。
+- 构建环境修复已**固化进 `build_vs.bat`**（本回合）：脚本开头清空所有代理变量、把 VS 内置 `cmake`
+  加进 `PATH`、检测到 `build/vcpkg_installed` 即跳过 `vcpkg install` 并传 `-DVCPKG_MANIFEST_INSTALL=OFF`。
+  本机 `.\build_vs.bat` 现已一键跑通（Release 全绿 + CTest 1/1 + DLL 拷贝）。注意：干净 checkout 无
+  `build/vcpkg_installed` 时会走 bootstrap 分支（需网络 clone vcpkg）；本机沙箱无网络但依赖已装，故走跳过分支。
+  `build/CMakeCache.txt` 的本地修改不提交（`gitignore`）。
 - GUI 的 `pipelined-smoke` 测试需带 `node_modules` 的环境才能跑，本机未验证。
