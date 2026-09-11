@@ -115,7 +115,7 @@ int KcpWrapper::wait_send() const {
 }
 
 void KcpWrapper::configure() {
-    ikcp_nodelay(kcp_, 1, KCP_INTERVAL_MS, 5, 1);
+    ikcp_nodelay(kcp_, KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC);
     ikcp_wndsize(kcp_, KCP_SNDWND, KCP_RCVWND);
     ikcp_setmtu(kcp_, KCP_MTU);
 }

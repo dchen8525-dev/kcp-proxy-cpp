@@ -2,14 +2,24 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 
 namespace kcp_proxy {
 
 // KCP configuration (matches Python implementation exactly)
+// Conversation id. Every session on the wire carries it, so both peers must
+// use the same value or ikcp silently discards the peer's packets.
+constexpr uint32_t KCP_CONV = 1;
 constexpr int KCP_INTERVAL_MS = 10;
 constexpr int KCP_SNDWND = 256;
 constexpr int KCP_RCVWND = 512;
 constexpr int KCP_MTU = 1400;
+// ikcp_nodelay() tuning. Named constants (instead of literals at the call
+// site) so the startup log and the live ikcp state can never drift apart —
+// the log renders these exact values.
+constexpr int KCP_NODELAY = 1; // 1 = enable nodelay (low-latency mode)
+constexpr int KCP_RESEND = 5;  // fast-retransmit after N skipped ACKs
+constexpr int KCP_NC = 1;      // 1 = disable congestion control
 // ikcp per-segment wire header overhead (conv4+cmd1+frg1+wnd2+ts4+sn4+una4+len4).
 constexpr int KCP_SEGMENT_OVERHEAD = 24;
 constexpr int KCP_TIMEOUT_SEC = 60;
@@ -123,5 +133,22 @@ inline constexpr char KCP_CONTROL_HELLO_ACK[] = "KCP_PROXY_HELLO_ACK_V1";
 // taught to recognize and drop this sentinel too, otherwise it would be
 // forwarded into the tunnel as garbage.
 inline constexpr char KCP_CONTROL_KEEPALIVE[] = "KCP_PROXY_KEEPALIVE_V1";
+
+// One-line summary of the KCP settings actually in force, rendered from the
+// constants above. Server, client and (eventually) the Android CPP_REMOTE peer
+// log this exact string at startup so a mismatch between two ends of a tunnel
+// is visible in the logs instead of showing up as a mysterious handshake
+// failure. Keep the field order stable — it is greppable output.
+inline std::string kcp_config_line() {
+    return "KCP config conv=" + std::to_string(KCP_CONV) +
+           " mtu=" + std::to_string(KCP_MTU) +
+           " nodelay=" + std::to_string(KCP_NODELAY) +
+           " interval=" + std::to_string(KCP_INTERVAL_MS) +
+           " resend=" + std::to_string(KCP_RESEND) +
+           " nc=" + std::to_string(KCP_NC) +
+           " sndWnd=" + std::to_string(KCP_SNDWND) +
+           " rcvWnd=" + std::to_string(KCP_RCVWND) +
+           " timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s";
+}
 
 } // namespace kcp_proxy

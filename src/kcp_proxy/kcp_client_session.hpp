@@ -24,7 +24,7 @@ namespace kcp_proxy {
 class KCPClientSession : public std::enable_shared_from_this<KCPClientSession> {
 public:
     KCPClientSession(asio::io_context& io, asio::ip::udp::endpoint server_addr,
-                     std::shared_ptr<Crypto> crypto, uint32_t conv = 1);
+                     std::shared_ptr<Crypto> crypto, uint32_t conv = KCP_CONV);
     ~KCPClientSession();
 
     // Async-friendly: connect dispatches onto the strand so the upper layer

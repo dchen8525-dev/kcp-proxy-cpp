@@ -127,6 +127,10 @@ void KCPProxyClient::do_resolve() {
             running_ = true;
             LOG_INFO("client", "SOCKS5 proxy listening on " +
                      listen_host_ + ":" + std::to_string(listen_port_));
+            // Same rendering as the server's startup line: diff the two logs to
+            // confirm both ends of the tunnel negotiate with identical KCP
+            // parameters (a mismatch manifests as a dead handshake).
+            LOG_INFO("client", kcp_config_line());
 
             start_traffic_reporter();
             // Start the shared KCP update tick (one 10ms timer for all

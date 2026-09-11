@@ -101,11 +101,7 @@ void KCPServer::start() {
              " crypto=AES-128-GCM/HKDF-SHA256" +
              " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
              " log_level=" + log_level_name());
-    LOG_INFO("server", "KCP config conv=1 mtu=" + std::to_string(KCP_MTU) +
-             " nodelay=1 interval=" + std::to_string(KCP_INTERVAL_MS) +
-             " resend=5 nc=1 sndWnd=" + std::to_string(KCP_SNDWND) +
-             " rcvWnd=" + std::to_string(KCP_RCVWND) +
-             " timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s");
+    LOG_INFO("server", kcp_config_line());
 
     do_receive();
 }
@@ -348,7 +344,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 return nullptr;
             }
         }
-        session = std::make_shared<KCPSession>(io_, 1, addr, std::move(session_crypto), sid);
+        session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid);
         // Set the send callback BEFORE publishing the session into sessions_.
         // The shared update tick can dispatch on_update_tick (and therefore
         // handle_kcp_output, which reads send_callback_) onto any thread the
