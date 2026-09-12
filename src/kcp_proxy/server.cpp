@@ -41,8 +41,8 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
       key_(key),
       udp_socket_(io_),
       cleanup_timer_(io_),
-      update_tick_timer_(io_),
-      receive_backoff_timer_(io_) {}
+      receive_backoff_timer_(io_),
+      update_tick_timer_(io_) {}
 
 KCPServer::~KCPServer() {
     stop();
