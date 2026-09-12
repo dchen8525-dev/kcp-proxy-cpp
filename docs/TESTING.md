@@ -62,7 +62,7 @@ python tests/e2e/robustness_e2e.py `
 Add `--keep-logs` to keep the per-process server/client log files for
 inspection (they are printed on failure either way).
 
-Three phases, all offline:
+Four phases, all offline:
 
 - **A. Wrong key** — a client started with a mismatched key must be dropped by
   the server at the auth boundary: no session is created, the packet is rejected
@@ -80,35 +80,45 @@ Three phases, all offline:
   must be registered *and* reclaimed once its target closes (verified by
   counting `new session` against `close_connection from target_drained`), and 10
   abrupt `SO_LINGER`-reset connections must not wedge the server.
+- **D. Half-close** — the local app stops sending while its target never closes.
+  A response still in flight must arrive byte-exact even when it is spread across
+  (and past) the grace window, while a stalled tunnel must be reclaimed — the
+  KCP session and its UDP socket are released rather than held forever. Also
+  checks the control case: nothing is reclaimed *before* the grace elapses, so
+  the bound can never truncate a response.
 
 The phases use `--allow-target` only to reach their own local echo servers; the
 regression that the guard stays on by default is pinned by `tunnel_e2e.py`.
 
-### Known limitation: half-closed tunnels are never reclaimed
+### Half-closed tunnels: bounded by a grace
 
-Measured on 2026-09-12 (Windows, Release build), with a local echo target that
-stays open:
+When the local app's read side reports EOF the client half-closes the tunnel
+instead of tearing it down, so a response still in flight is not truncated. That
+half-close cannot be unbounded: the application-layer keepalives keep refresh
+**both** peers' idle clocks, so if the target never closes either, nothing would
+ever reclaim the tunnel — each abandoned app (a closed browser tab, a client
+timeout, `curl --max-time`) would leak a local socket, a UDP socket, KCP buffers
+and one upstream connection until the client hit `MAX_CLIENT_SESSIONS` (512) and
+refused *all* new connections.
 
-- A tunnel whose **local app closes its socket** while the target keeps the
-  connection open is **never torn down**. The client half-closes by design (so a
-  large response in flight is not truncated) and keeps its KCP session; both
-  peers then keep each other alive with the 30 s application-layer keepalive, so
-  neither the client's nor the server's 60 s idle timer ever fires.
-- Control: a session the client abandons completely (its UDP socket is closed,
-  so no keepalives are sent) *is* reaped by the server's 30 s idle sweep, which
-  shows the sweep itself works.
-- Effect: repeated "app aborts mid-request" (closed browser tabs, client
-  timeouts, `curl --max-time`) accumulates sessions — each holding a UDP socket,
-  KCP buffers and an open upstream connection — until the client's
-  `MAX_CLIENT_SESSIONS` (512) is reached, after which it refuses *all* new
-  connections. Normal HTTP traffic self-heals because the target eventually
-  closes, which takes the `target_drained` path.
+The client therefore arms a grace (`CLIENT_HALF_CLOSE_GRACE_SEC`, 2× the idle
+timeout) when the app's read side reports EOF, and is refreshed **only** by
+payload actually written to the app — application keepalives are dropped inside
+the session and never reach the forwarding loop, so they cannot extend it. A
+response that keeps making progress is therefore never cut off, while a tunnel
+that goes quiet for the whole window is closed. Once the client closes its
+session it stops sending, so the server's own idle sweep reaps its half of the
+tunnel shortly after.
 
-Fixing this needs a client→server half-close signal (a new control frame) or a
-bounded grace timer for a half-closed session; both change protocol or product
-behaviour, so neither is done here. The negative suite deliberately asserts the
-tunnel teardown it *can* guarantee (target-closed reclamation) and does not
-assert this case.
+Override the grace for lab use (phase D of the robustness suite uses this to
+avoid waiting out the production value):
+
+```powershell
+kcp-proxy-client.exe -s 127.0.0.1 -k <key> --half-close-grace 3
+```
+
+A grace of `0` reclaims the tunnel immediately at EOF, which is only safe when
+the target is known to answer within the same packet exchange.
 
 Current unit coverage includes:
 

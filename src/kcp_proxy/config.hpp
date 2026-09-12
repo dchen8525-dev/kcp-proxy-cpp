@@ -28,6 +28,22 @@ constexpr int KCP_TIMEOUT_SEC = 60;
 // quiet tunnel (e.g. an idle SSH session). Must be < KCP_TIMEOUT_SEC.
 constexpr int KCP_KEEPALIVE_SEC = 30;
 
+// Client-side half-close grace (seconds). When the local app closes its write
+// side the client deliberately half-closes the tunnel instead of tearing it
+// down, so a response that is still in flight is not truncated. That leaves the
+// tunnel in a state neither idle sweep can ever reap: the application-layer
+// keepalives keep refreshing BOTH peers' idle clocks (each side only stops
+// sending them once its own session is gone), so a half-closed tunnel whose
+// target never closes would survive forever and leak the local socket, the UDP
+// socket and one upstream connection per abandoned app until the client hits
+// MAX_CLIENT_SESSIONS and refuses everything. This bounds it: the grace starts
+// when the app's read side reports EOF and is refreshed ONLY by payload
+// actually delivered to the app (never by keepalives), so a slow but still
+// progressing response is not cut off while a stalled one is reclaimed.
+// 2x KCP_TIMEOUT_SEC: comfortably longer than a slow / long-polling target,
+// short enough that abandoned tunnels cannot accumulate.
+constexpr int CLIENT_HALF_CLOSE_GRACE_SEC = 2 * KCP_TIMEOUT_SEC;
+
 // Server-side guard against memory exhaustion: any UDP source endpoint that
 // fails its first decryption is dropped on the floor; only authenticated
 // peers are allowed to allocate a session. The hard cap also bounds total

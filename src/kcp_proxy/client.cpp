@@ -3,6 +3,7 @@
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/socks5.hpp"
+#include "kcp_proxy/time_util.hpp"
 #include <asio/error.hpp>
 #include <asio/read.hpp>
 #include <asio/write.hpp>
@@ -26,10 +27,11 @@ std::string sock_err(const std::error_code& ec) {
 
 KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host,
                                 uint16_t server_port, std::string key,
-                                std::string listen_host, uint16_t listen_port)
+                                std::string listen_host, uint16_t listen_port,
+                                int half_close_grace_sec)
     : io_(io), server_host_(std::move(server_host)), server_port_(server_port),
       key_(std::move(key)), listen_host_(std::move(listen_host)),
-      listen_port_(listen_port),
+      listen_port_(listen_port), half_close_grace_sec_(half_close_grace_sec),
       tcp_acceptor_(io_), udp_resolver_(io_), traffic_timer_(io),
       update_tick_timer_(io) {
 }
@@ -480,9 +482,13 @@ void KCPProxyClient::handle_sync_request(
     session->send_data(byte_view(req_data.data(), req_data.size()));
 
     auto self = shared_from_this();
+    // Half-close bookkeeping shared by both forwarding loops. The deadline is
+    // only ever armed if the local app stops sending first; see
+    // CLIENT_HALF_CLOSE_GRACE_SEC for why an unbounded half-close leaks.
+    auto half_close = std::make_shared<HalfCloseGuard>(session->strand());
     auto reply_buf = std::make_shared<std::vector<uint8_t>>(SOCKS5_REPLY_BUF_SIZE);
     session->async_read_some(asio::buffer(*reply_buf),
-        [this, client_socket, session, reply_buf, handshake_start, handshake_deadline, handshake_cancelled, self]
+        [this, client_socket, session, reply_buf, handshake_start, handshake_deadline, handshake_cancelled, half_close, self]
         (const std::error_code& ec, size_t bytes) {
             if (handshake_cancelled->load()) return;
             // Send the error reply, then release the session once the write
@@ -531,7 +537,7 @@ void KCPProxyClient::handle_sync_request(
             auto reply = std::make_shared<std::vector<uint8_t>>(resp.build());
 
             asio::async_write(*client_socket, asio::buffer(*reply),
-                [this, client_socket, session, reply, handshake_start, self]
+                [this, client_socket, session, reply, handshake_start, half_close, self]
                 (const std::error_code& ec2, size_t) {
                     if (ec2) {
                         LOG_ERROR("client", "send reply error: " + ec2.message());
@@ -550,8 +556,8 @@ void KCPProxyClient::handle_sync_request(
                         std::chrono::steady_clock::now() - handshake_start).count();
                     LOG_INFO("client", "handshake complete in " +
                              std::to_string(elapsed_ms) + "ms, starting forwarding");
-                    forward_client_to_kcp(client_socket, session);
-                    forward_kcp_to_client(client_socket, session);
+                    forward_client_to_kcp(client_socket, session, {}, half_close);
+                    forward_kcp_to_client(client_socket, session, {}, half_close);
                 });
         });
 }
@@ -579,14 +585,15 @@ void KCPProxyClient::report_traffic() {
 void KCPProxyClient::forward_client_to_kcp(
     std::shared_ptr<asio::ip::tcp::socket> client_socket,
     std::shared_ptr<KCPClientSession> session,
-    std::shared_ptr<std::vector<uint8_t>> buf) {
+    std::shared_ptr<std::vector<uint8_t>> buf,
+    std::shared_ptr<HalfCloseGuard> guard) {
 
     // Run the whole loop on the session strand so the KCP-state reads
     // (wait_send) are serialized with the strand handlers that mutate KCP.
     if (!session->strand().running_in_this_thread()) {
         auto self = shared_from_this();
-        asio::dispatch(session->strand(), [this, self, client_socket, session, buf]() mutable {
-            forward_client_to_kcp(client_socket, session, buf);
+        asio::dispatch(session->strand(), [this, self, client_socket, session, buf, guard]() mutable {
+            forward_client_to_kcp(client_socket, session, buf, guard);
         });
         return;
     }
@@ -609,10 +616,10 @@ void KCPProxyClient::forward_client_to_kcp(
         auto retry = std::make_shared<asio::steady_timer>(io_);
         retry->expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS * 4));
         auto self = shared_from_this();
-        retry->async_wait([self, client_socket, session, buf, retry](const std::error_code& ec) mutable {
+        retry->async_wait([self, client_socket, session, buf, guard, retry](const std::error_code& ec) mutable {
             if (ec) return;
             if (session->is_connected()) {
-                self->forward_client_to_kcp(client_socket, session, buf);
+                self->forward_client_to_kcp(client_socket, session, buf, guard);
             }
         });
         return;
@@ -621,7 +628,7 @@ void KCPProxyClient::forward_client_to_kcp(
     auto self = shared_from_this();
     client_socket->async_read_some(asio::buffer(*buf),
         asio::bind_executor(session->strand(),
-        [this, self, client_socket, session, buf](const std::error_code& ec, size_t bytes) mutable {
+        [this, self, client_socket, session, buf, guard](const std::error_code& ec, size_t bytes) mutable {
             if (ec == asio::error::eof) {
                 LOG_INFO("client", "client disconnected (EOF)");
                 // Half-close, mirroring the server's target-EOF path: the local
@@ -631,6 +638,13 @@ void KCPProxyClient::forward_client_to_kcp(
                 // alive, and forward_kcp_to_client closes both once the server
                 // tears the session down (KCP EOF) or an error arrives.
                 // Closing the session here would truncate large responses.
+                //
+                // The half-close must not be unbounded, though: if the target
+                // never closes either, the keepalives keep refreshing BOTH
+                // idle clocks, so no sweep on either side can ever reap the
+                // tunnel. Start the grace, refreshed only by real payload from
+                // the target (see CLIENT_HALF_CLOSE_GRACE_SEC).
+                arm_half_close_grace(guard, client_socket, session);
                 return;
             }
             if (ec || bytes == 0) {
@@ -649,19 +663,20 @@ void KCPProxyClient::forward_client_to_kcp(
             LOG_DEBUG("client", "forward_client_to_kcp: read " + std::to_string(bytes) +
                      " bytes -> KCP");
             session->send_data(byte_view(buf->data(), bytes));
-            forward_client_to_kcp(client_socket, session, buf);
+            forward_client_to_kcp(client_socket, session, buf, guard);
         }));
 }
 
 void KCPProxyClient::forward_kcp_to_client(
     std::shared_ptr<asio::ip::tcp::socket> client_socket,
     std::shared_ptr<KCPClientSession> session,
-    std::shared_ptr<std::vector<uint8_t>> buf) {
+    std::shared_ptr<std::vector<uint8_t>> buf,
+    std::shared_ptr<HalfCloseGuard> guard) {
 
     if (!session->strand().running_in_this_thread()) {
         auto self = shared_from_this();
-        asio::dispatch(session->strand(), [this, self, client_socket, session, buf]() mutable {
-            forward_kcp_to_client(client_socket, session, buf);
+        asio::dispatch(session->strand(), [this, self, client_socket, session, buf, guard]() mutable {
+            forward_kcp_to_client(client_socket, session, buf, guard);
         });
         return;
     }
@@ -669,7 +684,7 @@ void KCPProxyClient::forward_kcp_to_client(
 
     LOG_DEBUG("client", "forward_kcp_to_client: starting async_read_some");
     session->async_read_some(asio::buffer(*buf),
-        [this, client_socket, session, buf](const std::error_code& ec, size_t bytes) mutable {
+        [this, client_socket, session, buf, guard](const std::error_code& ec, size_t bytes) mutable {
             if (ec || bytes == 0) {
                 if (ec == asio::error::eof) {
                     LOG_INFO("client", "KCP session closed (EOF)");
@@ -685,12 +700,24 @@ void KCPProxyClient::forward_kcp_to_client(
             }
 
             rx_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+            // Data from the target is progress, recorded as soon as it is
+            // consumed from KCP rather than when the write completes: a slow
+            // write to the app must not be mistaken for a stalled target and
+            // aborted by the grace. This handler and the grace callback both run
+            // on the session strand, so the ordering is well-defined — either
+            // the progress lands first (and the callback re-arms) or the
+            // callback ran before any data was available (and reclaiming is
+            // correct). Keepalives never reach this loop, so they still cannot
+            // extend the grace.
+            if (guard && guard->app_eof.load()) {
+                guard->last_progress_us.store(now_us());
+            }
             LOG_DEBUG("client", "forward_kcp_to_client: read " + std::to_string(bytes) +
                      " bytes -> client");
             asio::async_write(*client_socket,
                 asio::buffer(buf->data(), bytes),
                 asio::bind_executor(session->strand(),
-                [this, client_socket, session, buf](const std::error_code& ec2, size_t written) mutable {
+                [this, client_socket, session, buf, guard](const std::error_code& ec2, size_t written) mutable {
                     if (ec2) {
                         LOG_ERROR("client", "write to client error: " + ec2.message());
                         // Mirror the read-error path above: close BOTH sides.
@@ -703,11 +730,71 @@ void KCPProxyClient::forward_kcp_to_client(
                         session->close();
                         return;
                     }
+                    // Real payload reached the local app: the one and only
+                    // thing that extends a half-close grace (see the read path
+                    // above, where it is recorded). Keepalives never get here —
+                    // they are consumed inside the session — so an idle
+                    // half-closed tunnel still ages out.
                     LOG_DEBUG("client", "forward_kcp_to_client: write done (" +
                              std::to_string(written) + " bytes)");
-                    forward_kcp_to_client(client_socket, session, buf);
+                    forward_kcp_to_client(client_socket, session, buf, guard);
                 }));
         });
+}
+
+// --------------------------------------------------------------------------- //
+// half-close reclamation
+// --------------------------------------------------------------------------- //
+void KCPProxyClient::arm_half_close_grace(
+    const std::shared_ptr<HalfCloseGuard>& guard,
+    std::shared_ptr<asio::ip::tcp::socket> client_socket,
+    std::shared_ptr<KCPClientSession> session) {
+    if (!guard) return;
+
+    guard->app_eof.store(true);
+    guard->last_progress_us.store(now_us());
+
+    // Arm once. on_half_close_check() re-arms itself while the target keeps
+    // making progress, so the per-write hot path never touches the timer heap.
+    guard->deadline.expires_after(std::chrono::seconds(half_close_grace_sec_));
+    guard->deadline.async_wait(
+        [this, guard, client_socket, session](const std::error_code& ec) {
+            if (ec) return; // cancelled: the tunnel already finished
+            on_half_close_check(guard, client_socket, session);
+        });
+}
+
+void KCPProxyClient::on_half_close_check(
+    std::shared_ptr<HalfCloseGuard> guard,
+    std::shared_ptr<asio::ip::tcp::socket> client_socket,
+    std::shared_ptr<KCPClientSession> session) {
+    if (!guard->app_eof.load()) return;
+    // The tunnel may have ended normally (target closed, KCP EOF, write error)
+    // between the arm and this tick; there is nothing left to reclaim then.
+    if (!session || !session->is_connected()) return;
+
+    const int64_t grace_us = static_cast<int64_t>(half_close_grace_sec_) * 1000000;
+    const int64_t quiet_us = now_us() - guard->last_progress_us.load();
+    if (quiet_us < grace_us) {
+        // Payload was delivered inside the window, so the deadline expired
+        // before the tunnel was actually quiet. Wait out the remainder rather
+        // than cut a still-progressing response short.
+        guard->deadline.expires_after(std::chrono::microseconds(grace_us - quiet_us));
+        guard->deadline.async_wait(
+            [this, guard, client_socket, session](const std::error_code& ec) {
+                if (ec) return;
+                on_half_close_check(guard, client_socket, session);
+            });
+        return;
+    }
+
+    LOG_WARNING("client", "half-close grace expired (" +
+                std::to_string(quiet_us / 1000000) +
+                "s without target payload since the local app closed) - "
+                "reclaiming tunnel");
+    std::error_code ignored;
+    if (client_socket) client_socket->close(ignored);
+    if (session) session->close();
 }
 
 void KCPProxyClient::send_socks5_error(

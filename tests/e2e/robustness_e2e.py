@@ -17,6 +17,13 @@ security-sensitive proxy must *survive* but never be *seen* to succeed at:
                       with no cross-session bleed, and every session must be
                       reclaimed once its target closes (created == closed); an
                       abrupt RST must not wedge the server either.
+  D. Half-close     - a local app that stops sending half-closes the tunnel so
+                      an in-flight response is not truncated, but that grace
+                      must be bounded: a slow response spread past the grace
+                      must still arrive byte-exact, while a stalled one whose
+                      target never closes must be reclaimed (session + UDP
+                      socket released) instead of leaking one upstream
+                      connection per abandoned app.
 
 Every phase runs fully offline on loopback. Assertions are made against real
 process behaviour plus the structured logs (captured to files), never against
@@ -148,18 +155,23 @@ def dump_logs(log_paths, lines=12):
 
 
 def start_pair(server_exe, client_exe, udp_port, socks_port, key, log_dir, tag,
-               allow_target=None, log_level="INFO", client_key=None):
+               allow_target=None, log_level="INFO", client_key=None,
+               half_close_grace=None):
     """Start a server/client pair. ``client_key`` defaults to ``key``; passing a
-    different one is how the wrong-key phase provokes an auth failure."""
+    different one is how the wrong-key phase provokes an auth failure.
+    ``half_close_grace`` overrides the client's half-close grace so the
+    reclamation phase does not have to wait out the production value."""
     server_cmd = [server_exe, "-H", "127.0.0.1", "-p", str(udp_port),
                   "-k", key, "-L", log_level]
     if allow_target:
         server_cmd += ["--allow-target", allow_target]
     server = Proc(server_cmd, os.path.join(log_dir, tag + "-server.log"))
-    client = Proc([client_exe, "-s", "127.0.0.1", "-p", str(udp_port),
-                   "-H", "127.0.0.1", "-l", str(socks_port),
-                   "-k", client_key or key, "-L", log_level],
-                  os.path.join(log_dir, tag + "-client.log"))
+    client_cmd = [client_exe, "-s", "127.0.0.1", "-p", str(udp_port),
+                  "-H", "127.0.0.1", "-l", str(socks_port),
+                  "-k", client_key or key, "-L", log_level]
+    if half_close_grace is not None:
+        client_cmd += ["--half-close-grace", str(half_close_grace)]
+    client = Proc(client_cmd, os.path.join(log_dir, tag + "-client.log"))
     return server, client
 
 
@@ -515,6 +527,207 @@ def phase_concurrency(server_exe, client_exe, log_dir):
         target.stop()
 
 
+# --------------------------------------------------------------------------- #
+# phase D: the half-close must be bounded without truncating a slow response
+# --------------------------------------------------------------------------- #
+class HalfCloseTarget:
+    """A target that answers with delayed chunks and then NEVER closes.
+
+    The first byte of the request picks the behaviour:
+
+      ``C`` - send ``chunks`` payloads ``gap`` apart, then stay silent with the
+              connection still open (a slow but progressing response).
+      ``I`` - send nothing at all, connection open forever (a stalled long-poll
+              or an abandoned keep-alive connection).
+      ``E`` - echo everything back (a health check for the tunnel).
+
+    Never closing is the point: it is what makes the client-side half-close
+    unreclaimable without a grace, because the server never reaches its
+    target-closed drain path and the keepalives keep both idle clocks fresh.
+    """
+
+    def __init__(self, port, chunks=3, gap=1.2):
+        self.port = port
+        self.chunks = chunks
+        self.gap = gap
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(64)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop:
+            try:
+                self.sock.settimeout(0.3)
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.settimeout(15)
+            request = conn.recv(1)
+            if not request:
+                return
+            if request == b"E":
+                conn.sendall(request)
+                while True:
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    conn.sendall(data)
+                return
+            if request == b"C":
+                for i in range(self.chunks):
+                    time.sleep(self.gap)
+                    conn.sendall(b"chunk-%02d:" % i + bytes([65 + i]) * 64)
+            # Modes C and I then hold the connection open without ever sending
+            # FIN, so only the client's own grace can end the tunnel.
+            while not self._stop:
+                time.sleep(0.2)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def phase_half_close(server_exe, client_exe, log_dir):
+    """A local app that stops sending must not pin a tunnel forever.
+
+    The client deliberately half-closes when the app's read side reports EOF:
+    the response may still be in flight, and closing would truncate it. But the
+    application keepalives keep BOTH peers' idle clocks fresh, so if the target
+    never closes either, nothing ever reclaims the tunnel: it leaks the local
+    socket, the UDP socket and one upstream connection per abandoned app until
+    the client hits MAX_CLIENT_SESSIONS and refuses everything. This phase pins
+    both halves of the fix -- a progressing response survives the grace, a
+    stalled one is reclaimed.
+    """
+    print("[D] half-close: a slow response must survive, a stalled one must be reclaimed")
+    grace = 3          # seconds; short so the phase stays fast
+    chunks = 3
+    gap = 1.2          # chunks land over ~3.6s, i.e. past the 3s grace
+
+    target_port = free_port()
+    target = HalfCloseTarget(target_port, chunks=chunks, gap=gap)
+    target.start()
+
+    udp_port = free_port()
+    socks_port = free_port()
+    server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
+                                KEY, log_dir, "halfclose",
+                                allow_target="127.0.0.1:%d" % target_port,
+                                log_level="INFO",
+                                half_close_grace=grace)
+    try:
+        require_pair_ready(server, client, socks_port)
+        # wait_for_port() probes the listener with a connect/close, which the
+        # client turns into a session of its own. Let it settle so the counters
+        # below measure only this phase's tunnels.
+        time.sleep(1.0)
+
+        # on_close() emits a stats line, so this is a precise count of client
+        # sessions actually released (not merely of tunnels that logged).
+        base_closed = count_in(client.log_path, "stats tx_pkt=")
+        base_expired = count_in(client.log_path, "half-close grace expired")
+
+        # --- D1: the grace must not truncate a response still in flight -----
+        # The app half-closes its write side, then reads a response the target
+        # delivers in chunks spread across (and past) the grace window. Every
+        # byte must arrive: reclaiming at the deadline without checking for
+        # progress would cut the response.
+        app = socks5_connect("127.0.0.1", socks_port, "127.0.0.1", target_port, 20)
+        app.sendall(b"C")
+        app.shutdown(socket.SHUT_WR)
+        expected = b"".join(b"chunk-%02d:" % i + bytes([65 + i]) * 64
+                            for i in range(chunks))
+        try:
+            got = recv_exact(app, len(expected), 30)
+        except RuntimeError as exc:
+            raise AssertionError(
+                "half-closed tunnel truncated the slow response (%s): the grace "
+                "may only reclaim a tunnel that stopped making progress" % exc)
+        finally:
+            app.close()
+        if got != expected:
+            raise AssertionError(
+                "half-closed tunnel corrupted the slow response: expected %d "
+                "bytes, got %d" % (len(expected), len(got)))
+        print("  [ok] %d-byte response delivered in %d chunks over %.1fs (> grace=%ds): "
+              "no truncation" % (len(expected), chunks, gap * chunks, grace))
+
+        # D1's target never closes either, so its own tunnel must be reclaimed
+        # by the same grace. Waiting for that also gives D2 a clean baseline.
+        if not wait_until(
+                lambda: count_in(client.log_path, "stats tx_pkt=") > base_closed,
+                grace + 20):
+            raise AssertionError(
+                "the half-closed tunnel was never reclaimed after its target "
+                "went quiet (session leak)")
+        print("  [ok] it was reclaimed once the chunks stopped, not left pinned")
+
+        # --- D2: a stalled half-close must be reclaimed --------------------
+        base_closed = count_in(client.log_path, "stats tx_pkt=")
+        base_expired = count_in(client.log_path, "half-close grace expired")
+
+        app = socks5_connect("127.0.0.1", socks_port, "127.0.0.1", target_port, 20)
+        app.sendall(b"I")           # target will never answer and never close
+        time.sleep(0.5)
+        app.close()                 # local app abandons the tunnel (read EOF)
+
+        # Control: nothing may be reclaimed before the grace elapses, otherwise
+        # the fix would be a truncation hazard rather than a bound.
+        time.sleep(1.0)
+        if count_in(client.log_path, "half-close grace expired") > base_expired:
+            raise AssertionError(
+                "half-closed tunnel was reclaimed before the grace elapsed")
+
+        if not wait_until(
+                lambda: count_in(client.log_path, "half-close grace expired") > base_expired,
+                grace + 20):
+            raise AssertionError(
+                "client never reclaimed a half-closed tunnel whose target never "
+                "closes: the tunnel (and one upstream connection) leaks forever")
+
+        if not wait_until(
+                lambda: count_in(client.log_path, "stats tx_pkt=") > base_closed, 15):
+            raise AssertionError(
+                "client logged the half-close expiry but never tore the session "
+                "down (the KCP session and its UDP socket leaked)")
+        print("  [ok] stalled half-closed tunnel reclaimed after ~%ds; its KCP "
+              "session and UDP socket were released" % grace)
+
+        if not server.alive() or not client.alive():
+            raise AssertionError("a process died during the half-close phase")
+
+        # The client must still be fully functional: open a fresh tunnel.
+        run_case("post-half-close tunnel", socks_port, target_port,
+                 b"E" + b"still healthy after the grace", 20)
+        print("  [ok] the client still tunnels normally afterwards")
+    finally:
+        client.stop()
+        server.stop()
+        target.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="kcp-proxy negative / robustness end-to-end suite")
@@ -548,6 +761,9 @@ def main():
         phase_concurrency(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "concurrency-server.log"),
                       os.path.join(log_dir, "concurrency-client.log")]
+        phase_half_close(args.server, args.client, log_dir)
+        log_paths += [os.path.join(log_dir, "halfclose-server.log"),
+                      os.path.join(log_dir, "halfclose-client.log")]
 
         print("E2E ROBUSTNESS TEST PASSED")
         return 0

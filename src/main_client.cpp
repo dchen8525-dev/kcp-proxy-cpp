@@ -17,7 +17,11 @@ static void print_usage(const char* prog) {
               << "                         set the KCP_PROXY_KEY environment variable)\n"
               << "  -H, --listen-host HOST Local SOCKS5 bind address (default: 127.0.0.1)\n"
               << "  -l, --listen-port PORT Local SOCKS5 listen port (default: 1080)\n"
-              << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n";
+              << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n"
+              << "      --half-close-grace SEC\n"
+              << "                         Seconds a half-closed tunnel may go without target\n"
+              << "                         payload before it is reclaimed (default: "
+              << CLIENT_HALF_CLOSE_GRACE_SEC << ")\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -26,6 +30,7 @@ int main(int argc, char* argv[]) {
     std::string key;
     std::string listen_host = "127.0.0.1";
     uint16_t listen_port = 1080;
+    int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC;
     std::string log_level = "INFO";
 
     for (int i = 1; i < argc; i++) {
@@ -42,6 +47,17 @@ int main(int argc, char* argv[]) {
             if (!cli::get_port_arg(argc, argv, i, listen_port)) return 1;
         } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
             log_level = cli::get_arg(argc, argv, i);
+        } else if (arg == "--half-close-grace" && i + 1 < argc) {
+            try {
+                half_close_grace_sec = std::stoi(cli::get_arg(argc, argv, i));
+            } catch (const std::exception&) {
+                std::cerr << "Error: --half-close-grace expects a number of seconds" << std::endl;
+                return 1;
+            }
+            if (half_close_grace_sec < 0) {
+                std::cerr << "Error: --half-close-grace must be >= 0" << std::endl;
+                return 1;
+            }
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             print_usage(argv[0]);
@@ -75,7 +91,8 @@ int main(int argc, char* argv[]) {
         asio::io_context io;
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
         auto client = std::make_shared<KCPProxyClient>(
-            io, server_host, server_port, key, listen_host, listen_port);
+            io, server_host, server_port, key, listen_host, listen_port,
+            half_close_grace_sec);
         cli::secure_wipe(key);
         client->start();
 

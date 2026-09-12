@@ -20,7 +20,8 @@ public:
     KCPProxyClient(asio::io_context& io, std::string server_host,
                    uint16_t server_port, std::string key,
                    std::string listen_host = "127.0.0.1",
-                   uint16_t listen_port = 1080);
+                   uint16_t listen_port = 1080,
+                   int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC);
     ~KCPProxyClient();
 
     void start();
@@ -36,12 +37,38 @@ public:
     std::atomic<uint64_t> rx_bytes_{0};
 
 private:
+    // Per-tunnel half-close bookkeeping (see forward_client_to_kcp()). Created
+    // once the SOCKS5 handshake completes and shared by both forwarding loops;
+    // released with them when the tunnel ends.
+    //
+    // The timer runs on the session strand, so arm/re-arm happen on the same
+    // executor as the forwarding completions that refresh last_progress_us.
+    struct HalfCloseGuard {
+        explicit HalfCloseGuard(asio::steady_timer::executor_type ex)
+            : deadline(std::move(ex)) {}
+
+        asio::steady_timer deadline;
+        // Set once the local app's read side reported EOF: the tunnel is in
+        // drain-only mode. Until then the grace never applies.
+        std::atomic<bool> app_eof{false};
+        // steady_clock us of the last payload received from the target,
+        // recorded as soon as it is consumed from KCP (so a slow write to the
+        // app cannot look like a stalled target). Keepalives never touch this:
+        // they are dropped inside the session and never reach the forwarding
+        // loop, which is what makes the grace a measure of real progress rather
+        // than of session liveness.
+        std::atomic<int64_t> last_progress_us{0};
+    };
+
     asio::io_context& io_;
     std::string server_host_;
     uint16_t server_port_;
     std::string key_;
     std::string listen_host_;
     uint16_t listen_port_;
+    // How long a half-closed tunnel may sit without the target delivering
+    // payload before it is reclaimed. See CLIENT_HALF_CLOSE_GRACE_SEC.
+    int half_close_grace_sec_;
 
     void wipe_key();
 
@@ -99,11 +126,27 @@ private:
 
     void forward_client_to_kcp(std::shared_ptr<asio::ip::tcp::socket> client_socket,
                                std::shared_ptr<KCPClientSession> session,
-                               std::shared_ptr<std::vector<uint8_t>> buf = {});
+                               std::shared_ptr<std::vector<uint8_t>> buf = {},
+                               std::shared_ptr<HalfCloseGuard> guard = {});
 
     void forward_kcp_to_client(std::shared_ptr<asio::ip::tcp::socket> client_socket,
                                std::shared_ptr<KCPClientSession> session,
-                               std::shared_ptr<std::vector<uint8_t>> buf = {});
+                               std::shared_ptr<std::vector<uint8_t>> buf = {},
+                               std::shared_ptr<HalfCloseGuard> guard = {});
+
+    // Arm the half-close grace deadline after the local app's read side hit EOF.
+    // The tunnel is now drain-only: it exists solely to deliver whatever the
+    // target still has to say. See CLIENT_HALF_CLOSE_GRACE_SEC.
+    void arm_half_close_grace(const std::shared_ptr<HalfCloseGuard>& guard,
+                              std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                              std::shared_ptr<KCPClientSession> session);
+
+    // Grace deadline callback. Re-arms itself while the target is still making
+    // progress; reclaims the tunnel once the target has been quiet for the
+    // whole grace window after the app closed.
+    void on_half_close_check(std::shared_ptr<HalfCloseGuard> guard,
+                             std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                             std::shared_ptr<KCPClientSession> session);
 
     void send_socks5_error(std::shared_ptr<asio::ip::tcp::socket> client_socket,
                            uint8_t reply,
