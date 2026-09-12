@@ -12,6 +12,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fast, toolchain-free checks. Runs first so a whitespace error or a broken
+  # packaging invariant is reported in seconds instead of after three builds.
+  hygiene:
+    name: whitespace + packaging smoke
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # git diff --check needs the base commit, which a shallow clone lacks.
+        fetch-depth: 0
+
+    - name: Check whitespace (git diff --check)
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Check only the lines this change introduces, by comparing against the
+        # commit it is based on. AGENTS.md requires `git diff --check` to pass.
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base="${{ github.base_ref }}"
+          # fetch-depth: 0 already brought every branch, so origin/$base normally
+          # exists and no fetch is needed. It is fetched only as a fallback, and
+          # WITHOUT --depth: a shallow fetch marks the repo shallow, after which
+          # the three-dot diff below dies with "no merge base" (exit 128) -- i.e.
+          # the step would fail on every pull request it was meant to protect.
+          if ! git rev-parse --verify --quiet "refs/remotes/origin/$base" >/dev/null; then
+            git fetch --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base"
+          fi
+          range="refs/remotes/origin/$base...HEAD"
+        elif [ -n "${{ github.event.before }}" ] \
+             && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+          range="${{ github.event.before }}..HEAD"
+        elif git rev-parse --verify --quiet HEAD^ >/dev/null; then
+          # workflow_dispatch / a branch's very first push have no usable base.
+          range="HEAD^..HEAD"
+        else
+          echo "No base commit to compare against; nothing to check."
+          exit 0
+        fi
+
+        echo "git diff --check over $range"
+        git diff --check "$range"
+
+    - name: Packaging / deployment smoke tests
+      run: python3 tests/smoke/smoke_test.py
+
   build-linux:
     runs-on: ubuntu-22.04
     steps:

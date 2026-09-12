@@ -10,8 +10,9 @@ ctest --test-dir build -C Release --output-on-failure
 python tests/smoke/smoke_test.py
 ```
 
-`ctest` runs three tests:
+`ctest` runs four tests:
 
+- `kcp_proxy_smoke` — the packaging / deployment smoke tests (same script CI runs).
 - `kcp_proxy_test` — the unit suite below.
 - `kcp_proxy_e2e_tunnel` — an offline end-to-end tunnel test (see below).
 - `kcp_proxy_e2e_robustness` — the negative/robustness suite (see below).

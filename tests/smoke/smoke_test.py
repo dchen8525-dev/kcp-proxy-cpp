@@ -1,67 +1,332 @@
 #!/usr/bin/env python3
-"""Smoke tests for packaging/deployment invariants (stdlib only)."""
+"""Static smoke tests for packaging / deployment / release invariants.
+
+Standard library only and no build step: every check reads the tracked sources,
+so the suite finishes in well under a second and catches the things a compile
+and a unit test cannot see -- file layout, shell-injection guards, secret
+hygiene, and drift between the files that are required to agree (vcpkg pins,
+release versions, the suffix rule, the GUI/client key handoff).
+
+Run directly (this is exactly what CI does):
+
+    python3 tests/smoke/smoke_test.py
+"""
+from __future__ import annotations
+
 from pathlib import Path
 import json
 import re
+import sys
 import tarfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_paths_and_secrets():
-    package = (ROOT / "scripts/package/package.sh").read_text(encoding="utf-8")
-    assert 'dirname "${BASH_SOURCE[0]}"' in package
-    assert '/..' in package
-    common = (ROOT / "scripts/runtime/common.sh").read_text(encoding="utf-8")
-    assert "Kcp$Pr0xy!2024#Sec" not in common
-    assert (ROOT / "scripts/deploy/deploy.py").exists()
-    assert (ROOT / "scripts/package/package.sh").exists()
-    deploy = (ROOT / "scripts/deploy/deploy.py").read_text(encoding="utf-8")
-    assert "/tmp/kcp-proxy-deploy\"" not in deploy
-    assert "mktemp -d /var/tmp/kcp-proxy-deploy" in deploy
-    gui = (ROOT / "gui/electron/main.js").read_text(encoding="utf-8")
-    assert "args.join(' ')" not in gui
-    assert "-k <" not in gui
-    assert "electron-builder.win.json" in (ROOT / "gui/electron/package.json").read_text(encoding="utf-8")
-    service = (ROOT / "scripts/deploy/install-service.sh").read_text(encoding="utf-8")
-    assert "kcp-proxy-server-key-refresh.timer" in service
-    uninstall = (ROOT / "scripts/deploy/uninstall-service.sh").read_text(encoding="utf-8")
-    assert "--purge" in uninstall
+def read(relative: str) -> str:
+    return (ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_vcpkg_and_presets():
-    # build.sh pins the vcpkg checkout commit; vcpkg.json's builtin-baseline
-    # must agree so manifest resolution uses the same upstream state.
-    build = (ROOT / "build.sh").read_text(encoding="utf-8")
+def require(condition: bool, message: str) -> None:
+    """Like assert, but the message survives -O and always reaches the report."""
+    if not condition:
+        raise AssertionError(message)
+
+
+# --------------------------------------------------------------------------- #
+# packaging
+# --------------------------------------------------------------------------- #
+def test_packaging_script():
+    text = read("scripts/package/package.py")
+
+    # Self-locating: the repo root is derived from __file__, never from the
+    # caller's cwd, so the packager works when invoked from any directory.
+    require("Path(__file__).resolve().parents[2]" in text,
+            "package.py must locate the repo root from __file__, not from cwd")
+
+    # Archive permissions come from an explicit table, never from stat():
+    # Windows has no Unix mode bits, so stat-derived modes would silently ship
+    # non-executable binaries. The config file holds the key suffix, so it is
+    # the one member that must be installed 0600.
+    require("DEB_MODES" in text and "MODE_SECRET = 0o600" in text,
+            "package.py must declare archive permissions explicitly")
+    require("Never derived from the build host" in text,
+            "package.py must document that archive modes are never stat()-derived")
+    require('"./etc/kcp-proxy/server.env": MODE_SECRET' in text,
+            "the .deb config file (holds the key suffix) must be installed 0600")
+
+    # Members are written one by one from explicit TarInfo entries, so a
+    # symlink or an absolute path can never be swept in implicitly.
+    require("tar.addfile(" in text,
+            "package.py must add explicit members to the tarball")
+    require("tar.add(" not in text,
+            "package.py must not use recursive tar.add(), which follows symlinks")
+
+    # The version is read from CMakeLists.txt: one source of truth.
+    require("CMAKE_VERSION_RE" in text and "CMakeLists.txt" in text,
+            "package.py must derive the version from CMakeLists.txt")
+
+    # build_deb() refuses to run without the systemd templates it ships.
+    for template in ("kcp-proxy-server-key-refresh.service",
+                     "kcp-proxy-server-key-refresh.timer"):
+        require((ROOT / "scripts" / "templates" / template).is_file(),
+                f"missing systemd template: scripts/templates/{template}")
+
+
+# --------------------------------------------------------------------------- #
+# secrets
+# --------------------------------------------------------------------------- #
+def test_no_committed_secrets():
+    common = read("scripts/runtime/common.sh")
+
+    # A production key used to be checked in here as the default suffix.
+    require("Kcp$Pr0xy!2024#Sec" not in common,
+            "scripts/runtime/common.sh must not carry the legacy built-in key")
+    match = re.search(r'^DEFAULT_SUFFIX="([^"]*)"', common, re.MULTILINE)
+    require(match is not None, 'common.sh must define DEFAULT_SUFFIX=""')
+    require(match.group(1) == "",
+            "DEFAULT_SUFFIX must be empty: no default secret ships in the repo")
+
+    require("Kcp$Pr0xy!2024#Sec" not in read("scripts/deploy/deploy.py"),
+            "deploy.py must not carry a built-in key")
+
+    # The generated server wrapper must log only the key date and the suffix
+    # length -- never the assembled key, which is the SOCKS5/KCP credential.
+    package = read("scripts/package/package.py")
+    require("key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}" in package,
+            "the server wrapper must log only the key date and suffix length")
+
+
+# --------------------------------------------------------------------------- #
+# deployment safety
+# --------------------------------------------------------------------------- #
+def test_deploy_safety():
+    deploy = read("scripts/deploy/deploy.py")
+
+    # Remote staging must be unpredictable: a fixed path under a world-writable
+    # directory lets a local user pre-create it and win the race (symlink
+    # attack). mktemp allocates the name atomically.
+    require("mktemp -d /var/tmp/kcp-proxy-deploy.XXXXXX" in deploy,
+            "deploy.py must stage under a randomised mktemp directory")
+    require('"/tmp/kcp-proxy-deploy"' not in deploy,
+            "deploy.py must not use a predictable /tmp staging path")
+    require("secrets.token_hex" in deploy,
+            "the uploaded archive name must be randomised")
+    require("chmod 700" in deploy,
+            "the remote staging directory must not be world-readable")
+
+    # Everything interpolated into the remote shell command must be quoted.
+    require(deploy.count("shlex.quote") >= 3,
+            "deploy.py must shlex.quote every value interpolated into the remote command")
+
+    # The archive is validated before it is trusted.
+    require("def validate_tar_members" in deploy,
+            "deploy.py must validate archive members")
+    for guard in ("is_absolute()", '".." in name.parts', "issym()"):
+        require(guard in deploy,
+                f"deploy.py archive validation must cover {guard}")
+
+
+# --------------------------------------------------------------------------- #
+# the GUI -> client key handoff
+# --------------------------------------------------------------------------- #
+def test_gui_never_puts_the_key_on_the_command_line():
+    main = read("gui/electron/main.js")
+
+    # The command line of a process is visible to every local user (Task
+    # Manager / wmic); the environment is readable only by the same user. The
+    # key is a credential, so it must travel through the environment.
+    require("args.join(' ')" not in main,
+            "the GUI must spawn with an argv array, never a shell string")
+    require("'-k'" not in main and "'--key'" not in main,
+            "the GUI must not put the key on the client's command line")
+    require("KCP_PROXY_KEY" in main,
+            "the GUI must hand the key to the client through the environment")
+
+    # ...and the client must actually read that variable, or the GUI is broken.
+    require('get_env("KCP_PROXY_KEY")' in read("src/main_client.cpp"),
+            "the client must read KCP_PROXY_KEY from the environment")
+
+
+# --------------------------------------------------------------------------- #
+# systemd service install / uninstall
+# --------------------------------------------------------------------------- #
+def test_service_scripts():
+    install = read("scripts/deploy/install-service.sh")
+
+    require('dirname "${BASH_SOURCE[0]}"' in install,
+            "install-service.sh must locate itself from BASH_SOURCE, not cwd")
+
+    # The unit hardens the filesystem (ProtectSystem=strict), so the single
+    # writable path is granted explicitly and LOG_FILE must stay inside it.
+    require("ReadWritePaths=-$LOG_DIR" in install,
+            "the unit must grant write access to the log directory")
+    require("/var/log/kcp-proxy/*)" in install,
+            "install-service.sh must confine LOG_FILE to the log directory")
+
+    # The daily key is rotated by a systemd timer, and an unarmed timer freezes
+    # the key silently (clients then fail DECRYPT_FAILED), so the installer has
+    # to verify the timer actually scheduled a next run.
+    require("kcp-proxy-server-key-refresh.timer" in install,
+            "install-service.sh must install the key-refresh timer")
+    require("NextElapseUSecRealtime" in install,
+            "install-service.sh must verify the timer has a next elapse")
+    require("OnCalendar=" in install,
+            "the refresh timer must use a calendar schedule, not OnBootSec")
+
+    uninstall = read("scripts/deploy/uninstall-service.sh")
+    require("--purge" in uninstall, "uninstall-service.sh must support --purge")
+    require('if [ "$PURGE" -eq 1 ]; then' in uninstall
+            and 'rm -rf "$ENV_DIR"' in uninstall,
+            "uninstall-service.sh must remove configuration only under --purge")
+    require('rm -rf "$INSTALL_DIR"' in uninstall,
+            "uninstall-service.sh must always remove the installed binaries")
+
+
+# --------------------------------------------------------------------------- #
+# pins and versions that must agree across files
+# --------------------------------------------------------------------------- #
+def test_vcpkg_pins_agree():
+    build = read("build.sh")
     match = re.search(r'VCPKG_COMMIT="([0-9a-f]{40})"', build)
-    assert match, 'build.sh must pin a vcpkg commit (VCPKG_COMMIT="<40-hex>")'
-    commit = match.group(1)
-    manifest = json.loads((ROOT / "vcpkg.json").read_text(encoding="utf-8"))
-    assert manifest["builtin-baseline"] == commit
-    json.loads((ROOT / "CMakePresets.json").read_text(encoding="utf-8"))
+    require(match is not None,
+            'build.sh must pin a vcpkg commit (VCPKG_COMMIT="<40-hex>")')
+    pinned = match.group(1)
+
+    # vcpkg.json's builtin-baseline names the upstream state the manifest
+    # resolves against; a mismatch builds against a different vcpkg tree.
+    require(json.loads(read("vcpkg.json"))["builtin-baseline"] == pinned,
+            "vcpkg.json builtin-baseline must match build.sh's VCPKG_COMMIT")
+
+    # CI pins vcpkg itself -- drift here means the release artifacts are built
+    # against a vcpkg no local build ever used.
+    ci_pins = re.findall(r"vcpkgGitCommitId:\s*([0-9a-f]{40})",
+                         read(".github/workflows/ci.yml"))
+    require(ci_pins, "ci.yml must pin vcpkgGitCommitId")
+    for pin in ci_pins:
+        require(pin == pinned,
+                f"ci.yml pins vcpkg {pin} but build.sh pins {pinned}")
+
+    # CMakePresets.json is parsed by CMake directly; invalid JSON fails late.
+    json.loads(read("CMakePresets.json"))
 
 
-def test_suffix_vectors():
-    pattern = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
-    for value in ("abcdefgh", "abc_1234", "release-2026"):
-        assert pattern.fullmatch(value)
-    for value in ("", "short", "abc def", "abc=1234", "abc\n1234"):
-        assert not pattern.fullmatch(value)
+def test_versions_agree():
+    match = re.search(r"project\(\s*kcp_proxy\s+VERSION\s+(\d+\.\d+\.\d+)",
+                      read("CMakeLists.txt"))
+    require(match is not None,
+            "CMakeLists.txt must declare project(kcp_proxy VERSION x.y.z)")
+    version = match.group(1)
+
+    # The release version is duplicated in the manifest and the GUI package. A
+    # mismatch ships binaries whose reported version (generated from
+    # CMakeLists.txt) differs from the archive name the packager derives.
+    require(json.loads(read("vcpkg.json"))["version"] == version,
+            "vcpkg.json version must match CMakeLists.txt")
+    require(json.loads(read("gui/electron/package.json"))["version"] == version,
+            "gui/electron/package.json version must match CMakeLists.txt")
 
 
+def test_suffix_validation_agrees():
+    """The shell and Python halves of the suffix rule must not drift: the
+    installer validates it on the server, deploy.py validates it before upload."""
+    shell = re.search(r"=~ \^(\[[^\]]+\]\{\d+,\d+\})\$",
+                      read("scripts/runtime/common.sh"))
+    require(shell is not None, "common.sh must validate the suffix with a regex")
+    python = re.search(r're\.fullmatch\(r"(\[[^\]]+\]\{\d+,\d+\})"',
+                       read("scripts/deploy/deploy.py"))
+    require(python is not None, "deploy.py must validate the suffix with a regex")
+
+    require(shell.group(1) == python.group(1),
+            "suffix rule drift: common.sh has "
+            f"{shell.group(1)!r}, deploy.py has {python.group(1)!r}")
+
+    pattern = re.compile("^" + python.group(1) + "$")
+    for value in ("abcdefgh", "abc_1234", "release-2026", "A" * 128):
+        require(pattern.fullmatch(value) is not None,
+                f"suffix {value!r} must be accepted")
+    for value in ("", "short", "abc def", "abc=1234", "abc\n1234", "A" * 129):
+        require(pattern.fullmatch(value) is None,
+                f"suffix {value!r} must be rejected")
+
+
+# --------------------------------------------------------------------------- #
+# CI wiring
+# --------------------------------------------------------------------------- #
+def test_ci_runs_this_suite_and_the_whitespace_check():
+    """CI used to run only ctest, so a whitespace error or a packaging
+    regression could merge green. Pin the steps that close that gap."""
+    ci = read(".github/workflows/ci.yml")
+    require("tests/smoke/smoke_test.py" in ci,
+            "CI must run tests/smoke/smoke_test.py")
+    require("git diff --check" in ci,
+            "CI must run `git diff --check`")
+
+
+# --------------------------------------------------------------------------- #
+# built archives
+# --------------------------------------------------------------------------- #
 def test_archive_members():
-    for archive in (ROOT / "dist").glob("**/*.tar.gz"):
+    """Any archive left in dist/ must be safe to extract (no absolute paths, no
+    traversal, no links) -- the same rule deploy.py enforces before upload."""
+    dist = ROOT / "dist"
+    if not dist.is_dir():
+        return  # nothing built in this checkout (CI has no dist/)
+
+    for archive in sorted(dist.glob("**/*.tar.gz")):
         with tarfile.open(archive, "r:gz") as tar:
             for member in tar.getmembers():
                 path = Path(member.name)
-                assert not path.is_absolute()
-                assert ".." not in path.parts
-                assert not (member.issym() or member.islnk())
+                require(not path.is_absolute(),
+                        f"{archive.name}: absolute member {member.name!r}")
+                require(".." not in path.parts,
+                        f"{archive.name}: traversing member {member.name!r}")
+                require(not (member.issym() or member.islnk()),
+                        f"{archive.name}: link member {member.name!r}")
+
+    for archive in sorted(dist.glob("**/*.zip")):
+        with zipfile.ZipFile(archive) as zf:
+            for name in zf.namelist():
+                path = Path(name)
+                require(not path.is_absolute(),
+                        f"{archive.name}: absolute member {name!r}")
+                require(".." not in path.parts,
+                        f"{archive.name}: traversing member {name!r}")
+
+
+TESTS = [
+    test_packaging_script,
+    test_no_committed_secrets,
+    test_deploy_safety,
+    test_gui_never_puts_the_key_on_the_command_line,
+    test_service_scripts,
+    test_vcpkg_pins_agree,
+    test_versions_agree,
+    test_suffix_validation_agrees,
+    test_ci_runs_this_suite_and_the_whitespace_check,
+    test_archive_members,
+]
+
+
+def main() -> int:
+    failed = []
+    for test in TESTS:
+        try:
+            test()
+        except Exception as exc:  # noqa: BLE001 - report every failure, not just the first
+            failed.append(test.__name__)
+            print(f"FAIL {test.__name__}: {exc}", file=sys.stderr)
+        else:
+            print(f"ok   {test.__name__}")
+
+    total = len(TESTS)
+    print()
+    if failed:
+        print(f"smoke tests FAILED: {len(failed)}/{total} -> {', '.join(failed)}")
+        return 1
+    print(f"smoke tests passed ({total}/{total})")
+    return 0
 
 
 if __name__ == "__main__":
-    test_paths_and_secrets()
-    test_vcpkg_and_presets()
-    test_suffix_vectors()
-    test_archive_members()
-    print("smoke tests passed")
+    sys.exit(main())
