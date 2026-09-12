@@ -139,6 +139,18 @@ if(Python3_Interpreter_FOUND)
             --client $<TARGET_FILE:kcp-proxy-client>
     )
     set_tests_properties(kcp_proxy_e2e_tunnel PROPERTIES TIMEOUT 120)
+
+    # Negative / robustness suite: wrong key, hostile UDP flood, concurrency and
+    # session reclamation. Slower than the happy path (it drives ~100 tunnels and
+    # a 1500-packet flood), hence the separate registration and timeout.
+    add_test(
+        NAME kcp_proxy_e2e_robustness
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_ROOT}/tests/e2e/robustness_e2e.py
+            --server $<TARGET_FILE:kcp-proxy-server>
+            --client $<TARGET_FILE:kcp-proxy-client>
+    )
+    set_tests_properties(kcp_proxy_e2e_robustness PROPERTIES TIMEOUT 300)
 else()
     message(STATUS "Python3 interpreter not found: skipping kcp_proxy_e2e_tunnel test")
 endif()

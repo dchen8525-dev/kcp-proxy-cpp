@@ -385,7 +385,8 @@ kcp-proxy-cpp/
 │
 ├── tests/                 # 测试代码
 │   ├── smoke/             # 烟雾测试
-│   └── unit/              # 单元测试
+│   ├── unit/              # 单元测试
+│   └── e2e/               # 端到端隧道测试（黄金路径 + 负面/健壮性）
 │
 ├── docs/                  # 文档
 │   ├── TESTING.md         # 测试指南
@@ -434,6 +435,7 @@ kcp-proxy-cpp/
 - `src/kcp_proxy/` - 核心实现，包括服务端、客户端、加密、KCP封装
 - `tests/unit/` - 单元测试，覆盖加密、SOCKS5解析等核心功能
 - `tests/smoke/` - 烟雾测试，验证基本功能
+- `tests/e2e/` - 端到端测试：`tunnel_e2e.py`（隧道字节级黄金路径）、`robustness_e2e.py`（错误密钥、垃圾包洪泛、并发与会话回收）
 
 **脚本与部署**：
 - `scripts/deploy/` - 远程部署脚本，支持一键部署到服务器

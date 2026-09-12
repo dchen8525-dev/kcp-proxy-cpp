@@ -10,10 +10,11 @@ ctest --test-dir build -C Release --output-on-failure
 python tests/smoke/smoke_test.py
 ```
 
-`ctest` runs two tests:
+`ctest` runs three tests:
 
 - `kcp_proxy_test` — the unit suite below.
 - `kcp_proxy_e2e_tunnel` — an offline end-to-end tunnel test (see below).
+- `kcp_proxy_e2e_robustness` — the negative/robustness suite (see below).
 
 ## End-to-end tunnel test
 
@@ -45,6 +46,69 @@ kcp-proxy-server.exe -H 127.0.0.1 -p 8388 -k <key> --allow-target 127.0.0.1:9000
 guard even when it is loopback/private. It is **off by default** — production
 traffic has an empty allowlist and stays fully protected. Never expose a server
 started with `--allow-target` on an untrusted network.
+
+## Negative / robustness suite
+
+`tests/e2e/robustness_e2e.py` covers what the happy-path test cannot: hostile
+input and teardown. It is the automated form of the manual negative checks
+listed further down.
+
+```powershell
+python tests/e2e/robustness_e2e.py `
+  --server build/Release/kcp-proxy-server.exe `
+  --client build/Release/kcp-proxy-client.exe
+```
+
+Add `--keep-logs` to keep the per-process server/client log files for
+inspection (they are printed on failure either way).
+
+Three phases, all offline:
+
+- **A. Wrong key** — a client started with a mismatched key must be dropped by
+  the server at the auth boundary: no session is created, the packet is rejected
+  with `DECRYPT_FAILED`, and the local SOCKS5 app is told *no* (socket closed or
+  reset) instead of being handed a tunnel that is silently dead. The client must
+  log a handshake timeout and never claim a confirmed handshake.
+- **B. Garbage flood** — 1500 hostile datagrams (zero-length, header-sized,
+  oversize, and the 64 KB UDP maximum; pure noise plus KCP-shaped frames) are
+  blasted at the server's UDP port from several source ports. The server must
+  survive, reject every packet at auth, allocate **no** session, trip the global
+  auth rate limiter (`MAX_AUTH_ATTEMPTS_PER_SEC`), and still carry real traffic
+  byte-exact once the one-second window rolls over.
+- **C. Concurrency and reclamation** — 100 simultaneous tunnels must each carry
+  their own payload with no cross-session bleed, every one of the 100 sessions
+  must be registered *and* reclaimed once its target closes (verified by
+  counting `new session` against `close_connection from target_drained`), and 10
+  abrupt `SO_LINGER`-reset connections must not wedge the server.
+
+The phases use `--allow-target` only to reach their own local echo servers; the
+regression that the guard stays on by default is pinned by `tunnel_e2e.py`.
+
+### Known limitation: half-closed tunnels are never reclaimed
+
+Measured on 2026-09-12 (Windows, Release build), with a local echo target that
+stays open:
+
+- A tunnel whose **local app closes its socket** while the target keeps the
+  connection open is **never torn down**. The client half-closes by design (so a
+  large response in flight is not truncated) and keeps its KCP session; both
+  peers then keep each other alive with the 30 s application-layer keepalive, so
+  neither the client's nor the server's 60 s idle timer ever fires.
+- Control: a session the client abandons completely (its UDP socket is closed,
+  so no keepalives are sent) *is* reaped by the server's 30 s idle sweep, which
+  shows the sweep itself works.
+- Effect: repeated "app aborts mid-request" (closed browser tabs, client
+  timeouts, `curl --max-time`) accumulates sessions — each holding a UDP socket,
+  KCP buffers and an open upstream connection — until the client's
+  `MAX_CLIENT_SESSIONS` (512) is reached, after which it refuses *all* new
+  connections. Normal HTTP traffic self-heals because the target eventually
+  closes, which takes the `target_drained` path.
+
+Fixing this needs a client→server half-close signal (a new control frame) or a
+bounded grace timer for a half-closed session; both change protocol or product
+behaviour, so neither is done here. The negative suite deliberately asserts the
+tunnel teardown it *can* guarantee (target-closed reclamation) and does not
+assert this case.
 
 Current unit coverage includes:
 
@@ -90,7 +154,8 @@ curl -x socks5h://127.0.0.1:1080 https://example.com
 curl -x socks5h://127.0.0.1:1080 https://www.cloudflare.com
 ```
 
-Negative checks:
+Negative checks (automated by `tests/e2e/robustness_e2e.py`, kept here for
+manual poking):
 
 - Start the client with a wrong key; the KCP handshake should fail or time out.
 - Stop the server and open a new proxy connection; the client must not report KCP connected for that session.
