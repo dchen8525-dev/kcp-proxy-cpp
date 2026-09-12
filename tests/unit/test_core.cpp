@@ -374,6 +374,39 @@ void test_async_read_some_rejects_stacked_reads() {
     expect_true(first_called, "first read should be aborted during stop");
 }
 
+void test_kcp_config_line() {
+    // The startup log line is the contract between the two ends of a tunnel:
+    // both peers must print the same KCP settings or ikcp silently discards
+    // the other's packets (the conv mismatch symptom). Pin the exact string so
+    // a future drift — changing a KCP_* constant but not the log, or breaking
+    // the "log renders these exact values" invariant — breaks the test instead
+    // of shipping as a mysterious handshake failure.
+    const std::string line = kcp_config_line();
+
+    expect_true(line ==
+                    "KCP config conv=1 mtu=1400 nodelay=1 interval=10 "
+                    "resend=5 nc=1 sndWnd=256 rcvWnd=512 timeout=60s",
+                "kcp_config_line canonical baseline changed");
+
+    // Each field must track its constant, so a constant change propagates to
+    // the log automatically. Build the expected tokens from the constants
+    // themselves (not from a second copy of the format string) so this test
+    // fails if a field is ever rendered from a stale literal.
+    auto has = [&](const std::string& token) {
+        expect_true(line.find(token) != std::string::npos,
+                    ("kcp_config_line missing token: " + token).c_str());
+    };
+    has("conv=" + std::to_string(KCP_CONV));
+    has("mtu=" + std::to_string(KCP_MTU));
+    has("nodelay=" + std::to_string(KCP_NODELAY));
+    has("interval=" + std::to_string(KCP_INTERVAL_MS));
+    has("resend=" + std::to_string(KCP_RESEND));
+    has("nc=" + std::to_string(KCP_NC));
+    has("sndWnd=" + std::to_string(KCP_SNDWND));
+    has("rcvWnd=" + std::to_string(KCP_RCVWND));
+    has("timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s");
+}
+
 } // namespace
 
 int main() {
@@ -383,6 +416,7 @@ int main() {
         test_socks5_reply_bind_address();
         test_restricted_targets();
         test_async_read_some_rejects_stacked_reads();
+        test_kcp_config_line();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;
