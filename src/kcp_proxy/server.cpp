@@ -430,7 +430,7 @@ void KCPServer::handle_protocol_handshake(std::shared_ptr<KCPSession> session) {
             if (ec || bytes == 0) {
                 LOG_WARNING("server", session->session_id() +
                             ": KCP_HANDSHAKE_FAILED read error: " + ec.message());
-                session->stop();
+                close_connection(session->session_id(), "protocol_handshake_read", session);
                 return;
             }
             const std::string msg(reinterpret_cast<const char*>(buf->data()), bytes);
@@ -469,7 +469,7 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
             LOG_ERROR("server", "FAIL_STAGE=SOCKS5_PARSE_FAILED ERROR=request_too_large CLIENT_ENDPOINT=" +
                       session->session_id() + " TARGET=-");
             send_socks5_reply(session, SOCKS5_REPLY_GENERAL_FAILURE);
-            session->stop();
+            close_connection(session->session_id(), "socks5_too_large", session);
             return true;  // complete with error
         }
         return false;  // need more data
@@ -486,9 +486,9 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
         send_socks5_reply(session, parsed.bad_atyp
             ? SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
             : SOCKS5_REPLY_GENERAL_FAILURE);
-        // The client will see the failure reply and disconnect; don't leave a
-        // dead session parked in the table until the 60s idle sweep.
-        session->stop();
+        // The client sees the failure reply and disconnects; close_connection
+        // evicts the dead session from the table immediately (no 30s sweep wait).
+        close_connection(session->session_id(), "socks5_invalid", session);
         return true;  // complete with error
     }
 
@@ -520,9 +520,8 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
                     ":" + std::to_string(request.port));
         send_socks5_reply(session, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
         // Same as the other failure paths: the client sees the reply and tears
-        // the KCP session down, so don't leave it parked in the table until the
-        // 60s idle sweep.
-        session->stop();
+        // the KCP session down; close_connection evicts it from the table at once.
+        close_connection(session->session_id(), "socks5_unsupported_cmd", session);
     }
     return true;  // complete (success or handled error)
 }
@@ -559,7 +558,7 @@ void KCPServer::read_more_socks5(std::shared_ptr<KCPSession> session,
             LOG_ERROR("server", session->session_id() +
                       ": SOCKS5_PARSE_FAILED read error: " + ec.message());
             send_socks5_reply(session, SOCKS5_REPLY_GENERAL_FAILURE);
-            session->stop();
+            close_connection(session->session_id(), "socks5_read_error", session);
             return;
         }
 
@@ -600,9 +599,9 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
         LOG_WARNING("server", "FAIL_STAGE=TCP_CONNECT_FAILED ERROR=connect_timeout_" +
                     std::to_string(CONNECT_TIMEOUT_SEC) + "s CLIENT_ENDPOINT=" +
                     session->session_id() + " TARGET=" + request.host +
-                    ":" + std::to_string(request.port));
+                    ":" +                     std::to_string(request.port));
         send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
-        session->stop();
+        close_connection(session->session_id(), "connect_timeout", session);
     });
 
     // SSRF guard (early): if the request host is a literal IP that is a
@@ -619,7 +618,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         session->session_id() + " TARGET=" + request.host + ":" +
                         std::to_string(request.port));
             send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
-            session->stop();
+            close_connection(session->session_id(), "ssrf_blocked", session);
             return;
         }
     }
@@ -636,7 +635,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                           " CLIENT_ENDPOINT=" + session->session_id() +
                           " TARGET=" + request.host + ":" + std::to_string(request.port));
                 send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
-                session->stop();
+                close_connection(session->session_id(), "dns_resolve_failed", session);
                 return;
             }
 
@@ -655,7 +654,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                 std::to_string(request.port) +
                                 " RESOLVED=" + r.endpoint().address().to_string());
                     send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
-                    session->stop();
+                    close_connection(session->session_id(), "ssrf_blocked_postresolve", session);
                     return;
                 }
             }
@@ -677,7 +676,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                   " TARGET=" + request.host + ":" + std::to_string(request.port));
                         uint8_t reply = get_error_reply_code(ec2);
                         send_socks5_reply(session, reply);
-                        session->stop();
+                        close_connection(session->session_id(), "tcp_connect_failed", session);
                         return;
                     }
 
@@ -778,7 +777,7 @@ void KCPServer::handle_udp_associate(std::shared_ptr<KCPSession> session,
                 session->session_id() + " TARGET=" + request.host +
                 ":" + std::to_string(request.port));
     send_socks5_reply(session, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
-    session->stop();
+    close_connection(session->session_id(), "udp_associate_unsupported", session);
 }
 
 void KCPServer::send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t reply) {

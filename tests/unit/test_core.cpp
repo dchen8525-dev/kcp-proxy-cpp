@@ -430,6 +430,77 @@ void test_kcp_wrapper_applies_constants() {
     expect_true(k->nocwnd == KCP_NC, "ikcp nocwnd (nc) mismatch");
 }
 
+void test_session_stop_makes_inert() {
+    // Regression for the session-cleanup audit: once stop() runs, the session
+    // must be fully inert so a dead session can safely linger in the server's
+    // sessions_ map (reclaimed by the 30s sweep) without spinning, sending, or
+    // crashing the shared 10ms update tick.
+    asio::io_context io;
+    auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
+                                            Crypto::generate_session_salt());
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+    auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "stop-inert");
+    bool sent = false;
+    session->set_send_callback([&](std::vector<uint8_t>) { sent = true; });
+    session->start();
+    io.poll();
+    io.restart();
+
+    expect_true(session->is_running(), "session should run after start");
+    expect_true(session->is_alive(), "session should be alive after start");
+
+    session->stop();
+    io.restart();
+    io.poll();
+
+    expect_true(!session->is_running(), "session must not run after stop");
+    expect_true(!session->is_alive(), "session must not be alive after stop");
+
+    // on_update_tick is driven by the server's shared tick for EVERY session in
+    // the map, including stopped ones. On a stopped session it must be a no-op
+    // and must NOT invoke the send path.
+    asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+    io.poll();
+    expect_true(!sent, "on_update_tick on a stopped session must not send");
+
+    // Idempotent: a second stop must be safe and leave state unchanged.
+    session->stop();
+    expect_true(!session->is_running(), "second stop must stay not-running");
+    expect_true(!session->is_alive(), "second stop must stay not-alive");
+}
+
+void test_session_drained_callback_on_target_closed() {
+    // Regression for graceful upstream teardown: when the target TCP closes
+    // while KCP still has queued data, the session stays alive until wait_send()
+    // reaches 0, then the drained callback fires exactly once and tears the
+    // session down (close_connection in production). This pins the
+    // "fires once, then clears" contract.
+    asio::io_context io;
+    auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
+                                            Crypto::generate_session_salt());
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+    auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "drain");
+    session->set_send_callback([](std::vector<uint8_t>) {});
+    session->start();
+    io.poll();
+    io.restart();
+
+    bool drained = false;
+    session->set_drained_callback([&]() { drained = true; });
+    session->mark_target_closed();
+
+    asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+    io.poll();
+    io.restart();
+    expect_true(drained, "drained callback must fire when target closed and buffer empty");
+
+    // Must not re-fire on a subsequent tick (callback was moved out and nulled).
+    drained = false;
+    asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+    io.poll();
+    expect_true(!drained, "drained callback must not re-fire");
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +512,8 @@ int main() {
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
         test_kcp_wrapper_applies_constants();
+        test_session_stop_makes_inert();
+        test_session_drained_callback_on_target_closed();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;
