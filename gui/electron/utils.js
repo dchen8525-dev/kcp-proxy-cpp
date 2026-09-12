@@ -60,12 +60,34 @@ function validateLaunchConfig(cfg) {
   return null;
 }
 
+// Compose the client's argv from the launch configuration. The key is
+// deliberately ABSENT from these args: it travels through KCP_PROXY_KEY in
+// the environment (see buildClientEnv) because a process command line is
+// visible to every local user, while its environment is not.
+function buildClientArgs({ serverHost, serverPort, localPort }) {
+  return [
+    '-s', String(serverHost),
+    '-p', String(serverPort),
+    '-H', '127.0.0.1',
+    '-l', String(localPort),
+    '-L', 'info'
+  ];
+}
+
+// Compose the spawn environment for the client: the secret rides in
+// KCP_PROXY_KEY on top of the parent environment.
+function buildClientEnv(key, baseEnv = process.env) {
+  return { ...baseEnv, KCP_PROXY_KEY: key };
+}
+
 module.exports = {
   getBeijingDate,
   generateKey,
   formatBytes,
   isValidPort,
   validateLaunchConfig,
+  buildClientArgs,
+  buildClientEnv,
   SUFFIX_RE,
   FIXED_KEY_RE
 };

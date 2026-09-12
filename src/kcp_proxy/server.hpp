@@ -57,6 +57,10 @@ private:
     std::unordered_map<std::string, ClientConnection> connections_;
 
     asio::steady_timer cleanup_timer_;
+    // Backoff timer for the UDP receive error path: unknown receive errors
+    // re-arm do_receive() through this 10ms delay so a persistently failing
+    // socket cannot spin the io_context (bounded to ~100 retries/s).
+    asio::steady_timer receive_backoff_timer_;
     // Single shared KCP update timer. Drives ikcp_update/flush for EVERY
     // session on a fixed 10ms cadence, replacing one steady_timer per
     // session. With N sessions the old design churned N timer-heap entries

@@ -3,10 +3,21 @@
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/config.hpp"
 #include "kcp_proxy/logger.hpp"
+#include "kcp_proxy/target_allowlist.hpp"
 #include <asio/read.hpp>
 #include <asio/write.hpp>
 #include <asio/connect.hpp>
 #include <fmt/format.h>
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <mswsock.h>
+// Present in mswsock.h on modern SDKs; defined here so MinGW and older
+// toolchains still compile the SIO_UDP_CONNRESET call.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#endif
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -30,54 +41,25 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
       key_(key),
       udp_socket_(io_),
       cleanup_timer_(io_),
-      update_tick_timer_(io_) {}
+      update_tick_timer_(io_),
+      receive_backoff_timer_(io_) {}
 
 KCPServer::~KCPServer() {
     stop();
 }
 
 void KCPServer::set_allowed_targets(std::vector<std::string> targets) {
+    // Defense in depth: drop empty entries so a stray "--allow-target" with a
+    // missing value can never create an entry that matches the empty host.
+    // main_server.cpp already rejects that at the CLI, this keeps the library
+    // safe for embedders that bypass the CLI.
+    targets.erase(std::remove(targets.begin(), targets.end(), std::string()),
+                  targets.end());
     allowed_targets_ = std::move(targets);
 }
 
 bool KCPServer::is_target_allowed(const std::string& host, uint16_t port) const {
-    for (const auto& entry : allowed_targets_) {
-        std::string h;
-        uint16_t p = 0;
-        bool has_port = false;
-        if (!entry.empty() && entry.front() == '[') {
-            // Bracketed IPv6 literal: "[addr]" or "[addr]:port".
-            auto close = entry.find(']');
-            if (close == std::string::npos) continue;
-            h = entry.substr(1, close - 1);
-            if (close + 1 < entry.size() && entry[close + 1] == ':') {
-                try {
-                    p = static_cast<uint16_t>(std::stoi(entry.substr(close + 2)));
-                    has_port = true;
-                } catch (...) { continue; }
-            }
-        } else {
-            auto colon = entry.rfind(':');
-            // A single ':' separates host and port; "::" without a trailing
-            // port part is treated as a host-only (IPv6) entry.
-            if (colon != std::string::npos &&
-                entry.find(':') != colon) {  // more than one ':', i.e. IPv6
-                h = entry;  // keep whole entry as host (no port parse)
-            } else if (colon != std::string::npos) {
-                h = entry.substr(0, colon);
-                try {
-                    p = static_cast<uint16_t>(std::stoi(entry.substr(colon + 1)));
-                    has_port = true;
-                } catch (...) { continue; }
-            } else {
-                h = entry;
-            }
-        }
-        if (h == host && (!has_port || p == port)) {
-            return true;
-        }
-    }
-    return false;
+    return target_matches_allowlist(allowed_targets_, host, port);
 }
 
 void KCPServer::wipe_key() {
@@ -128,6 +110,28 @@ void KCPServer::start() {
     LOG_INFO("server", "UDP socket buffers so_rcvbuf=" + eff_rcv_str +
              " so_sndbuf=" + eff_snd_str);
 
+#if defined(_WIN32)
+    // Root-cause fix for the ICMP port-unreachable error path: on Windows an
+    // unconnected UDP socket reports WSAECONNRESET on the next receive after
+    // every send to a dead peer port. A hostile or churning client could keep
+    // that error channel hot forever (each error is an ERROR/DEBUG log plus a
+    // re-arm). SIO_UDP_CONNRESET=FALSE turns the reporting off at the source;
+    // the tolerant handler below stays as the cross-platform safety net.
+    {
+        BOOLEAN disable_connreset = FALSE;
+        DWORD bytes_returned = 0;
+        // native_handle() already yields the SOCKET integer type on Windows.
+        const int wsa_rc = ::WSAIoctl(
+            udp_socket_.native_handle(),
+            SIO_UDP_CONNRESET,
+            &disable_connreset, sizeof(disable_connreset),
+            nullptr, 0,
+            &bytes_returned, nullptr, nullptr);
+        LOG_INFO("server", std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") +
+                 std::to_string(wsa_rc) + ")");
+    }
+#endif
+
     running_ = true;
 
     cleanup_timer_.expires_after(std::chrono::seconds(30));
@@ -158,6 +162,7 @@ void KCPServer::stop() {
     udp_socket_.close(ignored);
     cleanup_timer_.cancel(ignored);
     update_tick_timer_.cancel(ignored);
+    receive_backoff_timer_.cancel(ignored);
 
     std::unordered_map<std::string, std::shared_ptr<KCPSession>> drained_sessions;
     std::unordered_map<std::string, ClientConnection> drained_conns;
@@ -199,14 +204,30 @@ void KCPServer::handle_receive(const std::error_code& ec, size_t bytes_transferr
             // UDP sockets surface ICMP Port Unreachable as an error on the next
             // receive: connection_refused on Linux/BSD, connection_reset
             // (WSAECONNRESET) on Windows. This is normal after a peer closes
-            // its socket and is not fatal for the server. Just log and continue.
+            // its socket and is not fatal for the server; on Windows the
+            // reporting is disabled at the source (SIO_UDP_CONNRESET in
+            // start()), and on Linux it only fires for connected sockets
+            // anyway. Just log and continue.
             if (ec == asio::error::connection_refused ||
                 ec == asio::error::connection_reset) {
                 LOG_DEBUG("server", "UDP ICMP port unreachable received (ignored)");
+                do_receive();
             } else {
                 LOG_ERROR("server", "UDP receive error: " + ec.message());
+                // Unknown errors are the one path that can complete
+                // immediately and repeatedly with no external pacing at all:
+                // an unbounded re-arm here is a busy spin plus an ERROR log
+                // line per iteration. Re-arm through a short backoff instead,
+                // which bounds the loop to ~100 attempts/s while a transient
+                // condition (or an operator) resolves it.
+                auto self = shared_from_this();
+                receive_backoff_timer_.expires_after(
+                    std::chrono::milliseconds(10));
+                receive_backoff_timer_.async_wait(
+                    [this, self](const std::error_code& timer_ec) {
+                        if (!timer_ec) do_receive();
+                    });
             }
-            do_receive();
         }
         return;
     }

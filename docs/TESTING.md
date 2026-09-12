@@ -48,6 +48,15 @@ guard even when it is loopback/private. It is **off by default** — production
 traffic has an empty allowlist and stays fully protected. Never expose a server
 started with `--allow-target` on an untrusted network.
 
+Entries are parsed strictly and fail closed (`src/kcp_proxy/target_allowlist.hpp`):
+a host-only entry matches every port on that host, and malformed entries —
+`host:99999`, `host:-1`, `host:80x`, `host:`, unclosed brackets, port `0` — are
+rejected at startup with a clear error. The strictness is deliberate: loose
+`std::stoi` parsing used to wrap `host:99999` into port 34463 and `host:-1`
+into 65535, silently allowlisting the wrong port. There is no wildcard support;
+`*` matches nothing. The boundaries are pinned by `test_allowlist_matching` in
+the unit suite.
+
 ## Negative / robustness suite
 
 `tests/e2e/robustness_e2e.py` covers what the happy-path test cannot: hostile
@@ -63,7 +72,7 @@ python tests/e2e/robustness_e2e.py `
 Add `--keep-logs` to keep the per-process server/client log files for
 inspection (they are printed on failure either way).
 
-Five phases, all offline:
+Six phases, all offline:
 
 - **A. Wrong key** — a client started with a mismatched key must be dropped by
   the server at the auth boundary: no session is created, the packet is rejected
@@ -80,7 +89,10 @@ Five phases, all offline:
   their own payload with no cross-session bleed, every one of the 100 sessions
   must be registered *and* reclaimed once its target closes (verified by
   counting `new session` against `close_connection from target_drained`), and 10
-  abrupt `SO_LINGER`-reset connections must not wedge the server.
+  abrupt `SO_LINGER`-reset connections must not wedge the server. This phase
+  runs **twice**: once against a single-threaded server and once against
+  `-T 4`, so the per-session-strand + `shared_mutex` thread-safety design has
+  runtime coverage instead of only being claimed in a comment.
 - **D. Half-close** — the local app stops sending while its target never closes.
   A response still in flight must arrive byte-exact even when it is spread across
   (and past) the grace window, while a stalled tunnel must be reclaimed — the
@@ -93,6 +105,12 @@ Five phases, all offline:
   through the **drained** path (`close_connection from target_drained`), which
   only runs once `wait_send() == 0` — i.e. after the whole tail was delivered —
   rather than by closing on the FIN.
+- **F. Env key channel** — `KCP_PROXY_KEY` is the channel the GUI actually uses
+  (the secret never touches the command line). A pair provisioned purely through
+  the environment must authenticate and carry bytes; a wrong value in that
+  channel must be rejected exactly like a wrong `--key` (no session, auth
+  rejection, local app told no); a client with **neither** channel must fail
+  fast with `--key is required` instead of half-starting.
 
 The phases use `--allow-target` only to reach their own local echo servers; the
 regression that the guard stays on by default is pinned by `tunnel_e2e.py`.

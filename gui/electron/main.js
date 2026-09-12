@@ -5,7 +5,7 @@ const fs = require('fs');
 const dns = require('dns');
 const net = require('net');
 const zlib = require('zlib');
-const { generateKey: buildKey, validateLaunchConfig } = require('./utils');
+const { generateKey: buildKey, validateLaunchConfig, buildClientArgs, buildClientEnv } = require('./utils');
 
 // Auto-updater (electron-updater) — loaded lazily to keep dev/preview simple.
 let autoUpdater = null;
@@ -435,22 +435,16 @@ async function startProxy(opts = {}) {
 
   const key = generateKey();
 
-  const args = [
-    '-s', serverHost,
-    '-p', serverPort,
-    '-H', '127.0.0.1',
-    '-l', localPort,
-    '-L', 'info'
-  ];
+  // The key travels via KCP_PROXY_KEY in the environment, NOT argv: the
+  // command line of a process is visible to every local user (Task Manager /
+  // wmic), while the environment is readable only by the same user.
+  const args = buildClientArgs({ serverHost, serverPort, localPort });
 
   try {
     clientProcess = spawn(clientPath, args, {
       cwd: path.dirname(clientPath),
       stdio: ['ignore', 'pipe', 'pipe'],
-      // Pass the key via the environment, NOT argv: the command line of a
-      // process is visible to every local user (Task Manager / wmic), while
-      // the environment is readable only by the same user.
-      env: { ...process.env, KCP_PROXY_KEY: key }
+      env: buildClientEnv(key)
     });
 
     isRunning = true;
@@ -729,16 +723,12 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
     };
 
     try {
-      proc = spawn(clientPath, [
-        '-s', host,
-        '-p', String(port),
-        '-H', '127.0.0.1',
-        '-l', String(listenPort),
-        '-L', 'info'
-      ], {
+      proc = spawn(clientPath, buildClientArgs({
+        serverHost: host, serverPort: port, localPort: listenPort
+      }), {
         cwd: path.dirname(clientPath),
         stdio: ['ignore', 'ignore', 'pipe'],
-        env: { ...process.env, KCP_PROXY_KEY: generateKey() }
+        env: buildClientEnv(generateKey())
       });
     } catch (err) {
       finish({ ok: false, message: `启动测试进程失败: ${err.message}` });

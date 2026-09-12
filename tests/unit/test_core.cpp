@@ -6,6 +6,7 @@
 #include "kcp_proxy/kcp_session.hpp"
 #include "kcp_proxy/kcp_wrapper.hpp"
 #include "kcp_proxy/socks5.hpp"
+#include "kcp_proxy/target_allowlist.hpp"
 #include <asio.hpp>
 #include <cassert>
 #include <array>
@@ -810,6 +811,94 @@ void test_client_abort_handshake_closes_local_socket() {
     app.close(ec);
 }
 
+// --allow-target is the only SSRF-guard bypass, so its parser is pinned
+// boundary by boundary. The wrapping regressions are the point of the two
+// "must NOT match" cases: loose std::stoi parsing used to turn "host:99999"
+// into port 34463 and "host:-1" into 65535, silently allowlisting the wrong
+// port. Malformed entries must match nothing, never crash, never widen.
+void test_allowlist_matching() {
+    using kcp_proxy::parse_allow_target_entry;
+    using kcp_proxy::target_matches_allowlist;
+
+    std::string host;
+    bool has_port = false;
+    uint16_t port = 0;
+
+    // Exact host+port entries.
+    expect_true(parse_allow_target_entry("127.0.0.1:9000", host, has_port, port),
+                "host:port entry should parse");
+    expect_true(host == "127.0.0.1" && has_port && port == 9000,
+                "host:port parsed values");
+    expect_true(target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.1", 9000),
+                "exact entry matches its host and port");
+    expect_true(!target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.1", 9001),
+                "exact entry must not match a different port");
+    expect_true(!target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.2", 9000),
+                "exact entry must not match a different host");
+
+    // Host-only entries match every port on that host (documented semantics).
+    expect_true(target_matches_allowlist({"127.0.0.1"}, "127.0.0.1", 1),
+                "host-only entry matches low port");
+    expect_true(target_matches_allowlist({"127.0.0.1"}, "127.0.0.1", 65535),
+                "host-only entry matches high port");
+    expect_true(!target_matches_allowlist({"127.0.0.1"}, "127.0.0.2", 1),
+                "host-only entry must not match another host");
+    expect_true(target_matches_allowlist({"example.com"}, "example.com", 443),
+                "hostname-only entry matches any port");
+    expect_true(target_matches_allowlist({"example.com:443"}, "example.com", 443),
+                "hostname:port entry matches");
+
+    // IPv6 forms.
+    expect_true(parse_allow_target_entry("[::1]:9000", host, has_port, port),
+                "bracketed IPv6 with port should parse");
+    expect_true(host == "::1" && has_port && port == 9000,
+                "bracketed IPv6 parsed values");
+    expect_true(target_matches_allowlist({"[::1]:9000"}, "::1", 9000),
+                "bracketed IPv6 entry matches");
+    expect_true(target_matches_allowlist({"[::1]"}, "::1", 1234),
+                "bracketed host-only IPv6 matches any port");
+    expect_true(target_matches_allowlist({"::1"}, "::1", 1234),
+                "bare multi-colon IPv6 is a host-only entry");
+    expect_true(target_matches_allowlist({"2001:db8::1"}, "2001:db8::1", 80),
+                "bare IPv6 literal host-only matches");
+    expect_true(!target_matches_allowlist({"[::1]:9000"}, "::1", 9001),
+                "bracketed entry must not match another port");
+
+    // Malformed entries are rejected by the parser and match nothing.
+    const char* malformed[] = {
+        "", ":80", "host:", "host:-1", "host:99999", "host:80x",
+        "host:0", "[::1", "[::1]x", "[::1]:", "[]:80", "[::1]:99999",
+        "host:65536"
+    };
+    for (const char* entry : malformed) {
+        expect_true(!parse_allow_target_entry(entry, host, has_port, port),
+                    "malformed entry must be rejected");
+        expect_true(!target_matches_allowlist({entry}, "host", 9000) &&
+                    !target_matches_allowlist({entry}, "::1", 9000),
+                    "malformed entry must match nothing");
+    }
+    // The wrapping regressions: these ports must not have been silently
+    // allowlisted by the typo'd entries above.
+    expect_true(!target_matches_allowlist({"host:99999"}, "host", 34463),
+                "port 99999 must not wrap to 34463");
+    expect_true(!target_matches_allowlist({"host:-1"}, "host", 65535),
+                "port -1 must not wrap to 65535");
+
+    // No wildcard support: '*' (and any glob-ish entry) is inert.
+    expect_true(!target_matches_allowlist({"*"}, "anything", 80),
+                "wildcard entry must not match everything");
+    expect_true(!target_matches_allowlist({"*:80"}, "anything", 80),
+                "wildcard host with port must not match");
+
+    // A malformed entry is skipped without hiding a later valid one, and the
+    // matcher is safe against an empty allowlist (production default).
+    expect_true(target_matches_allowlist({"host:", "127.0.0.1:9000"},
+                                         "127.0.0.1", 9000),
+                "valid entry after a malformed one still matches");
+    expect_true(!target_matches_allowlist({}, "127.0.0.1", 9000),
+                "empty allowlist matches nothing");
+}
+
 } // namespace
 
 int main() {
@@ -818,6 +907,7 @@ int main() {
         test_socks5_parser();
         test_socks5_reply_bind_address();
         test_restricted_targets();
+        test_allowlist_matching();
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
         test_kcp_wrapper_applies_constants();

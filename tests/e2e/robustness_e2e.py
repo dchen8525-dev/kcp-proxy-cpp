@@ -30,6 +30,14 @@ security-sensitive proxy must *survive* but never be *seen* to succeed at:
                       server has to hold the session open until that buffer
                       drains (the drained callback) and the local app must
                       receive every byte, byte-exact.
+  F. Env key        - KCP_PROXY_KEY (the GUI's actual key channel, never the
+                      command line) must authenticate a real round-trip; a
+                      wrong value there must be rejected like a wrong --key;
+                      a client with neither channel must fail fast.
+
+The concurrency phase runs twice: once against a single-threaded server and
+once against ``-T 4``, so the strand / shared_mutex thread-safety design has
+runtime coverage instead of only being claimed in a comment.
 
 Every phase runs fully offline on loopback. Assertions are made against real
 process behaviour plus the structured logs (captured to files), never against
@@ -82,13 +90,18 @@ FLOOD_PACKETS = 1500    # phase B: must exceed MAX_AUTH_ATTEMPTS_PER_SEC (500)
 class Proc:
     """A spawned binary whose combined stdout/stderr goes to its own log file."""
 
-    def __init__(self, cmd, log_path):
+    def __init__(self, cmd, log_path, extra_env=None):
         self.cmd = cmd
         self.log_path = log_path
+        env = None
+        if extra_env:
+            env = dict(os.environ)
+            env.update(extra_env)
         # Binary mode: log lines are ASCII, and this avoids any text-layer
         # buffering surprises when we read the file back while the child writes.
         self._fh = open(log_path, "wb")
-        self.proc = subprocess.Popen(cmd, stdout=self._fh, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(cmd, stdout=self._fh, stderr=subprocess.STDOUT,
+                                     env=env)
 
     def alive(self):
         return self.proc.poll() is None
@@ -162,22 +175,35 @@ def dump_logs(log_paths, lines=12):
 
 def start_pair(server_exe, client_exe, udp_port, socks_port, key, log_dir, tag,
                allow_target=None, log_level="INFO", client_key=None,
-               half_close_grace=None):
+               half_close_grace=None, server_threads=None, use_env_key=False):
     """Start a server/client pair. ``client_key`` defaults to ``key``; passing a
     different one is how the wrong-key phase provokes an auth failure.
     ``half_close_grace`` overrides the client's half-close grace so the
-    reclamation phase does not have to wait out the production value."""
+    reclamation phase does not have to wait out the production value.
+    ``server_threads`` appends ``-T N`` (multi-threaded io_context run).
+    ``use_env_key`` drops ``-k`` from BOTH command lines and ships the secret
+    through KCP_PROXY_KEY in the process environment instead — the channel the
+    GUI actually uses."""
+    server_env = {"KCP_PROXY_KEY": key} if use_env_key else None
     server_cmd = [server_exe, "-H", "127.0.0.1", "-p", str(udp_port),
-                  "-k", key, "-L", log_level]
+                  "-L", log_level]
+    if not use_env_key:
+        server_cmd += ["-k", key]
+    if server_threads:
+        server_cmd += ["-T", str(server_threads)]
     if allow_target:
         server_cmd += ["--allow-target", allow_target]
-    server = Proc(server_cmd, os.path.join(log_dir, tag + "-server.log"))
+    server = Proc(server_cmd, os.path.join(log_dir, tag + "-server.log"),
+                  extra_env=server_env)
+    client_env = {"KCP_PROXY_KEY": client_key or key} if use_env_key else None
     client_cmd = [client_exe, "-s", "127.0.0.1", "-p", str(udp_port),
-                  "-H", "127.0.0.1", "-l", str(socks_port),
-                  "-k", client_key or key, "-L", log_level]
+                  "-H", "127.0.0.1", "-l", str(socks_port), "-L", log_level]
+    if not use_env_key:
+        client_cmd += ["-k", client_key or key]
     if half_close_grace is not None:
         client_cmd += ["--half-close-grace", str(half_close_grace)]
-    client = Proc(client_cmd, os.path.join(log_dir, tag + "-client.log"))
+    client = Proc(client_cmd, os.path.join(log_dir, tag + "-client.log"),
+                  extra_env=client_env)
     return server, client
 
 
@@ -450,9 +476,13 @@ def _concurrent_tunnel(index, socks_port, target_port, results, timeout):
         results[index] = (False, str(exc))
 
 
-def phase_concurrency(server_exe, client_exe, log_dir):
-    print("[C] concurrency: %d simultaneous tunnels, then session reclamation"
-          % N_CONCURRENT)
+def phase_concurrency(server_exe, client_exe, log_dir, server_threads=1,
+                      tag="concurrency"):
+    label = ("[C] concurrency (%d server threads)" % server_threads
+             if server_threads > 1 else
+             "[C] concurrency: %d simultaneous tunnels, then session reclamation"
+             % N_CONCURRENT)
+    print(label)
     target_port = free_port()
     target = CloseAfterEchoServer(target_port)
     target.start()
@@ -460,9 +490,9 @@ def phase_concurrency(server_exe, client_exe, log_dir):
     udp_port = free_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
-                                KEY, log_dir, "concurrency",
+                                KEY, log_dir, tag,
                                 allow_target="127.0.0.1:%d" % target_port,
-                                log_level="INFO")
+                                log_level="INFO", server_threads=server_threads)
     try:
         require_pair_ready(server, client, socks_port)
 
@@ -531,6 +561,117 @@ def phase_concurrency(server_exe, client_exe, log_dir):
         client.stop()
         server.stop()
         target.stop()
+
+
+# --------------------------------------------------------------------------- #
+# phase F: the KCP_PROXY_KEY environment channel must work end to end
+# --------------------------------------------------------------------------- #
+def _local_app_told_no(socks_port, timeout=12):
+    """Drive a SOCKS5 greeting and return how the local socket was treated."""
+    app = socket.create_connection(("127.0.0.1", socks_port), timeout=10)
+    try:
+        app.settimeout(timeout)
+        app.sendall(bytes([0x05, 0x01, 0x00]))  # greeting: no-auth
+        try:
+            data = app.recv(2)
+            return "closed" if data == b"" else "replied:%r" % data
+        except socket.timeout:
+            return "hang"
+        except ConnectionResetError:
+            return "reset"
+    finally:
+        try:
+            app.close()
+        except OSError:
+            pass
+
+
+def phase_env_key(server_exe, client_exe, log_dir, echo_port):
+    """KCP_PROXY_KEY is the channel the GUI actually uses (the secret never
+    touches the command line). Until now it only had a static smoke
+    assertion that the client source reads the variable; this phase runs it
+    for real: a pair provisioned purely through the environment must
+    authenticate and carry bytes, a wrong value in that channel must be
+    rejected exactly like a wrong --key, and a client with neither channel
+    must fail fast at startup."""
+    print("[F] env key: KCP_PROXY_KEY must authenticate, and misfire cleanly")
+
+    # --- positive: both sides keyed via the environment only ---
+    udp_port = free_port()
+    socks_port = free_port()
+    server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
+                                KEY, log_dir, "envkey",
+                                allow_target="127.0.0.1:%d" % echo_port,
+                                log_level="INFO", use_env_key=True)
+    try:
+        require_pair_ready(server, client, socks_port)
+        run_case("env-key tunnel", socks_port, echo_port,
+                 b"authenticated via KCP_PROXY_KEY env only", 20)
+        if not server.alive() or not client.alive():
+            raise AssertionError("a process died during the env-key phase")
+        srv_log = log_text(server.log_path)
+        if "new session" not in srv_log:
+            raise AssertionError(
+                "server created no session although both sides used the "
+                "KCP_PROXY_KEY environment channel")
+        print("  [ok] env-only pair authenticated and carried bytes")
+    finally:
+        client.stop()
+        server.stop()
+
+    # --- negative: a wrong value in the env channel must behave like a wrong
+    # --key: no session, auth rejection, local app told no ---
+    udp_port = free_port()
+    socks_port = free_port()
+    server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
+                                KEY, log_dir, "envkey-wrong",
+                                log_level="INFO", client_key=WRONG_KEY,
+                                use_env_key=True)
+    try:
+        if not wait_for_port("127.0.0.1", socks_port, 20):
+            raise RuntimeError("client SOCKS port never came up (env-key phase)")
+        outcome = _local_app_told_no(socks_port)
+        if outcome == "hang" or outcome.startswith("replied"):
+            raise AssertionError(
+                "wrong env key left the local app %s instead of refusing" % outcome)
+        if not wait_until(
+                lambda: "DECRYPT_FAILED" in log_text(server.log_path), 10):
+            raise AssertionError(
+                "server did not reject the wrong env key at the auth boundary")
+        if "new session" in log_text(server.log_path):
+            raise AssertionError("server created a session for a wrong env key")
+        print("  [ok] wrong env key rejected (app told no, DECRYPT_FAILED, "
+              "no session)")
+        if not server.alive() or not client.alive():
+            raise AssertionError("a process died during the env-key phase")
+    finally:
+        client.stop()
+        server.stop()
+
+    # --- negative: neither channel set -> fail fast, not a half-started proxy.
+    # Explicit env (without the variable) so a KCP_PROXY_KEY exported in this
+    # test process cannot leak into the child.
+    env = {k: v for k, v in os.environ.items() if k != "KCP_PROXY_KEY"}
+    env.setdefault("PATH", os.environ.get("PATH", ""))
+    client_log = os.path.join(log_dir, "envkey-missing-client.log")
+    with open(client_log, "wb") as fh:
+        proc = subprocess.Popen(
+            [client_exe, "-s", "127.0.0.1", "-p", str(free_port()),
+             "-H", "127.0.0.1", "-l", str(free_port()), "-L", "INFO"],
+            stdout=fh, stderr=subprocess.STDOUT, env=env)
+        try:
+            code = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError(
+                "client without any key channel kept running instead of "
+                "failing fast")
+    text = log_text(client_log)
+    if code == 0 or "--key is required" not in text:
+        raise AssertionError(
+            "client missing both key channels exited with code %s "
+            "(expected a clear '--key is required' failure)" % code)
+    print("  [ok] client with no key channel fails fast ('--key is required')")
 
 
 # --------------------------------------------------------------------------- #
@@ -923,12 +1064,25 @@ def main():
         phase_concurrency(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "concurrency-server.log"),
                       os.path.join(log_dir, "concurrency-client.log")]
+        # The strand + shared_mutex thread-safety design is claimed to hold
+        # under multiple io_context workers; run the same burst against a
+        # 4-thread server so that claim has runtime coverage.
+        phase_concurrency(args.server, args.client, log_dir, server_threads=4,
+                          tag="concurrency-t4")
+        log_paths += [os.path.join(log_dir, "concurrency-t4-server.log"),
+                      os.path.join(log_dir, "concurrency-t4-client.log")]
         phase_half_close(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "halfclose-server.log"),
                       os.path.join(log_dir, "halfclose-client.log")]
         phase_big_response_target_close(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "bigresp-server.log"),
                       os.path.join(log_dir, "bigresp-client.log")]
+        phase_env_key(args.server, args.client, log_dir, echo_port)
+        log_paths += [os.path.join(log_dir, "envkey-server.log"),
+                      os.path.join(log_dir, "envkey-client.log"),
+                      os.path.join(log_dir, "envkey-wrong-server.log"),
+                      os.path.join(log_dir, "envkey-wrong-client.log"),
+                      os.path.join(log_dir, "envkey-missing-client.log")]
 
         print("E2E ROBUSTNESS TEST PASSED")
         return 0

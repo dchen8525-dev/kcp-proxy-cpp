@@ -1,4 +1,5 @@
 #include "kcp_proxy/server.hpp"
+#include "kcp_proxy/target_allowlist.hpp"
 #include "cli_helpers.hpp"
 #include <asio.hpp>
 #include <iostream>
@@ -52,7 +53,21 @@ int main(int argc, char* argv[]) {
         } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
             log_level = cli::get_arg(argc, argv, i);
         } else if (arg == "--allow-target" && i + 1 < argc) {
-            allowed_targets.push_back(cli::get_arg(argc, argv, i));
+            const std::string value = cli::get_arg(argc, argv, i);
+            std::string parsed_host;
+            bool has_port = false;
+            uint16_t parsed_port = 0;
+            // Fail loudly: a malformed entry (e.g. "host:99999" or a missing
+            // value) is a typo an operator must see, not a silently inert
+            // allowlist row. The parser is fail-closed either way.
+            if (!kcp_proxy::parse_allow_target_entry(value, parsed_host,
+                                                     has_port, parsed_port)) {
+                std::cerr << "Error: invalid --allow-target entry '" << value
+                          << "' (expected HOST[:PORT] or [IPv6][:PORT])"
+                          << std::endl;
+                return 1;
+            }
+            allowed_targets.push_back(value);
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             print_usage(argv[0]);
