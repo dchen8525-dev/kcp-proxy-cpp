@@ -24,6 +24,12 @@ security-sensitive proxy must *survive* but never be *seen* to succeed at:
                       target never closes must be reclaimed (session + UDP
                       socket released) instead of leaking one upstream
                       connection per abandoned app.
+  E. Big response   - a target that sends a large response and then closes must
+                      not have its tail truncated: at the FIN the response is
+                      still sitting in the server's KCP send buffer, so the
+                      server has to hold the session open until that buffer
+                      drains (the drained callback) and the local app must
+                      receive every byte, byte-exact.
 
 Every phase runs fully offline on loopback. Assertions are made against real
 process behaviour plus the structured logs (captured to files), never against
@@ -728,6 +734,162 @@ def phase_half_close(server_exe, client_exe, log_dir):
         target.stop()
 
 
+# --------------------------------------------------------------------------- #
+# phase E: a large response whose target closes must not be truncated
+# --------------------------------------------------------------------------- #
+# A megabyte: far more than one KCP window (KCP_SNDWND * KCP_MTU ~ 350KB), so
+# the target's close lands in the middle of a multi-segment, backpressured
+# transfer instead of on a single small response.
+BIG_RESPONSE_BYTES = 1024 * 1024
+
+
+class BigResponseThenCloseTarget:
+    """Sends a large response, then closes while the tail is still buffered.
+
+    The response is deliberately much larger than the KCP in-flight window, so
+    the FIN necessarily races the still-queued tail through the tunnel. The
+    server must therefore hold the session open until its KCP send buffer
+    drains; tearing down on the FIN instead would truncate the response.
+    """
+
+    def __init__(self, port, size):
+        self.port = port
+        self.size = size
+        # Offset-sensitive pattern: a shifted or reordered stream is caught,
+        # which a repeated-single-byte payload would hide.
+        self.payload = (bytes(range(256)) * (size // 256 + 1))[:size]
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(16)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop:
+            try:
+                self.sock.settimeout(0.3)
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.settimeout(60)
+            # Write the whole body without reading anything, then close the
+            # write side immediately: the FIN follows the last byte with the
+            # tail still queued in the server's KCP send buffer.
+            conn.sendall(self.payload)
+            conn.shutdown(socket.SHUT_WR)
+            while True:  # drain until the peer tears the connection down
+                if not conn.recv(65536):
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def phase_big_response_target_close(server_exe, client_exe, log_dir):
+    """A fast target that closes mid-response must not truncate the stream.
+
+    This is the end-to-end counterpart of the session-level drained contract
+    (``set_drained_callback`` / ``KCPSession::on_update_tick``): the callback
+    only fires once ``wait_send() == 0``, i.e. after the client has acknowledged
+    every queued byte. Bypassing it -- closing the session as soon as the target
+    reports EOF -- would drop whatever was still buffered and hand the app a
+    short read. The app here must therefore receive all ``BIG_RESPONSE_BYTES``
+    bytes, byte-exact, and the server must have gone through the drained path.
+    """
+    print("[E] big response + target close: the buffered tail must not be cut")
+    target_port = free_port()
+    target = BigResponseThenCloseTarget(target_port, BIG_RESPONSE_BYTES)
+    target.start()
+
+    udp_port = free_port()
+    socks_port = free_port()
+    server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
+                                KEY, log_dir, "bigresp",
+                                allow_target="127.0.0.1:%d" % target_port,
+                                log_level="INFO")
+    try:
+        require_pair_ready(server, client, socks_port)
+        time.sleep(0.5)
+        base_drained = count_in(server.log_path, "close_connection from target_drained")
+
+        app = socks5_connect("127.0.0.1", socks_port, "127.0.0.1", target_port, 20)
+        try:
+            got = recv_exact(app, BIG_RESPONSE_BYTES, 60)
+        except RuntimeError as exc:
+            raise AssertionError(
+                "large response was truncated when the target closed (%s): the "
+                "session was torn down before the KCP send buffer had drained"
+                % exc)
+        finally:
+            app.close()
+
+        if got != target.payload:
+            raise AssertionError(
+                "large response corrupted: received %d bytes, expected %d "
+                "byte-exact" % (len(got), BIG_RESPONSE_BYTES))
+        print("  [ok] %d-byte response delivered byte-exact although the target "
+              "closed right after the last byte" % BIG_RESPONSE_BYTES)
+
+        # The teardown must have gone through the drained path, which only fires
+        # once wait_send() == 0 -- i.e. after the client acknowledged the whole
+        # tail -- rather than from a close on the FIN.
+        srv_log = log_text(server.log_path)
+        if "draining queued data to client" not in srv_log:
+            raise AssertionError(
+                "server did not keep the session alive to drain the response "
+                "after the target closed")
+        drained = wait_for_count(server.log_path,
+                                 "close_connection from target_drained",
+                                 base_drained + 1, 20)
+        if drained <= base_drained:
+            raise AssertionError(
+                "target close did not go through the drained path; the response "
+                "may have been cut by an early teardown")
+        # How much was left at the FIN is reported, not asserted: on loopback the
+        # path drains about as fast as the target feeds it, so the leftover is
+        # timing dependent (observed from tens of bytes to hundreds of KB). The
+        # deterministic proof that a non-empty buffer *withholds* the teardown is
+        # the unit test test_session_drained_deferred_while_send_buffer_nonempty;
+        # this phase pins the outcome: no byte is lost and the close was drained.
+        marker = "draining queued data to client (wait_send="
+        backlog = -1
+        idx = srv_log.find(marker)
+        if idx != -1:
+            idx += len(marker)
+            backlog = int(srv_log[idx:srv_log.find(")", idx)])
+        print("  [ok] session drained fully, then closed via the drained callback "
+              "(backlog at the FIN: %d bytes)" % backlog)
+
+        if not server.alive() or not client.alive():
+            raise AssertionError("a process died during the big-response phase")
+        print("  [ok] both processes alive")
+    finally:
+        client.stop()
+        server.stop()
+        target.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="kcp-proxy negative / robustness end-to-end suite")
@@ -764,6 +926,9 @@ def main():
         phase_half_close(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "halfclose-server.log"),
                       os.path.join(log_dir, "halfclose-client.log")]
+        phase_big_response_target_close(args.server, args.client, log_dir)
+        log_paths += [os.path.join(log_dir, "bigresp-server.log"),
+                      os.path.join(log_dir, "bigresp-client.log")]
 
         print("E2E ROBUSTNESS TEST PASSED")
         return 0

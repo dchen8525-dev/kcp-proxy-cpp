@@ -62,7 +62,7 @@ python tests/e2e/robustness_e2e.py `
 Add `--keep-logs` to keep the per-process server/client log files for
 inspection (they are printed on failure either way).
 
-Four phases, all offline:
+Five phases, all offline:
 
 - **A. Wrong key** — a client started with a mismatched key must be dropped by
   the server at the auth boundary: no session is created, the packet is rejected
@@ -86,6 +86,12 @@ Four phases, all offline:
   KCP session and its UDP socket are released rather than held forever. Also
   checks the control case: nothing is reclaimed *before* the grace elapses, so
   the bound can never truncate a response.
+- **E. Big response, target closes** — a target that sends a 1 MB response and
+  closes immediately after the last byte must not have it truncated: the local
+  app has to receive every byte, byte-exact, and the session must be torn down
+  through the **drained** path (`close_connection from target_drained`), which
+  only runs once `wait_send() == 0` — i.e. after the whole tail was delivered —
+  rather than by closing on the FIN.
 
 The phases use `--allow-target` only to reach their own local echo servers; the
 regression that the guard stays on by default is pinned by `tunnel_e2e.py`.
@@ -140,7 +146,11 @@ Current unit coverage includes:
 - Stacked `async_read_some` rejection with `already_started`
 - KCP config line rendering and live `ikcp` state matching the `KCP_*` constants
 - Stopped-session inertness (`stop()` idempotent, `on_update_tick` no-op) and
-  the target-drained teardown callback firing exactly once
+  the target-drained teardown contract: the callback fires exactly once when the
+  target closed and the send buffer is empty, and — the anti-truncation half — is
+  **withheld** while bytes are still queued in KCP. That deferral is pinned
+  deterministically here; phase E of the robustness suite covers the same
+  guarantee end-to-end (a 1 MB response whose target closes must arrive whole).
 
 ## Manual
 

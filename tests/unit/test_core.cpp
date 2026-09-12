@@ -501,6 +501,48 @@ void test_session_drained_callback_on_target_closed() {
     expect_true(!drained, "drained callback must not re-fire");
 }
 
+void test_session_drained_deferred_while_send_buffer_nonempty() {
+    // The anti-truncation half of the drained contract, and the one that keeps
+    // large responses intact: when the target closes while KCP still holds
+    // undelivered bytes, the session must NOT be torn down yet. Doing so would
+    // drop the tail of the stream. The companion test above only covers the
+    // firing case (empty buffer, callback runs on the first tick); this one
+    // pins the deferral, i.e. that wait_send() > 0 withholds the callback.
+    asio::io_context io;
+    auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
+                                            Crypto::generate_session_salt());
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+    auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "drain-defer");
+    session->set_send_callback([](std::vector<uint8_t>) {});
+    session->start();
+    io.poll();
+    io.restart();
+
+    // Queue far more than one KCP segment so the send buffer cannot already be
+    // empty when the target closes. Nothing ACKs it, so it stays queued -- the
+    // same state the server is in when a fast target FINs a large response.
+    std::vector<uint8_t> payload(8192, 0x5A);
+    session->send_data(byte_view(payload.data(), payload.size()));
+    io.poll();
+    io.restart();
+    expect_true(session->wait_send() > 0, "send_data must leave bytes queued in KCP");
+
+    bool drained = false;
+    session->set_drained_callback([&]() { drained = true; });
+    session->mark_target_closed();
+
+    asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+    io.poll();
+    io.restart();
+    expect_true(!drained,
+                "drained callback fired while KCP still held undelivered data "
+                "(an early teardown would truncate the stream)");
+    expect_true(session->is_alive(),
+                "session must stay alive until its send buffer drains");
+
+    session->stop();
+}
+
 } // namespace
 
 int main() {
@@ -514,6 +556,7 @@ int main() {
         test_kcp_wrapper_applies_constants();
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();
+        test_session_drained_deferred_while_send_buffer_nonempty();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;

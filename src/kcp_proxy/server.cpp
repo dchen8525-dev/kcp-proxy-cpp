@@ -1075,7 +1075,15 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
 void KCPServer::handle_target_closed(std::shared_ptr<KCPSession> session,
                                      std::shared_ptr<asio::ip::tcp::socket> tcp_socket) {
     if (!session->is_target_closed()) {
-        LOG_INFO("server", session->session_id() + ": target connection closed, draining queued data to client");
+        // wait_send() is read here on the session strand (this is reached from
+        // forward_tcp_to_kcp's strand-bound read handler), so it is race-free.
+        // The backlog is diagnostics: it reports how much target data was still
+        // queued when the FIN arrived, i.e. how much the drained teardown had to
+        // flush before the session could close. On a fast link this is only the
+        // tail of the last TCP read, so do not read it as a queue gauge.
+        LOG_INFO("server", session->session_id() +
+                 ": target connection closed, draining queued data to client (wait_send=" +
+                 std::to_string(session->wait_send()) + ")");
         session->mark_target_closed();
     }
     if (tcp_socket && tcp_socket->is_open()) {
