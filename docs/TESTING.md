@@ -10,6 +10,42 @@ ctest --test-dir build -C Release --output-on-failure
 python tests/smoke/smoke_test.py
 ```
 
+`ctest` runs two tests:
+
+- `kcp_proxy_test` — the unit suite below.
+- `kcp_proxy_e2e_tunnel` — an offline end-to-end tunnel test (see below).
+
+## End-to-end tunnel test
+
+`tests/e2e/tunnel_e2e.py` spawns the built server and client binaries plus a
+local TCP echo server and a dependency-free SOCKS5 client, then drives real
+payloads through the full SOCKS5-over-KCP path and asserts they return
+byte-for-byte (small, >64 KB, all-byte-values, and a streamed sequence). It is
+fully offline — every endpoint is loopback.
+
+Because the server's SSRF guard refuses loopback/private targets by default, the
+test starts the server with an explicit lab allowlist entry:
+
+```powershell
+python tests/e2e/tunnel_e2e.py `
+  --server build/Release/kcp-proxy-server.exe `
+  --client build/Release/kcp-proxy-client.exe
+```
+
+The second phase of the test starts a server *without* `--allow-target` and
+asserts the same loopback target is still refused, pinning the security default.
+
+### `--allow-target` (lab/test only)
+
+```powershell
+kcp-proxy-server.exe -H 127.0.0.1 -p 8388 -k <key> --allow-target 127.0.0.1:9000
+```
+
+`--allow-target HOST[:PORT]` (repeatable) lets a specific target bypass the SSRF
+guard even when it is loopback/private. It is **off by default** — production
+traffic has an empty allowlist and stays fully protected. Never expose a server
+started with `--allow-target` on an untrusted network.
+
 Current unit coverage includes:
 
 - Crypto client-to-server and server-to-client round trips
@@ -25,7 +61,12 @@ Current unit coverage includes:
 - UDP ASSOCIATE parse-before-reject behavior
 - Invalid SOCKS5 version rejection
 - SOCKS5 reply bind-address encoding
+- Restricted-target classification (loopback, private, link-local, CGN, and
+  IPv6 transition forms such as 6to4/Teredo/NAT64)
 - Stacked `async_read_some` rejection with `already_started`
+- KCP config line rendering and live `ikcp` state matching the `KCP_*` constants
+- Stopped-session inertness (`stop()` idempotent, `on_update_tick` no-op) and
+  the target-drained teardown callback firing exactly once
 
 ## Manual
 

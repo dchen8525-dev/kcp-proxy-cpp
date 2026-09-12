@@ -32,6 +32,13 @@ public:
     void start();
     void stop();
 
+    // Lab allowlist: targets explicitly permitted to bypass the SSRF guard.
+    // Empty by default, so production traffic is fully protected. Populated
+    // only when an operator passes --allow-target (e.g. to test against a
+    // local echo server). Each entry is "host" or "host:port"; an IPv6 host
+    // may be bracketed as "[addr]:port".
+    void set_allowed_targets(std::vector<std::string> targets);
+
 private:
     asio::io_context& io_;
     uint16_t port_;
@@ -74,6 +81,13 @@ private:
     // UDP floods. Only touched on the single I/O thread.
     uint32_t auth_attempts_window_ = 0;
     std::chrono::steady_clock::time_point auth_window_start_{};
+
+    // Targets whitelisted via --allow-target; the SSRF guard refuses a target
+    // only if it is restricted AND not in this list. Read-only after start().
+    std::vector<std::string> allowed_targets_;
+
+    // True iff (host, port) matches an entry in allowed_targets_.
+    bool is_target_allowed(const std::string& host, uint16_t port) const;
 
     // Fixed-size UDP receive buffer (avoids heap allocation per datagram).
     alignas(64) std::array<uint8_t, UDP_RECV_BUF_SIZE> udp_recv_buf_{};

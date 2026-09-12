@@ -125,6 +125,24 @@ add_test(
         -P ${PROJECT_ROOT}/tests/run_core_tests.cmake
 )
 
+# --- End-to-end tunnel test (server <-> client <-> echo, offline) ---
+# Spawns the built binaries plus a local echo target and a minimal SOCKS5
+# client, then asserts real payloads survive the full SOCKS5-over-KCP path
+# byte-for-byte. Registered only when a Python 3 interpreter is available.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME kcp_proxy_e2e_tunnel
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_ROOT}/tests/e2e/tunnel_e2e.py
+            --server $<TARGET_FILE:kcp-proxy-server>
+            --client $<TARGET_FILE:kcp-proxy-client>
+    )
+    set_tests_properties(kcp_proxy_e2e_tunnel PROPERTIES TIMEOUT 120)
+else()
+    message(STATUS "Python3 interpreter not found: skipping kcp_proxy_e2e_tunnel test")
+endif()
+
 install(TARGETS kcp-proxy-server kcp-proxy-client
     RUNTIME DESTINATION bin
 )

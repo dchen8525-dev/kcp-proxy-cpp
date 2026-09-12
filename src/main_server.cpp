@@ -21,7 +21,10 @@ static void print_usage(const char* prog) {
               << "                         extra threads spread UDP/TCP I/O across cores.\n"
               << "                         Thread safety comes from per-session strands\n"
               << "                         and the shared_mutex-protected session map.\n"
-              << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n";
+              << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n"
+              << "  --allow-target HOST[:PORT]  Allow a specific lab/test target to bypass\n"
+              << "                         the SSRF guard (repeatable). Off by default; never\n"
+              << "                         expose this in production. e.g. --allow-target 127.0.0.1:9000\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -30,6 +33,7 @@ int main(int argc, char* argv[]) {
     std::string key;
     std::string log_level = "INFO";
     unsigned int threads = 1;
+    std::vector<std::string> allowed_targets;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -47,6 +51,8 @@ int main(int argc, char* argv[]) {
             }
         } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
             log_level = cli::get_arg(argc, argv, i);
+        } else if (arg == "--allow-target" && i + 1 < argc) {
+            allowed_targets.push_back(cli::get_arg(argc, argv, i));
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             print_usage(argv[0]);
@@ -76,6 +82,7 @@ int main(int argc, char* argv[]) {
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
         auto server = std::make_shared<KCPServer>(io, port, key, host);
         cli::secure_wipe(key);
+        server->set_allowed_targets(allowed_targets);
         server->start();
 
         LOG_INFO("main", "KCP proxy server started on " + host + ":" + std::to_string(port));

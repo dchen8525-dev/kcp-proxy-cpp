@@ -36,6 +36,50 @@ KCPServer::~KCPServer() {
     stop();
 }
 
+void KCPServer::set_allowed_targets(std::vector<std::string> targets) {
+    allowed_targets_ = std::move(targets);
+}
+
+bool KCPServer::is_target_allowed(const std::string& host, uint16_t port) const {
+    for (const auto& entry : allowed_targets_) {
+        std::string h;
+        uint16_t p = 0;
+        bool has_port = false;
+        if (!entry.empty() && entry.front() == '[') {
+            // Bracketed IPv6 literal: "[addr]" or "[addr]:port".
+            auto close = entry.find(']');
+            if (close == std::string::npos) continue;
+            h = entry.substr(1, close - 1);
+            if (close + 1 < entry.size() && entry[close + 1] == ':') {
+                try {
+                    p = static_cast<uint16_t>(std::stoi(entry.substr(close + 2)));
+                    has_port = true;
+                } catch (...) { continue; }
+            }
+        } else {
+            auto colon = entry.rfind(':');
+            // A single ':' separates host and port; "::" without a trailing
+            // port part is treated as a host-only (IPv6) entry.
+            if (colon != std::string::npos &&
+                entry.find(':') != colon) {  // more than one ':', i.e. IPv6
+                h = entry;  // keep whole entry as host (no port parse)
+            } else if (colon != std::string::npos) {
+                h = entry.substr(0, colon);
+                try {
+                    p = static_cast<uint16_t>(std::stoi(entry.substr(colon + 1)));
+                    has_port = true;
+                } catch (...) { continue; }
+            } else {
+                h = entry;
+            }
+        }
+        if (h == host && (!has_port || p == port)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void KCPServer::wipe_key() {
     std::memset(key_.data(), 0, key_.size());
     key_.clear();
@@ -607,10 +651,13 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
     // SSRF guard (early): if the request host is a literal IP that is a
     // restricted target (loopback/private/link-local/etc.), refuse it without
     // even resolving, so the server can never be pointed at its own network.
+    // An operator-supplied --allow-target entry explicitly overrides this for
+    // lab/test targets (e.g. a local echo server); production traffic has an
+    // empty allowlist and stays fully protected.
     {
         std::error_code ip_ec;
         const auto ip = asio::ip::make_address(request.host, ip_ec);
-        if (!ip_ec && is_restricted_target(ip)) {
+        if (!ip_ec && is_restricted_target(ip) && !is_target_allowed(request.host, request.port)) {
             if (fired->exchange(true)) return;
             std::error_code ignored;
             deadline->cancel(ignored);
@@ -620,6 +667,11 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
             send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
             close_connection(session->session_id(), "ssrf_blocked", session);
             return;
+        }
+        if (!ip_ec && is_restricted_target(ip)) {
+            LOG_WARNING("server", "SSRF_ALLOWLISTED CLIENT_ENDPOINT=" +
+                        session->session_id() + " TARGET=" + request.host + ":" +
+                        std::to_string(request.port));
         }
     }
 
@@ -643,20 +695,31 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
             // publicly reachable. A domain such as "localhost" or an internal
             // hostname would resolve to a restricted address and is refused
             // here. Rejecting the whole set if any endpoint is restricted
-            // prevents DNS-rebinding-style partial allowances.
+            // prevents DNS-rebinding-style partial allowances. An operator
+            // --allow-target entry overrides this for explicitly named lab
+            // targets.
+            bool restricted = false;
+            std::string restricted_addr;
             for (const auto& r : results) {
                 if (is_restricted_target(r.endpoint().address())) {
-                    if (fired->exchange(true)) return;
-                    std::error_code ignored;
-                    deadline->cancel(ignored);
-                    LOG_WARNING("server", "FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target CLIENT_ENDPOINT=" +
-                                session->session_id() + " TARGET=" + request.host + ":" +
-                                std::to_string(request.port) +
-                                " RESOLVED=" + r.endpoint().address().to_string());
-                    send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
-                    close_connection(session->session_id(), "ssrf_blocked_postresolve", session);
-                    return;
+                    restricted = true;
+                    // Copy the address now: endpoint() may return by value, so
+                    // holding a reference/pointer past the loop would dangle.
+                    restricted_addr = r.endpoint().address().to_string();
+                    break;
                 }
+            }
+            if (restricted && !is_target_allowed(request.host, request.port)) {
+                if (fired->exchange(true)) return;
+                std::error_code ignored;
+                deadline->cancel(ignored);
+                LOG_WARNING("server", "FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target CLIENT_ENDPOINT=" +
+                            session->session_id() + " TARGET=" + request.host + ":" +
+                            std::to_string(request.port) +
+                            " RESOLVED=" + restricted_addr);
+                send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
+                close_connection(session->session_id(), "ssrf_blocked_postresolve", session);
+                return;
             }
 
             LOG_INFO("server", session->session_id() +
