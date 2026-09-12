@@ -1,15 +1,20 @@
 #include "kcp_proxy/address.hpp"
+#include "kcp_proxy/client.hpp"
 #include "kcp_proxy/config.hpp"
 #include "kcp_proxy/crypto.hpp"
+#include "kcp_proxy/kcp_client_session.hpp"
 #include "kcp_proxy/kcp_session.hpp"
 #include "kcp_proxy/kcp_wrapper.hpp"
 #include "kcp_proxy/socks5.hpp"
 #include <asio.hpp>
 #include <cassert>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace kcp_proxy;
@@ -543,6 +548,268 @@ void test_session_drained_deferred_while_send_buffer_nonempty() {
     session->stop();
 }
 
+// --------------------------------------------------------------------------- //
+// client-side cleanup contract (KCPClientSession::close / abort_handshake)
+// --------------------------------------------------------------------------- //
+//
+// The server-side teardown is pinned by the KCPSession tests above. The client
+// is not symmetric: KCPProxyClient::abort_handshake() (client.hpp) is the single
+// funnel for every failed SOCKS5/KCP handshake, and all it does beyond closing
+// the local TCP socket is call KCPClientSession::close(). These tests pin the
+// contract that funnel depends on, so the class of bug it was written to fix
+// (a failed handshake leaking the session + its UDP socket until the idle
+// timeout, because only the deadline timer was cancelled) cannot come back.
+
+uint16_t free_tcp_port() {
+    asio::io_context io;
+    asio::ip::tcp::acceptor acceptor(
+        io, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    return acceptor.local_endpoint().port();
+}
+
+uint16_t free_udp_port() {
+    asio::io_context io;
+    asio::ip::udp::socket sock(
+        io, asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    return sock.local_endpoint().port();
+}
+
+std::shared_ptr<KCPClientSession> make_client_session(asio::io_context& io,
+                                                      uint16_t server_port) {
+    auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_CLIENT,
+                                           Crypto::generate_session_salt());
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), server_port);
+    return std::make_shared<KCPClientSession>(io, endpoint, crypto);
+}
+
+void test_client_session_close_before_connect_is_safe_and_idempotent() {
+    // abort_handshake() can run before the session ever reached connect(): the
+    // local app may disconnect (or send a bad greeting) while the SOCKS5 step is
+    // still in flight, and the handshake deadline can fire first. close() must
+    // therefore be safe on a session whose running_ is still false, and must
+    // tolerate being called more than once (the funnel is idempotent by design).
+    asio::io_context io;
+    auto session = make_client_session(io, free_udp_port());
+
+    expect_true(!session->is_connected(), "fresh client session must not look connected");
+
+    session->close();
+    io.poll();
+    io.restart();
+    expect_true(!session->is_connected(), "close before connect must not connect the session");
+
+    session->close();
+    io.restart();
+    io.poll();
+    expect_true(!session->is_connected(), "second close must stay a no-op");
+
+    // KCPProxyClient's shared 10ms tick calls on_update_tick() for every
+    // registered session; on a closed one it must be inert (no crash, no queued
+    // data), exactly as the server-side equivalent must be.
+    asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+    io.restart();
+    io.poll();
+    expect_true(!session->is_connected(), "on_update_tick on a closed session must not revive it");
+    expect_true(session->wait_send() == 0, "closed session must not queue KCP data");
+}
+
+void test_client_session_close_mid_handshake_makes_it_inert() {
+    // The state abort_handshake() has to leave the session in. While the
+    // handshake read is parked the session is live, so a caller's read is
+    // rejected instead of stacked (observable proof of the parked read); after
+    // close() the session must be inert -- reads abort immediately rather than
+    // parking forever, which would strand a forwarding loop.
+    asio::io_context io;
+    auto session = make_client_session(io, free_udp_port());
+
+    // connect() starts the session (running_ = true) and parks its own read for
+    // the HELLO_ACK. No peer answers, so it stays pending -- which is all this
+    // test needs; the 3s handshake timeout never elapses.
+    session->connect([](bool) {});
+    io.poll();
+    io.restart();
+
+    std::array<uint8_t, 16> buf{};
+    bool stacked_called = false;
+    std::error_code stacked_ec;
+    session->async_read_some(asio::buffer(buf), [&](std::error_code ec, size_t) {
+        stacked_called = true;
+        stacked_ec = ec;
+    });
+    io.poll();
+    io.restart();
+    expect_true(stacked_called, "read issued while the handshake read is parked must not hang");
+    expect_true(stacked_ec == asio::error::already_started,
+                "a stacked read must be rejected with already_started");
+
+    session->close();
+    io.poll();
+    io.restart();
+    io.poll();
+    expect_true(!session->is_connected(), "closed session must not report connected");
+
+    bool read_called = false;
+    std::error_code read_ec;
+    session->async_read_some(asio::buffer(buf), [&](std::error_code ec, size_t) {
+        read_called = true;
+        read_ec = ec;
+    });
+    io.poll();
+    io.restart();
+    io.poll();
+    expect_true(read_called, "read on a closed session must complete, not hang");
+    expect_true(read_ec == asio::error::operation_aborted,
+                "read on a closed session must report operation_aborted");
+    expect_true(!session->is_connected(), "session must stay closed");
+}
+
+void test_client_session_close_releases_parked_handler() {
+    // The leak regression, made observable. connect() parks a read handler that
+    // captures the session's own shared_ptr; if close() did not release it, the
+    // session -- and with it the UDP socket -- would outlive every owner, which
+    // is exactly the leak abort_handshake() was written to stop. A weak_ptr is
+    // the instrument: once close() has run and the completions it queued have
+    // been drained, no handler may still be holding the session.
+    asio::io_context io;
+    std::weak_ptr<KCPClientSession> weak;
+    {
+        auto session = make_client_session(io, free_udp_port());
+        weak = session;
+        session->connect([](bool) {});
+        io.poll();
+        io.restart();
+
+        session->close();
+        io.poll();
+        io.restart();
+        io.poll();
+    }
+    // Drain whatever the teardown queued (aborted read, cancelled timer, aborted
+    // UDP receive): each of those handlers holds a self-reference until it runs.
+    io.restart();
+    io.poll();
+    expect_true(weak.expired(),
+                "closed client session was still referenced by a parked handler "
+                "(session + UDP socket leak)");
+}
+
+void test_client_session_keepalive_released_with_session() {
+    // set_keepalive() carries the client's session-cap ticket (see
+    // handle_client_connection in client.cpp): the counter must drop exactly
+    // when the session object dies, on every teardown path, which is what lets
+    // the cap survive handshake failures without a per-path cleanup hook. Pin
+    // that the resource is owned by the session and released with it.
+    asio::io_context io;
+    auto probe = std::make_shared<int>(1);
+    {
+        auto session = make_client_session(io, free_udp_port());
+        session->set_keepalive(probe);
+        expect_true(probe.use_count() == 2, "the session must hold the keepalive resource");
+    }
+    expect_true(probe.use_count() == 1,
+                "keepalive resource must be released when the session is destroyed");
+}
+
+// Stops the client's io_context and joins its runner on scope exit, so an
+// assertion failure (which throws) cannot leave a joinable std::thread behind
+// and terminate the process.
+struct ClientIoGuard {
+    asio::io_context& io;
+    std::thread& runner;
+    ~ClientIoGuard() {
+        io.stop();
+        if (runner.joinable()) runner.join();
+    }
+};
+
+void test_client_abort_handshake_closes_local_socket() {
+    // Regression for abort_handshake() (see client.hpp). The KCP handshake to an
+    // unreachable server never completes, so the failure path must close BOTH
+    // the local app socket and the KCP session. Before the fix only the deadline
+    // was cancelled, whose callback owned the cleanup and returns early on
+    // operation_aborted -- so the local app kept a socket that would never
+    // answer, and the session + UDP socket leaked until the idle timeout.
+    //
+    // What is asserted here is the half the local app can see: its socket is
+    // closed promptly instead of hanging. The session half is pinned by the
+    // KCPClientSession tests above (close() drops the parked handler and
+    // releases the UDP socket / keepalive ticket).
+    asio::io_context io;
+    const uint16_t listen_port = free_tcp_port();
+    const uint16_t dead_server_port = free_udp_port();  // deliberately nothing here
+
+    auto client = std::make_shared<KCPProxyClient>(
+        io, "127.0.0.1", dead_server_port, "remote_test_key_123456",
+        "127.0.0.1", listen_port);
+    client->start();
+
+    std::thread runner([&io]() { io.run(); });
+    ClientIoGuard guard{io, runner};
+
+    const auto listen_ep =
+        asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), listen_port);
+
+    // The listener comes up asynchronously (resolve -> bind -> listen).
+    asio::io_context probe_io;
+    bool up = false;
+    for (int i = 0; i < 100 && !up; ++i) {
+        asio::ip::tcp::socket probe(probe_io);
+        std::error_code ec;
+        probe.connect(listen_ep, ec);
+        up = !ec;
+        if (up) {
+            probe.close(ec);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    expect_true(up, "client SOCKS5 listener never came up");
+
+    // A local app opens a tunnel. The KCP handshake times out after
+    // KCP_HANDSHAKE_TIMEOUT_SEC, after which abort_handshake() must close this
+    // socket rather than leave the app waiting on a tunnel that will never come.
+    asio::io_context app_io;
+    asio::ip::tcp::socket app(app_io);
+    std::error_code ec;
+    app.connect(listen_ep, ec);
+    expect_true(!ec, "local app could not connect to the client listener");
+    const std::array<uint8_t, 3> greeting{0x05, 0x01, 0x00};
+    asio::write(app, asio::buffer(greeting), ec);
+
+    bool peer_closed = false;
+    bool timed_out = false;
+    std::array<uint8_t, 32> buf{};
+    asio::steady_timer deadline(app_io);
+    deadline.expires_after(std::chrono::seconds(15));
+    deadline.async_wait([&](const std::error_code& timer_ec) {
+        if (!timer_ec) timed_out = true;
+    });
+    app.async_read_some(asio::buffer(buf),
+        [&](const std::error_code& read_ec, size_t n) {
+            // A clean close surfaces as EOF, an abrupt one as connection_reset.
+            peer_closed = (read_ec == asio::error::eof) ||
+                          (read_ec == asio::error::connection_reset) ||
+                          (!read_ec && n == 0);
+            deadline.cancel();
+        });
+    app_io.run();
+
+    expect_true(!timed_out,
+                "abort_handshake left the local app hanging after the KCP "
+                "handshake failed (socket neither closed nor reset)");
+    expect_true(peer_closed,
+                "abort_handshake must close the local socket when the KCP handshake fails");
+
+    // The client must still be serving afterwards: a fresh local connection is
+    // accepted, which also shows the failed session was released rather than
+    // held against the session cap.
+    asio::ip::tcp::socket app2(app_io);
+    app2.connect(listen_ep, ec);
+    expect_true(!ec, "client stopped accepting connections after a failed handshake");
+    app2.close(ec);
+    app.close(ec);
+}
+
 } // namespace
 
 int main() {
@@ -557,6 +824,11 @@ int main() {
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();
         test_session_drained_deferred_while_send_buffer_nonempty();
+        test_client_session_close_before_connect_is_safe_and_idempotent();
+        test_client_session_close_mid_handshake_makes_it_inert();
+        test_client_session_close_releases_parked_handler();
+        test_client_session_keepalive_released_with_session();
+        test_client_abort_handshake_closes_local_socket();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;

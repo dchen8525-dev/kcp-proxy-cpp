@@ -151,6 +151,16 @@ Current unit coverage includes:
   **withheld** while bytes are still queued in KCP. That deferral is pinned
   deterministically here; phase E of the robustness suite covers the same
   guarantee end-to-end (a 1 MB response whose target closes must arrive whole).
+- Client-side teardown contract, the counterpart of the above:
+  `KCPClientSession::close()` — the primitive every `abort_handshake()` runs — is
+  safe before `connect()` and idempotent, leaves a mid-handshake session inert
+  (a later read aborts instead of parking), and **releases the handler the
+  handshake parked** (asserted through a `weak_ptr`, which is the session +
+  UDP-socket leak the funnel exists to prevent). The keepalive/ticket attached
+  via `set_keepalive()` is released with the session. An in-process test then
+  drives a real `KCPProxyClient` against an unreachable server and asserts
+  `abort_handshake()` closes the local app socket once the handshake fails,
+  while the client keeps accepting new connections.
 
 ## Manual
 
