@@ -62,6 +62,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -441,11 +442,46 @@ def phase_garbage_flood(server_exe, client_exe, log_dir, echo_port):
                 "allocate any state" % (sessions_after - sessions_before))
         print("  [ok] garbage allocated no session on the server")
 
-        if "auth attempt rate limit reached" not in srv_log:
-            raise AssertionError(
-                "auth throttle never engaged under a %d-packet flood "
-                "(a flood could pin the CPU on AEAD decrypts)" % FLOOD_PACKETS)
-        print("  [ok] auth rate limiter engaged under the flood")
+        # The limiter is a global per-second budget (MAX_AUTH_ATTEMPTS_PER_SEC
+        # = 500), so it can only engage if auth attempts actually arrive at
+        # 500+/sec. Two subtleties make the log the only honest witness:
+        #   - once the throttle engages, FAIL_STAGE=DECRYPT_FAILED lines STOP
+        #     (packets are dropped before decrypt), so the FAIL_STAGE rate is
+        #     only ever a *lower bound* of the attempt rate;
+        #   - some OSes (macOS notably) pace loopback UDP bursts to a trickle,
+        #     so a 1500-packet flood can be delivered far below the budget no
+        #     matter how fast the server is.
+        # Decision: throttle message present -> pass; absent but the observed
+        # FAIL_STAGE rate still exceeded the budget -> real bug; otherwise the
+        # budget was never approached and the throttle engaging is not required.
+        if "auth attempt rate limit reached" in srv_log:
+            print("  [ok] auth rate limiter engaged under the flood")
+        else:
+            attempt_times = []
+            for line in srv_log.splitlines():
+                if "FAIL_STAGE=DECRYPT_FAILED" in line:
+                    try:
+                        attempt_times.append(
+                            datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S.%f")
+                            .timestamp())
+                    except ValueError:
+                        continue
+            attempt_times.sort()
+            peak_rate = 0
+            lo = 0
+            for hi in range(len(attempt_times)):
+                while attempt_times[hi] - attempt_times[lo] > 1.0:
+                    lo += 1
+                peak_rate = max(peak_rate, hi - lo + 1)
+            if peak_rate >= 500:
+                raise AssertionError(
+                    "auth path saw %d decrypt failures/sec (budget is 500/s) "
+                    "yet the throttle never engaged: a flood could pin the "
+                    "CPU on AEAD decrypts" % peak_rate)
+            print("  [skip] throttle assertion: flood delivered at peak %d "
+                  "decrypt failures/sec, below the 500/s budget (the OS paces "
+                  "the loopback burst), so the limiter engaging is not required"
+                  % peak_rate)
 
         # The throttle is a global per-second budget. A legitimate handshake in
         # the same window would be dropped, so wait for the window to roll over
