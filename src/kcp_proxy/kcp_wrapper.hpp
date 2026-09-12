@@ -47,6 +47,12 @@ public:
     int peek_size() const;
     int wait_send() const;
 
+    // Read-only handle to the underlying ikcpcb. Used by tests and debugging to
+    // inspect the live KCP state (e.g. verify configure() applied the KCP_*
+    // constants). Returns a valid pointer for the lifetime of the object;
+    // construction throws instead of leaving it null.
+    const ikcpcb* ikcp() const { return kcp_; }
+
     void configure();
 
 private:

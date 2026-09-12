@@ -2,6 +2,7 @@
 #include "kcp_proxy/config.hpp"
 #include "kcp_proxy/crypto.hpp"
 #include "kcp_proxy/kcp_session.hpp"
+#include "kcp_proxy/kcp_wrapper.hpp"
 #include "kcp_proxy/socks5.hpp"
 #include <asio.hpp>
 #include <cassert>
@@ -407,6 +408,28 @@ void test_kcp_config_line() {
     has("timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s");
 }
 
+void test_kcp_wrapper_applies_constants() {
+    // configure() must apply the KCP_* constants to the live ikcp state. The
+    // whole point of promoting the literals to named constants (b52a8bb) was
+    // that the startup log (kcp_config_line) and the live ikcp tuning can
+    // never drift apart; this asserts the live side actually carries them, so
+    // the "log renders these exact values" promise is enforced, not just
+    // asserted textually by test_kcp_config_line.
+    KcpWrapper wrapper(KCP_CONV);
+    const ikcpcb* k = wrapper.ikcp();
+    expect_true(k != nullptr, "KcpWrapper.ikcp() returned null");
+
+    expect_true(k->conv == KCP_CONV, "ikcp conv mismatch");
+    expect_true(k->mtu == static_cast<IUINT32>(KCP_MTU), "ikcp mtu mismatch");
+    expect_true(k->snd_wnd == static_cast<IUINT32>(KCP_SNDWND), "ikcp snd_wnd mismatch");
+    expect_true(k->rcv_wnd == static_cast<IUINT32>(KCP_RCVWND), "ikcp rcv_wnd mismatch");
+    expect_true(k->nodelay == static_cast<IUINT32>(KCP_NODELAY), "ikcp nodelay mismatch");
+    expect_true(k->interval == static_cast<IUINT32>(KCP_INTERVAL_MS), "ikcp interval mismatch");
+    // ikcp_nodelay() maps the resend argument to fastresend and nc to nocwnd.
+    expect_true(k->fastresend == KCP_RESEND, "ikcp fastresend (resend) mismatch");
+    expect_true(k->nocwnd == KCP_NC, "ikcp nocwnd (nc) mismatch");
+}
+
 } // namespace
 
 int main() {
@@ -417,6 +440,7 @@ int main() {
         test_restricted_targets();
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
+        test_kcp_wrapper_applies_constants();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;
