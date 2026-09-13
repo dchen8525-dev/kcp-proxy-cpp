@@ -42,13 +42,14 @@ npm run build:win
 npm run build:linux
 ```
 
-打包结果：`dist/kcp-proxy-client-<版本>.AppImage`
+打包结果：`dist/KCP-Proxy-Client-<版本>.AppImage`
 
 ## 配置文件
 
-配置保存在：
-- Windows: `%APPDATA%/kcp-proxy-gui/config.json`
-- Linux: `~/.config/kcp-proxy-gui/config.json`
+配置保存在 Electron 的 `userData` 目录下（`config.json`）：
+- Windows 打包版: `%APPDATA%/KCP Proxy Client/config.json`
+- Linux 打包版: `~/.config/KCP Proxy Client/config.json`
+- 开发模式（`npm start`）: 目录名为 `kcp-proxy-gui`
 
 ## 功能说明
 
@@ -58,15 +59,16 @@ npm run build:linux
 - **本地 SOCKS 端口**: 本地代理端口（默认 1080）
 
 ### 密钥模式
-1. **每日密钥**: 北京日期 (YYYYMMDD) + 后缀
-   - 例如：日期为 20260818，后缀为 `xyz`，密钥为 `20260818xyz`
-2. **固定密钥**: 手动输入密钥（至少 16 个字符）
+GUI 只使用**每日密钥**：北京日期 (YYYYMMDD) + 后缀。
+- 例如：日期为 20260818，后缀为 `xyz`，密钥为 `20260818xyz`
+- 固定密钥（`-k`）仅在命令行客户端可用
 
 ### 按钮说明
-- **保存设置**: 保存当前配置
+- **测试连接**: 解析域名并做一次真实 KCP 握手探测
 - **启动代理**: 启动 kcp-proxy-client 进程
 - **停止代理**: 停止代理进程
-- **开机自动启动**: 勾选后随系统启动
+
+所有输入框在内容变更后自动保存（没有单独的「保存设置」按钮）。
 
 ## 注意事项
 
@@ -82,7 +84,7 @@ npm run build:linux
 
 - Electron 28+
 - 原生 HTML/CSS/JavaScript（无框架依赖）
-- electron-store（配置持久化）
+- 内置轻量配置存储（`main.js` 的 `ConfigStore`，不再依赖 electron-store）
 - electron-builder（打包）
 
 ## 文件结构

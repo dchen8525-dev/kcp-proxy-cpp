@@ -387,7 +387,13 @@ def build_standalone(os_name: str, arch: str) -> Path:
     server_bin = bin_dir / f"kcp-proxy-server{ext}"
     client_bin = bin_dir / f"kcp-proxy-client{ext}"
     readme = ROOT_DIR / "README.md"
-    for required in (server_bin, client_bin, readme):
+    # The launcher is shipped flat next to the binaries -- the release layout
+    # start.sh/start.bat look for first. README documents them and CMakeLists
+    # installs them, so the archive has to carry them too or a user who unpacks
+    # a release gets no way to start anything but the raw CLI.
+    launchers = ["start.bat"] if os_name == "windows" else ["start.sh"]
+    launcher_paths = [ROOT_DIR / "scripts" / "runtime" / l for l in launchers]
+    for required in (server_bin, client_bin, readme, *launcher_paths):
         if not required.is_file():
             raise PackageError(f"required file not found: {required}")
 
@@ -403,6 +409,8 @@ def build_standalone(os_name: str, arch: str) -> Path:
         (f"{name}/kcp-proxy-client{ext}", client_bin, MODE_EXEC),
         (f"{name}/README.md", readme, MODE_FILE),
     ]
+    entries += [(f"{name}/{launcher}", path, MODE_EXEC)
+                for launcher, path in zip(launchers, launcher_paths)]
     entries += [(f"{name}/{dll.name}", dll, MODE_EXEC) for dll in dlls]
 
     stage_root = new_stage_dir(prefix=f"pkg-{version}-")

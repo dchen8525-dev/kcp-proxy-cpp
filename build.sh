@@ -8,13 +8,24 @@ echo " KCP Proxy Build (Linux/macOS)"
 echo "========================================"
 
 echo "[1/3] Setting up vcpkg..."
+# Pinned upstream state. vcpkg.json's builtin-baseline, the CI pin and this
+# must agree (tests/smoke/smoke_test.py enforces it).
+VCPKG_COMMIT="c5a15727ee70fddf0296f0d8aafc3f58916fefac"
+
+# Verify a vcpkg tree this script manages is at the pinned commit. A
+# user-supplied VCPKG_ROOT is deliberately not validated -- it is the user's
+# choice. Before, this function compared against an undefined
+# EXPECTED_VCPKG_COMMIT and was never called at all, so a stale project-local
+# vcpkg silently built the release against a different tree than CI.
 validate_vcpkg() {
     local root="$1"
     [ -x "$root/vcpkg" ] || { echo "Error: vcpkg executable not found at $root" >&2; exit 1; }
     local actual
     actual=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
-    [ "$actual" = "$EXPECTED_VCPKG_COMMIT" ] || {
-        echo "Error: vcpkg commit mismatch (expected $EXPECTED_VCPKG_COMMIT, got ${actual:-unknown})" >&2
+    [ "$actual" = "$VCPKG_COMMIT" ] || {
+        echo "Error: vcpkg commit mismatch at $root" >&2
+        echo "       expected $VCPKG_COMMIT, got ${actual:-unknown}" >&2
+        echo "       Remove $root and re-run, or point VCPKG_ROOT at a matching tree." >&2
         exit 1
     }
 }
@@ -22,13 +33,14 @@ validate_vcpkg() {
 if [ -z "${VCPKG_ROOT:-}" ]; then
     if [ -x "$REPO_ROOT/vcpkg/vcpkg" ]; then
         VCPKG_ROOT="$REPO_ROOT/vcpkg"
+        validate_vcpkg "$VCPKG_ROOT"
     else
         echo "[1/3] Bootstrapping pinned vcpkg..."
-        VCPKG_COMMIT="c5a15727ee70fddf0296f0d8aafc3f58916fefac"
         git clone https://github.com/microsoft/vcpkg.git "$REPO_ROOT/vcpkg"
         git -C "$REPO_ROOT/vcpkg" checkout --detach "$VCPKG_COMMIT"
         "$REPO_ROOT/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
         VCPKG_ROOT="$REPO_ROOT/vcpkg"
+        validate_vcpkg "$VCPKG_ROOT"
     fi
 else
     echo "[1/3] Using vcpkg at $VCPKG_ROOT"
@@ -76,8 +88,18 @@ echo "[3/3] Configuring and building..."
 cmake --preset default
 cmake --build --preset release --parallel
 
+# Same gate build_vs.bat runs: a green build must not hide failing tests.
+echo "Running tests (ctest)..."
+ctest --test-dir build --output-on-failure
+
 echo
-OUTDIR="$REPO_ROOT/bin/linux"
+# Match the directory package.py reads for this OS (bin/linux, bin/macos).
+# This used to be bin/linux unconditionally, so a macOS build's artifacts
+# landed where the macOS packager never looked.
+case "$(uname -s)" in
+    Darwin) OUTDIR="$REPO_ROOT/bin/macos" ;;
+    *)      OUTDIR="$REPO_ROOT/bin/linux" ;;
+esac
 mkdir -p "$OUTDIR"
 cp -f "$REPO_ROOT/build/kcp-proxy-server" "$OUTDIR/"
 cp -f "$REPO_ROOT/build/kcp-proxy-client" "$OUTDIR/"

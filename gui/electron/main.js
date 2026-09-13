@@ -48,9 +48,7 @@ class ConfigStore {
     return this._data[key] !== undefined ? this._data[key] : this.defaults[key];
   }
 
-  set(key, value) {
-    this._ensure();
-    this._data[key] = value;
+  _persist() {
     try {
       const dir = path.dirname(this.filePath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -58,6 +56,26 @@ class ConfigStore {
     } catch (err) {
       console.error('Failed to save config:', err.message);
     }
+  }
+
+  set(key, value) {
+    this._ensure();
+    this._data[key] = value;
+    this._persist();
+  }
+
+  // Apply several keys with a single file write. The renderer saves five fields
+  // at once, and the old per-key loop rewrote the whole file five times.
+  setMany(entries) {
+    this._ensure();
+    let changed = false;
+    for (const [key, value] of entries) {
+      if (this._data[key] !== value) {
+        this._data[key] = value;
+        changed = true;
+      }
+    }
+    if (changed) this._persist();
   }
 }
 
@@ -117,10 +135,16 @@ function getClientPath() {
     ? 'kcp-proxy-client.exe'
     : 'kcp-proxy-client';
 
+  // Map Node's platform names onto the bin/<dir> layout build.sh / build_vs.bat
+  // produce. process.platform is 'darwin' on macOS but the directory is 'macos'.
+  const binDir = process.platform === 'win32' ? 'windows'
+    : process.platform === 'darwin' ? 'macos'
+    : 'linux';
+
   const candidates = [
     path.join(process.resourcesPath, executable),
-    // Dev-mode layout: gui/electron -> ../../bin/windows (repo root's bin dir).
-    path.join(__dirname, '../../bin', process.platform === 'win32' ? 'windows' : process.platform, executable),
+    // Dev-mode layout: gui/electron -> ../../bin/<os> (repo root's bin dir).
+    path.join(__dirname, '../../bin', binDir, executable),
     path.join(__dirname, '../../../build/Release', executable),
     path.join(__dirname, executable)
   ];
@@ -181,20 +205,22 @@ function createWindow() {
     }
   });
 
-  // Hide to tray instead of closing
+  // Hide to tray instead of closing -- but only when a tray actually exists.
+  // If createTray() failed (no tray, e.g. a Linux desktop without a status
+  // notifier), swallowing the close would leave the window hidden with nothing
+  // able to bring it back, and the only way out would be Task Manager.
   mainWindow.on('close', (event) => {
-    if (!app.isQuitting) {
-      event.preventDefault();
-      mainWindow.hide();
+    if (app.isQuitting || !tray) return;
+    event.preventDefault();
+    mainWindow.hide();
 
-      // Show notification on first hide
-      if (!store.get('hasHiddenOnce')) {
-        tray?.displayBalloon({
-          title: 'KCP Proxy Client',
-          content: '程序已最小化到系统托盘，点击托盘图标可重新打开'
-        });
-        store.set('hasHiddenOnce', true);
-      }
+    // Show notification on first hide
+    if (!store.get('hasHiddenOnce')) {
+      tray?.displayBalloon({
+        title: 'KCP Proxy Client',
+        content: '程序已最小化到系统托盘，点击托盘图标可重新打开'
+      });
+      store.set('hasHiddenOnce', true);
     }
   });
 
@@ -252,8 +278,8 @@ function createTray() {
     {
       label: '显示主界面',
       click: () => {
-        mainWindow.show();
-        mainWindow.focus();
+        mainWindow?.show();
+        mainWindow?.focus();
       }
     },
     { type: 'separator' },
@@ -293,8 +319,8 @@ function createTray() {
   trayMenu = contextMenu;
 
   tray.on('double-click', () => {
-    mainWindow.show();
-    mainWindow.focus();
+    mainWindow?.show();
+    mainWindow?.focus();
   });
 }
 
@@ -669,10 +695,17 @@ function handleClientLine(line) {
 // IPC handlers
 ipcMain.handle('get-config', () => store.store);
 
+// The only keys the renderer may persist (see renderer.js saveSettings). A
+// whitelist costs nothing now and stops an unknown or hostile key from being
+// written into the config file if the renderer is ever compromised.
+const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoReconnect'];
+
 ipcMain.handle('save-config', (event, config) => {
-  Object.keys(config).forEach(key => {
-    store.set(key, config[key]);
-  });
+  if (!config || typeof config !== 'object') return false;
+  const entries = SAVEABLE_CONFIG_KEYS
+    .filter((key) => Object.prototype.hasOwnProperty.call(config, key))
+    .map((key) => [key, config[key]]);
+  store.setMany(entries);
   return true;
 });
 
@@ -834,23 +867,6 @@ ipcMain.handle('test-connection', async (event, host, port) => {
   return probeKcpHandshake(clientPath, h, p);
 });
 
-// IPC for updater (stubs — real mechanism lives in main process)
-ipcMain.handle('check-for-updates', async () => {
-  if (autoUpdater) {
-    autoUpdater.checkForUpdates();
-    return true;
-  }
-  return false;
-});
-
-ipcMain.handle('quit-and-install', async () => {
-  if (autoUpdater) {
-    installPendingUpdate();
-    return true;
-  }
-  return false;
-});
-
 ipcMain.on('window-minimize', () => {
   mainWindow?.minimize();
 });
@@ -937,14 +953,41 @@ function installPendingUpdate() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-  if (clientProcess) {
-    try { clientProcess.kill(); } catch (err) { sendLog(`停止代理失败: ${err.message}`, 'warn'); }
+
+  const finish = () => {
+    app.isQuitting = true;
+    if (autoUpdater) {
+      autoUpdater.quitAndInstall();
+    } else {
+      app.quit();
+    }
+  };
+
+  const proc = clientProcess;
+  if (!proc) {
+    finish();
+    return;
   }
-  app.isQuitting = true;
-  if (autoUpdater) {
-    autoUpdater.quitAndInstall();
-  } else {
-    app.quit();
+
+  // Wait for the child to actually exit before installing. It holds the local
+  // SOCKS port, and on Windows quitAndInstall() ends the app via app.exit(0) --
+  // which bypasses before-quit -- so killing it and installing immediately left
+  // the fresh version racing the old process's teardown. Bounded, so a stuck
+  // child cannot block the update forever.
+  let settled = false;
+  let timer = null;
+  const finishOnce = () => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    finish();
+  };
+  timer = setTimeout(finishOnce, 3000);
+  proc.once('close', finishOnce);
+  try {
+    proc.kill();
+  } catch (err) {
+    sendLog(`停止代理失败: ${err.message}`, 'warn');
   }
 }
 
@@ -969,6 +1012,9 @@ app.whenReady().then(() => {
 
   createWindow();
   createTray();
+  // Sync the tray menu's start/stop enabled state; updateStatus() is otherwise
+  // only called on start/stop, so both items started out enabled.
+  updateStatus(false);
   setupAutoUpdater();
   removeLegacyAutoStartEntry();
 });
@@ -981,6 +1027,13 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
+  // Suppress auto-reconnect: the child's 'close' handler would otherwise call
+  // scheduleReconnect() and could spawn a fresh client while the app exits.
+  isManualStop = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   if (clientProcess) {
     clientProcess.kill();
   }

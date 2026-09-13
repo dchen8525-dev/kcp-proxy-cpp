@@ -5,7 +5,8 @@ build/
 vcpkg/
 vcpkg_installed/
 
-# Pre-built binaries (deploy scripts live in scripts/, root start.sh/start.bat)
+# Pre-built binaries (deploy scripts live in scripts/deploy, runtime launchers
+# in scripts/runtime)
 bin/
 
 # IDE
@@ -30,7 +31,7 @@ cmake_install.cmake
 # Logs
 *.log
 
-# Release artifacts (built by scripts/package-*.sh / *.ps1)
+# Release artifacts (built by scripts/package/package.py)
 dist/
 
 # Editor / IDE
@@ -62,8 +63,6 @@ update_service.py
 # Electron GUI
 gui/electron/dist/
 gui/electron/node_modules/
-gui/windows/KcpProxyGui/bin/
-gui/windows/KcpProxyGui/obj/
 
 # Release packages (keep only in releases)
 *.zip
@@ -77,5 +76,3 @@ gui/windows/KcpProxyGui/obj/
 
 # Local deploy helper (contains server credentials; kept out of the repo)
 scripts/deploy/sshrun.py
-# Icon candidate scratch renderer (points at a machine-local node_modules)
-gui/electron/assets/icon-candidates/render.js

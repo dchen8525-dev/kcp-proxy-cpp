@@ -2,58 +2,27 @@
 
 #include "config.hpp"
 #include "crypto.hpp"
-#include "kcp_wrapper.hpp"
+#include "kcp_tunnel.hpp"
 #include "byte_view.hpp"
 #include <asio.hpp>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
-#include <array>
 
 namespace kcp_proxy {
 
-// Performance metrics for monitoring
-struct SessionMetrics {
-    std::atomic<uint64_t> packets_sent{0};
-    std::atomic<uint64_t> packets_received{0};
-    std::atomic<uint64_t> bytes_sent{0};
-    std::atomic<uint64_t> bytes_received{0};
-    std::atomic<uint64_t> encrypt_errors{0};
-    std::atomic<uint64_t> decrypt_errors{0};
-
-    // UDP datagram level (used for peer-to-peer loss localization): every
-    // encrypted datagram handed to the peer counts as one TX, every datagram
-    // that reaches decrypt counts as one RX. replay_dropped counts decrypted
-    // duplicates discarded by the anti-replay window (i.e. peer retransmissions).
-    std::atomic<uint64_t> udp_tx_packets{0};
-    std::atomic<uint64_t> udp_tx_bytes{0};
-    std::atomic<uint64_t> udp_rx_packets{0};
-    std::atomic<uint64_t> udp_rx_bytes{0};
-    std::atomic<uint64_t> replay_dropped{0};
-
-    void reset() {
-        packets_sent.store(0);
-        packets_received.store(0);
-        bytes_sent.store(0);
-        bytes_received.store(0);
-        encrypt_errors.store(0);
-        decrypt_errors.store(0);
-        udp_tx_packets.store(0);
-        udp_tx_bytes.store(0);
-        udp_rx_packets.store(0);
-        udp_rx_bytes.store(0);
-        replay_dropped.store(0);
-    }
-};
-
-class KCPSession : public std::enable_shared_from_this<KCPSession> {
+// Server-side tunnel: one peer UDP endpoint. It owns no socket -- the server
+// multiplexes every session over a single UDP socket -- so encrypted output
+// leaves through the send callback installed by KCPServer. See KcpTunnel for
+// the machinery shared with the client session.
+class KCPSession : public KcpTunnel {
 public:
     KCPSession(asio::io_context& io, uint32_t conv,
                asio::ip::udp::endpoint remote_addr,
                std::shared_ptr<Crypto> crypto,
                std::string session_id);
-    ~KCPSession();
+    ~KCPSession() override;
 
     void start();
     void stop();
@@ -75,14 +44,10 @@ public:
     // (to authenticate before allocating a session) and we don't want to pay
     // the cost twice -- nor have it rejected by the replay window.
     void inject_decrypted(std::vector<uint8_t> decrypted, std::function<void()> after = {});
-    void send_data(byte_view data);
-    void async_read_some(asio::mutable_buffer buffer,
-                         std::function<void(std::error_code, size_t)> handler);
 
     bool is_alive() const;
     bool is_running() const { return (state_flags_.load() & RUNNING) != 0; }
-    bool is_handshake_done() const;
-    void mark_handshake_done();
+    void mark_handshake_done() override;
     bool is_protocol_handshake_done() const {
         return (state_flags_.load() & PROTOCOL_HS_DONE) != 0;
     }
@@ -131,42 +96,20 @@ public:
 
     const std::string& session_id() const { return session_id_; }
     const asio::ip::udp::endpoint& remote_addr() const { return remote_addr_; }
-    int wait_send() const { return kcp_.wait_send(); }
-    int peek_size() const { return kcp_.peek_size(); }
-
-    // Exposes the per-session strand so the server can safely perform KCP-state
-    // reads (peek_size/wait_send) and run session-driven logic on the strand
-    // instead of the raw I/O thread.
-    asio::strand<asio::io_context::executor_type>& strand() { return strand_; }
 
     // True if `packet`'s leading bytes carry this session's salt (i.e. the
-    // packet belongs to this session, not to a NEW session that collided on
-    // the same source endpoint after a client reconnect).
+    // packet belongs to this session, not to a NEW session that collided on the
+    // same source endpoint after a client reconnect).
     bool salt_matches(byte_view packet) const { return crypto_->matches_salt(packet); }
 
     // Takes ownership of the (already encrypted) datagram so the server's UDP
     // send can move it without an extra copy.
     void set_send_callback(std::function<void(std::vector<uint8_t>)> cb);
 
-    // Performance metrics
-    const SessionMetrics& metrics() const { return metrics_; }
-
-    // Single-line UDP/decrypt counters for loss localization (see stats_summary()).
-    std::string stats_summary() const;
-
 private:
-    asio::io_context& io_;
-    asio::strand<asio::io_context::executor_type> strand_;
     std::string session_id_;
     asio::ip::udp::endpoint remote_addr_;
-    std::shared_ptr<Crypto> crypto_;
     std::function<void(std::vector<uint8_t>)> send_callback_;
-
-    KcpWrapper kcp_;
-    // NOTE: there is intentionally NO per-session update timer here. KCP
-    // updates are driven by KCPServer's single shared 10ms tick (see
-    // do_update_tick), which collapses 4096 per-session timer-heap entries
-    // into one timer. on_update_tick() below runs inside strand_ only.
 
     // Packed atomic flags to reduce cache line contention
     std::atomic<uint8_t> state_flags_{0};
@@ -174,19 +117,9 @@ private:
     // State flag bits
     static constexpr uint8_t RUNNING = 0x01;
     static constexpr uint8_t PROTOCOL_HS_DONE = 0x02;
-    static constexpr uint8_t SOCKS5_HS_DONE = 0x04;
     static constexpr uint8_t SOCKS5_READ_PENDING = 0x08;
     static constexpr uint8_t FORWARD_READ_PENDING = 0x10;
     static constexpr uint8_t CONNECT_PENDING = 0x20;
-
-    std::atomic<int64_t> last_activity_us_{0}; // steady_clock micros since epoch
-    // Throttle for the periodic (DEBUG) UDP stats line, to avoid per-tick spam.
-    std::atomic<int64_t> last_stats_us_{0};
-    // Keepalive send throttle. Distinct from last_activity_us_: sending a
-    // keepalive must NOT refresh the activity clock, otherwise a session whose
-    // peer has gone away would keep itself alive forever and evade the idle
-    // sweep. The cadence is throttled by this clock instead.
-    std::atomic<int64_t> last_keepalive_us_{0};
 
     // Set once the upstream target TCP connection has closed (see
     // is_target_closed()/mark_target_closed()). While it is set, the session
@@ -196,28 +129,15 @@ private:
     std::atomic<bool> target_closed_{false};
     std::function<void()> drained_cb_;
 
-    asio::mutable_buffer pending_read_buffer_{nullptr, 0};
-    std::function<void(std::error_code, size_t)> pending_read_handler_;
+    // --- KcpTunnel hooks ---
+    bool can_accept_data() const override { return is_running(); }
+    bool is_active() const override { return is_running(); }
+    void shut_down() override;
+    void handle_kcp_output(byte_view data) override;
 
-    // Fixed-size buffer for KCP recv (avoid heap allocation). Sized to hold a
-    // full forwarding message; KcpWrapper::recv reports KCP_RECV_MSG_TOO_BIG if
-    // a larger message ever arrives.
-    alignas(64) std::array<uint8_t, FWD_BUF_SIZE> kcp_recv_buf_{};
-    // Reused decrypt output (safe: kcp_.input copies into KCP's own buffers).
-    std::vector<uint8_t> decrypt_buf_;
-
-    SessionMetrics metrics_;
-
-    // All methods below assume they run on strand_.
+    // Both assume they run on strand_.
     void on_receive(std::vector<uint8_t> encrypted);
     void on_inject_decrypted(std::vector<uint8_t> decrypted);
-    void on_send(byte_view data);
-    void on_async_read_some(asio::mutable_buffer buffer,
-                            std::function<void(std::error_code, size_t)> handler);
-    void handle_kcp_output(byte_view data);
-    void try_fulfill_read();
-
-    void touch_activity();
 };
 
 } // namespace kcp_proxy

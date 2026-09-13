@@ -7,16 +7,16 @@ OpenSSH client (ssh/scp), which is built into Windows 10+ and
 available on virtually every Linux/macOS machine.
 
 Usage:
-    python3 scripts/deploy.py user@host [-P ssh-port] [-i identity-file]
-                                        [--suffix SUFFIX] [--uninstall]
-                                        [--dry-run] [--verbose]
+    python3 scripts/deploy/deploy.py user@host [-P ssh-port] [-i identity-file]
+                                               [--suffix SUFFIX] [--uninstall]
+                                               [--dry-run] [--verbose]
 
 Examples:
-    python3 scripts/deploy.py root@1.2.3.4
-    python3 scripts/deploy.py ubuntu@example.com -P 2222 -i ~/.ssh/id_ed25519
-    python3 scripts/deploy.py root@1.2.3.4 --suffix 'MyS3cret!'
-    python3 scripts/deploy.py root@1.2.3.4 --uninstall
-    python3 scripts/deploy.py root@1.2.3.4 --dry-run  # verify package without connecting
+    python3 scripts/deploy/deploy.py root@1.2.3.4
+    python3 scripts/deploy/deploy.py ubuntu@example.com -P 2222 -i ~/.ssh/id_ed25519
+    python3 scripts/deploy/deploy.py root@1.2.3.4 --suffix 'MyS3cret!'
+    python3 scripts/deploy/deploy.py root@1.2.3.4 --uninstall
+    python3 scripts/deploy/deploy.py root@1.2.3.4 --dry-run  # verify package without connecting
 """
 
 import argparse
@@ -310,8 +310,8 @@ def main():
         print(f"  Server port: {port}/udp")
         print()
         print("Connect a client:")
-        print(f"  scripts/start.sh client {host} '{suffix}'")
-        print(f"  scripts\\start.bat client {host} \"{suffix}\"")
+        print(f"  scripts/runtime/start.sh client {host} '{suffix}'")
+        print(f"  scripts\\runtime\\start.bat client {host} \"{suffix}\"")
         print(f"Then point your app at SOCKS5 {listen_host}:{listen_port}.")
         print()
         print("NOTE: the key is re-derived from the Beijing date on every")

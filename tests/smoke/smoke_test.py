@@ -72,6 +72,15 @@ def test_packaging_script():
         require((ROOT / "scripts" / "templates" / template).is_file(),
                 f"missing systemd template: scripts/templates/{template}")
 
+    # The standalone archive must ship the launchers CMakeLists installs and the
+    # README documents; without them a user who unpacks a release has no start
+    # script (this is exactly how the references drifted before).
+    for launcher in ("start.sh", "start.bat"):
+        require(launcher in text,
+                f"package.py must ship scripts/runtime/{launcher} in the CLI archive")
+        require((ROOT / "scripts" / "runtime" / launcher).is_file(),
+                f"missing runtime launcher: scripts/runtime/{launcher}")
+
 
 # --------------------------------------------------------------------------- #
 # secrets

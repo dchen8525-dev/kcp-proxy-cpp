@@ -25,21 +25,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   maximizeWindow: () => ipcRenderer.send('window-maximize'),
   closeWindow: () => ipcRenderer.send('window-close'),
 
-  // Updater
-  checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
-  quitAndInstall: () => ipcRenderer.invoke('quit-and-install'),
-
   // Events (auto-cleanup on each registration)
   onStatusUpdate: (callback) => safeOn('status-update', callback),
   onLog: (callback) => safeOn('log', callback),
   onTrafficUpdate: (callback) => safeOn('traffic-update', callback),
   onUpdateStatus: (callback) => safeOn('update-status', callback),
-  onMaximizeState: (callback) => safeOn('maximize-state', callback),
-
-  // Remove all listeners
-  removeAllListeners: (channel) => {
-    ipcRenderer.removeAllListeners(channel);
-  }
+  onMaximizeState: (callback) => safeOn('maximize-state', callback)
 });
 
 // Expose pure helpers (from utils.js) to the renderer. utils.js is CommonJS and

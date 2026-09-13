@@ -35,7 +35,6 @@ struct SOCKS5ParseResult {
     // Only engaged when status == Complete.
     std::optional<SOCKS5Request> request;
     std::string error;
-    size_t bytes_consumed = 0;
     // True when status == Invalid because the ATYP is unsupported. The caller
     // should reply SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED for that case and
     // SOCKS5_REPLY_GENERAL_FAILURE for every other parse error.

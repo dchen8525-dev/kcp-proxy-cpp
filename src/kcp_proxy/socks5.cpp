@@ -36,6 +36,15 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
         return result;
     }
 
+    // RFC 1928: RSV is reserved and MUST be 0x00. The parser used to read only
+    // VER/CMD/ATYP and ignored this byte entirely, so a request with RSV set was
+    // silently accepted.
+    if (data[2] != 0x00) {
+        result.status = SOCKS5ParseStatus::Invalid;
+        result.error = "invalid SOCKS5 reserved byte: " + std::to_string(data[2]);
+        return result;
+    }
+
     const uint8_t cmd = data[1];
     const uint8_t atyp = data[3];
     size_t need = 0;
@@ -78,7 +87,6 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
                                        data.end());
         }
         result.request = std::move(req);
-        result.bytes_consumed = need;
         result.status = SOCKS5ParseStatus::Complete;
     } catch (const std::exception& e) {
         result.status = SOCKS5ParseStatus::Invalid;

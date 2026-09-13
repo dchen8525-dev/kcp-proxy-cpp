@@ -7,10 +7,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # ---------- config: common.sh if available, else built-in defaults ----------
-if [ -f "$SCRIPT_DIR/../runtime/common.sh" ]; then
+# Deploy package: common.sh is shipped next to this script. Repo checkout: it
+# lives in ../runtime/. The old ../../scripts/common.sh fallback never existed.
+if [ -f "$SCRIPT_DIR/common.sh" ]; then
+    source "$SCRIPT_DIR/common.sh"
+elif [ -f "$SCRIPT_DIR/../runtime/common.sh" ]; then
     source "$SCRIPT_DIR/../runtime/common.sh"
-elif [ -f "$SCRIPT_DIR/../../scripts/common.sh" ]; then
-    source "$SCRIPT_DIR/../../scripts/common.sh"
 else
     INSTALL_DIR="/usr/local/bin/kcp-proxy"
     ENV_DIR="/etc/kcp-proxy"

@@ -41,7 +41,6 @@ public:
     EVPContext& operator=(EVPContext&&) = delete;
 
     operator evp_cipher_ctx_st*() { return ctx_; }
-    operator const evp_cipher_ctx_st*() const { return ctx_; }
 
 private:
     evp_cipher_ctx_st* ctx_;

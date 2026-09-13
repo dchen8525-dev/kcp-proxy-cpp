@@ -145,6 +145,20 @@ def wait_for_port(host, port, timeout):
     return False
 
 
+def normalize_binary_path(path):
+    """Return an absolute path with native separators.
+
+    Windows' CreateProcess does not resolve a *relative* path written with
+    forward slashes: ``subprocess.Popen(["build/Release/kcp-proxy-server.exe"])``
+    fails with ``[WinError 2] The system cannot find the file specified`` even
+    though the file exists and ``os.path.exists`` agrees. That is exactly the
+    form the documented invocation uses, so the failure was a confusing
+    "binary not found" against a binary that is right there. Normalizing once,
+    here, makes every downstream Popen call work on all platforms.
+    """
+    return os.path.abspath(os.path.normpath(path))
+
+
 def augment_dll_path(exe_path):
     """On Windows, add the vcpkg runtime dir next to the built binary to PATH.
 
@@ -223,6 +237,10 @@ def main():
         if not os.path.exists(path):
             print("E2E FAILED: binary not found: %s" % path, file=sys.stderr)
             return 1
+    # Normalize before spawning: a relative path with forward slashes is not
+    # resolvable by CreateProcess on Windows (see normalize_binary_path).
+    args.server = normalize_binary_path(args.server)
+    args.client = normalize_binary_path(args.client)
     augment_dll_path(args.server)
     augment_dll_path(args.client)
 

@@ -28,6 +28,7 @@ Electron (`gui/electron`) 是主 GUI，提供跨平台的图形界面。
 | OpenSSL | vcpkg | TLS / AES-128-GCM |
 | Asio | vcpkg | 异步网络库（standalone，无 Boost） |
 | KCP | vcpkg | 可靠 UDP 传输 |
+| fmt | vcpkg | 日志/字符串格式化（{fmt}） |
 
 ### 通用前置条件
 
@@ -135,11 +136,11 @@ cmake --build --preset release --parallel
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载最新的deb包：
 
 ```bash
-# 下载deb包（以v0.0.1为例）
-wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.1/kcp-proxy-server_0.0.1_amd64.deb
+# 下载deb包（以v0.0.5为例）
+wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.5/kcp-proxy-server_0.0.5_amd64.deb
 
 # 安装
-sudo dpkg -i kcp-proxy-server_0.0.1_amd64.deb
+sudo dpkg -i kcp-proxy-server_0.0.5_amd64.deb
 
 # 启动服务
 sudo systemctl start kcp-proxy-server
@@ -184,10 +185,11 @@ sudo systemctl status kcp-proxy-server
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载Windows GUI客户端：
 
 ```
-KCP-Proxy-Client-Windows-v0.0.1.zip (106MB)
+KCP-Proxy-Client-0.0.5-Setup.exe     # NSIS 安装包（推荐）
+KCP-Proxy-Client-0.0.5-Portable.exe  # 免安装单文件版
 ```
 
-解压后运行 `KCP Proxy Client.exe`。
+运行安装包，或直接运行免安装版。
 
 #### GUI使用步骤
 
@@ -197,9 +199,8 @@ KCP-Proxy-Client-Windows-v0.0.1.zip (106MB)
    - 本地SOCKS端口：默认 `1080`
 
 2. **配置密钥**：
-   - 选择"固定密钥"模式
-   - 输入密钥（至少16字符）
-   - 或选择"每日密钥"模式（Beijing Date + suffix）
+   - 填写密钥后缀（8-128 位字母、数字、`.`、`_` 或 `-`）
+   - 完整密钥 = 北京日期 (YYYYMMDD) + 后缀，服务端每天自动轮换
 
 3. **启动代理**：
    - 点击「启动代理」按钮
@@ -218,14 +219,14 @@ KCP-Proxy-Client-Windows-v0.0.1.zip (106MB)
 
 #### 密钥模式说明
 
-**固定密钥**：
-- 手动输入密钥（至少16字符）
-- 例如：`remote_test_key_123456`
-
-**每日密钥**：
+**每日密钥（GUI 与默认部署方式）**：
 - 格式：`YYYYMMDD` + suffix
 - 例如：日期`20260818`，后缀`abc` → 密钥`20260818abc`
-- 服务端每天自动轮换
+- 服务端每天自动轮换；GUI 只使用这种模式
+
+**固定密钥（仅命令行客户端）**：
+- 通过 `-k <密钥>` 手动指定（至少16字符），例如 `remote_test_key_123456`
+- 仅在与 `kcp-proxy-server -k` 搭配、且不依赖每日轮换时使用
 
 ---
 
@@ -401,19 +402,19 @@ kcp-proxy-cpp/
 │   ├── package/           # 打包脚本
 │   │   └── package.py     # 统一打包（Python3.12，纯标准库，跨平台）
 │   ├── runtime/           # 运行时脚本
-│   │   └── common.sh      # 共享配置（suffix、端口等）
+│   │   ├── common.sh      # 共享配置（suffix、端口等）
+│   │   ├── start.sh       # 本地启动服务端/客户端（Linux/macOS）
+│   │   └── start.bat      # 本地启动服务端/客户端（Windows）
 │   └── templates/         # 配置模板
 │       ├── kcp-proxy-server-key-refresh.service # 密钥轮换 service
 │       └── kcp-proxy-server-key-refresh.timer   # 密钥轮换 timer
 │
 ├── gui/                   # GUI客户端
-│   ├── electron/          # Electron GUI（主GUI，推荐）
-│   │   ├── main.js        # 主进程
-│   │   ├── renderer.js    # 渲染进程
-│   │   ├── package.json   # Node.js依赖
-│   │   └── dist/          # 构建产物（.gitignore）
-│   └── windows/           # Windows原生GUI（legacy）
-│       └── KcpProxyGui/   # C# WinForms实现
+│   └── electron/          # Electron GUI（跨平台）
+│       ├── main.js        # 主进程
+│       ├── renderer.js    # 渲染进程
+│       ├── package.json   # Node.js依赖
+│       └── dist/          # 构建产物（.gitignore）
 │
 ├── build/                 # CMake构建目录（.gitignore）
 ├── bin/                   # 编译产物（.gitignore）
@@ -484,6 +485,7 @@ kcp-proxy-cpp/
 | OpenSSL | vcpkg |
 | Asio | vcpkg（standalone，无 Boost） |
 | KCP | vcpkg |
+| fmt | vcpkg |
 
 KCP 基于 UDP 的可靠 ARQ 协议，以极速模式运行：`conv=1`，`mtu=1400`，`nodelay=1`，`interval=10ms`，`fast resend=5`，`nc=1`，发送窗口 `256`，接收窗口 `512`，会话超时 `60s`。
 

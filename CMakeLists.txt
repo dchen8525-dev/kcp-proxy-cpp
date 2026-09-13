@@ -51,6 +51,7 @@ add_library(kcp_proxy_lib STATIC
     ${PROJECT_ROOT}/src/kcp_proxy/logger.cpp
     ${PROJECT_ROOT}/src/kcp_proxy/crypto.cpp
     ${PROJECT_ROOT}/src/kcp_proxy/kcp_wrapper.cpp
+    ${PROJECT_ROOT}/src/kcp_proxy/kcp_tunnel.cpp
     ${PROJECT_ROOT}/src/kcp_proxy/kcp_session.cpp
     ${PROJECT_ROOT}/src/kcp_proxy/kcp_client_session.cpp
     ${PROJECT_ROOT}/src/kcp_proxy/socks5.cpp
@@ -124,6 +125,9 @@ add_test(
         -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
         -P ${PROJECT_ROOT}/tests/run_core_tests.cmake
 )
+# Every other test here has a TIMEOUT; without one a hung unit test blocks the
+# CI job until the runner's own (much longer) limit expires.
+set_tests_properties(kcp_proxy_test PROPERTIES TIMEOUT 300)
 
 # --- End-to-end tunnel test (server <-> client <-> echo, offline) ---
 # Spawns the built binaries plus a local echo target and a minimal SOCKS5
@@ -175,38 +179,9 @@ if(WIN32)
     install(FILES "${PROJECT_ROOT}/scripts/runtime/start.bat" DESTINATION . OPTIONAL)
 endif()
 
-# Generate a small version manifest consumed by packaging and smoke tests.
-set(KCP_PROXY_VERSION_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/generated/version.json")
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(WRITE "${KCP_PROXY_VERSION_MANIFEST}"
-    "{\n"
-    "  \"version\": \"${PROJECT_VERSION}\",\n"
-    "  \"project\": \"kcp-proxy\"\n"
-    "}\n")
-install(FILES "${KCP_PROXY_VERSION_MANIFEST}" DESTINATION share/kcp-proxy)
-
-# Packaging with CPack
-set(CPACK_PACKAGE_NAME "kcp-proxy")
-set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "KCP-based encrypted SOCKS5 proxy")
-set(CPACK_PACKAGE_CONTACT "dchen8525@gmail.com")
-set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/dchen8525-dev/kcp-proxy-cpp")
-# CPack license/readme resources are optional - fall back to CPack defaults
-# when the repo does not ship a LICENSE file.
-if(EXISTS "${PROJECT_ROOT}/LICENSE")
-    set(CPACK_RESOURCE_FILE_LICENSE "${PROJECT_ROOT}/LICENSE")
-endif()
-if(EXISTS "${PROJECT_ROOT}/README.md")
-    set(CPACK_RESOURCE_FILE_README "${PROJECT_ROOT}/README.md")
-endif()
-
-# Platform-specific package settings
-if(WIN32)
-    set(CPACK_GENERATOR "ZIP")
-    set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-windows-x64")
-else()
-    set(CPACK_GENERATOR "TGZ")
-    set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-linux-x64")
-endif()
-
-include(CPack)
+# NOTE: the project deliberately has no CPack configuration and no generated
+# version manifest. Releases are produced by scripts/package/package.py (see
+# .github/workflows/release.yml), which derives the version from CMakeLists.txt
+# itself -- a second, untested packaging path here only drifted: it shipped
+# binaries without the OpenSSL runtime they need, and nothing ever invoked
+# `cpack` or read the version.json it installed to share/kcp-proxy.

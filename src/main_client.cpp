@@ -1,6 +1,7 @@
 #include "kcp_proxy/client.hpp"
 #include "cli_helpers.hpp"
 #include <asio.hpp>
+#include <atomic>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -101,8 +102,23 @@ int main(int argc, char* argv[]) {
 
         cli::setup_signal_handler(io, [client]() { client->stop(); });
 
-        std::thread io_thread([&io]() { io.run(); });
+        std::atomic<bool> io_failed{false};
+        std::thread io_thread([&io, &io_failed]() {
+            // A handler that throws must not escape into std::terminate: this
+            // is a bare worker thread with no handler of its own, unlike the
+            // server's io.run(), which sits inside main()'s try block. Catch,
+            // report, and exit non-zero like any other fatal error.
+            try {
+                io.run();
+            } catch (const std::exception& e) {
+                std::cerr << "Fatal error in I/O thread: " << e.what() << std::endl;
+                io_failed.store(true);
+            }
+        });
         io_thread.join();
+        if (io_failed.load()) {
+            return 1;
+        }
         // If startup failed (e.g. DNS resolve), fail_startup() stopped the io
         // context; exit with a non-zero code instead of silently "succeeding".
         if (!client->startup_ok()) {

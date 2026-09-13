@@ -17,6 +17,34 @@
 
 namespace kcp_proxy {
 
+namespace detail {
+
+// Convert a decimal port, rejecting anything that is not a plain in-range
+// decimal. The length gate is what makes std::stol safe to call: "all digits"
+// does NOT imply "fits in a long", and on Windows (32-bit long) a port like
+// "3000000000" made std::stol throw std::out_of_range. Because --allow-target
+// is parsed in main()'s argv loop -- outside its try block -- that exception
+// escaped as an uncaught exception, so the documented clean rejection
+// ("Error: invalid --allow-target entry ...") never printed: the process just
+// aborted with no diagnostic at all. 5 digits is the widest valid port (65535),
+// so anything longer is out of range by construction and needs no conversion.
+// A zero-padded port longer than 5 digits ("0065535") is consequently rejected
+// as well: deliberate, and consistent with this file's fail-closed contract for
+// an SSRF allowlist. Padding that still fits ("00080") parses normally -- the
+// value is unambiguous.
+inline bool parse_port_digits(const std::string& digits, uint16_t& port) {
+    if (digits.empty() || digits.size() > 5) return false;
+    for (const char c : digits) {
+        if (c < '0' || c > '9') return false;
+    }
+    const long value = std::stol(digits);
+    if (value < 1 || value > 65535) return false;
+    port = static_cast<uint16_t>(value);
+    return true;
+}
+
+} // namespace detail
+
 // Parse one allowlist entry into (host, has_port, port).
 // Accepted forms:
 //   "host"            host-only: matches every port on that host
@@ -44,13 +72,9 @@ inline bool parse_allow_target_entry(const std::string& entry,
         if (close + 1 == entry.size()) return true;           // "[v6]"
         if (entry[close + 1] != ':') return false;            // "[v6]junk"
         const std::string port_part = entry.substr(close + 2);
-        if (port_part.empty()) return false;                  // "[v6]:"
-        for (const char c : port_part) {
-            if (c < '0' || c > '9') return false;
+        if (!detail::parse_port_digits(port_part, port)) {    // "[v6]:" / "[v6]:80x"
+            return false;
         }
-        const long value = std::stol(port_part);
-        if (value < 1 || value > 65535) return false;
-        port = static_cast<uint16_t>(value);
         has_port = true;
         return true;
     }
@@ -63,14 +87,11 @@ inline bool parse_allow_target_entry(const std::string& entry,
     }
     if (colon != std::string::npos) {
         host = entry.substr(0, colon);
+        if (host.empty()) return false;                       // ":80"
         const std::string port_part = entry.substr(colon + 1);
-        if (host.empty() || port_part.empty()) return false;  // ":80" / "host:"
-        for (const char c : port_part) {
-            if (c < '0' || c > '9') return false;             // "-1" / "80x"
+        if (!detail::parse_port_digits(port_part, port)) {    // "host:" / "-1" / "80x" / "99999"
+            return false;
         }
-        const long value = std::stol(port_part);
-        if (value < 1 || value > 65535) return false;         // "99999"
-        port = static_cast<uint16_t>(value);
         has_port = true;
         return true;
     }

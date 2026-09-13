@@ -81,6 +81,13 @@ private:
     // Live SOCKS5 connections, enforced against MAX_CLIENT_SESSIONS.
     std::atomic<size_t> active_sessions_{0};
 
+    // Last (tx,rx) pair handed to the GUI. The 2s traffic heartbeat only emits
+    // an INFO line when these change; an idle tunnel drops to DEBUG instead of
+    // repeating the same cumulative numbers forever. The GUI keeps its last
+    // values, so the display is unaffected. Only touched from the io thread.
+    uint64_t last_reported_tx_ = 0;
+    uint64_t last_reported_rx_ = 0;
+
     // Shared KCP update tick: one 10ms timer for ALL client sessions (same
     // design as KCPServer::do_update_tick). The registry stores weak refs
     // keyed by raw pointer; expired entries are pruned during the tick, so

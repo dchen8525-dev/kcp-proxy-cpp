@@ -58,6 +58,30 @@ jobs:
     - name: Packaging / deployment smoke tests
       run: python3 tests/smoke/smoke_test.py
 
+  # The GUI had tests (`npm test`) and a syntax/JSON check (`npm run check`)
+  # that CI never ran, so a broken main.js or a malformed electron-builder
+  # config failed only at release time. Both are stdlib Node -- no npm install
+  # needed -- and the runtime tests skip themselves when no client binary was
+  # built (see gui/electron/test/launch-contract.test.js).
+  gui-checks:
+    name: Electron GUI checks
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: '20'
+
+    - name: Syntax + builder-config check
+      working-directory: gui/electron
+      run: npm run check
+
+    - name: Unit tests
+      working-directory: gui/electron
+      run: node --test
+
   build-linux:
     runs-on: ubuntu-22.04
     steps:
@@ -84,7 +108,6 @@ jobs:
       run: |
         cd build
         ctest --output-on-failure
-        ./kcp_proxy_test
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v7
@@ -115,7 +138,6 @@ jobs:
       run: |
         cd build
         ctest -C Release --output-on-failure
-        .\Release\kcp_proxy_test.exe
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v7
@@ -151,7 +173,6 @@ jobs:
       run: |
         cd build
         ctest --output-on-failure
-        ./kcp_proxy_test
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v7

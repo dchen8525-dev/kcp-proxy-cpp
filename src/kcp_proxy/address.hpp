@@ -13,7 +13,6 @@ struct byte_view;
 struct ParsedAddress {
     std::string host;
     uint16_t port = 0;
-    size_t bytes_consumed = 0;
 };
 
 ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset = 0);

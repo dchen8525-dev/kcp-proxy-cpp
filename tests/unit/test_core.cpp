@@ -5,6 +5,8 @@
 #include "kcp_proxy/kcp_client_session.hpp"
 #include "kcp_proxy/kcp_session.hpp"
 #include "kcp_proxy/kcp_wrapper.hpp"
+#include "kcp_proxy/logger.hpp"
+#include "kcp_proxy/server.hpp"
 #include "kcp_proxy/socks5.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
 #include <asio.hpp>
@@ -246,6 +248,15 @@ void test_socks5_parser() {
     parsed = parse_socks5_request(bad_version);
     expect_true(parsed.status == SOCKS5ParseStatus::Invalid, "bad version should be invalid");
 
+    // RFC 1928 reserves the third byte and requires it to be 0x00. It used to be
+    // read by nothing at all, so a request that set it was silently accepted.
+    expect_true(ipv4[2] == 0x00, "the request builder must emit RSV=0");
+    std::vector<uint8_t> bad_rsv = ipv4;
+    bad_rsv[2] = 0x01;
+    parsed = parse_socks5_request(bad_rsv);
+    expect_true(parsed.status == SOCKS5ParseStatus::Invalid,
+                "a non-zero SOCKS5 reserved byte should be invalid");
+
     std::vector<uint8_t> bad_atyp{SOCKS5_VERSION, SOCKS5_CMD_CONNECT, 0x00, 0x09, 0x00, 0x50};
     parsed = parse_socks5_request(bad_atyp);
     expect_true(parsed.status == SOCKS5ParseStatus::Invalid, "unsupported ATYP should be invalid");
@@ -275,6 +286,18 @@ void test_restricted_targets() {
     // IPv4-mapped ::ffff:a.b.c.d inherits the IPv4 classification.
     expect_true(is_restricted_target(asio::ip::make_address("::ffff:127.0.0.1")), "v4-mapped loopback");
     expect_true(!is_restricted_target(asio::ip::make_address("::ffff:1.1.1.1")), "v4-mapped public allowed");
+
+    // Private/non-routable IPv6 ranges. fec0::/10 (site-local) is neither
+    // fe80::/10 (link-local) nor fc00::/7 (unique-local), so it used to be the
+    // one private IPv6 range the SSRF guard let through.
+    expect_true(is_restricted_target(asio::ip::make_address("fec0::1")),
+                "v6 site-local fec0::/10");
+    expect_true(is_restricted_target(asio::ip::make_address("feff::1")),
+                "v6 site-local upper bound feff::");
+    expect_true(is_restricted_target(asio::ip::make_address("fc00::1")), "v6 unique-local");
+    expect_true(is_restricted_target(asio::ip::make_address("fe80::1")), "v6 link-local");
+    expect_true(!is_restricted_target(asio::ip::make_address("2001:4860:4860::8888")),
+                "v6 public allowed");
 
     // 6to4 (2002::/16) embeds the IPv4 address in bytes 2-5: it must not be
     // usable to tunnel into the blocked IPv4 ranges.
@@ -434,6 +457,222 @@ void test_kcp_wrapper_applies_constants() {
     // ikcp_nodelay() maps the resend argument to fastresend and nc to nocwnd.
     expect_true(k->fastresend == KCP_RESEND, "ikcp fastresend (resend) mismatch");
     expect_true(k->nocwnd == KCP_NC, "ikcp nocwnd (nc) mismatch");
+}
+
+void test_kcp_wrapper_oversized_message_is_not_truncated() {
+    // FWD_BUF_SIZE is the per-message cap every forwarding loop relies on. A
+    // sender that exceeds it is a protocol violation, and the fixed-buffer
+    // recv() must report KCP_RECV_MSG_TOO_BIG *without consuming* the message:
+    // silently truncating would corrupt the byte stream this proxy exists to
+    // preserve, and the caller's recovery (peek + vector overload) depends on
+    // the message still being queued.
+    KcpWrapper sender(KCP_CONV);
+    KcpWrapper receiver(KCP_CONV);
+    // Wire both directions so KCP can carry the ACKs the sender needs.
+    sender.set_output_callback([&receiver](byte_view d) { (void)receiver.input(d); });
+    receiver.set_output_callback([&sender](byte_view d) { (void)sender.input(d); });
+
+    // Bigger than the caller's buffer, so the receiver's own cap is what
+    // rejects it -- not a malformed segment.
+    const size_t payload_size = FWD_BUF_SIZE + 512;
+    std::vector<uint8_t> payload(payload_size);
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
+    }
+    expect_true(sender.send(byte_view(payload.data(), payload.size())) >= 0,
+                "sender.send must accept the oversized payload");
+
+    // Drive both sides until the message is fully reassembled.
+    uint32_t now = 0;
+    for (int i = 0; i < 200 && receiver.peek_size() != static_cast<int>(payload_size); ++i) {
+        now += KCP_INTERVAL_MS;
+        sender.update(now);
+        sender.flush();
+        receiver.update(now);
+        receiver.flush();
+    }
+    expect_true(receiver.peek_size() == static_cast<int>(payload_size),
+                "receiver must reassemble the whole message");
+
+    // A buffer that cannot hold it is rejected instead of truncated...
+    std::vector<uint8_t> too_small(FWD_BUF_SIZE);
+    expect_true(receiver.recv(too_small.data(), too_small.size()) ==
+                    KcpWrapper::KCP_RECV_MSG_TOO_BIG,
+                "oversized message must be reported, never truncated");
+    // ...and it stays queued, which is what makes recovery possible.
+    expect_true(receiver.peek_size() == static_cast<int>(payload_size),
+                "the rejected message must still be queued");
+
+    // The vector overload is the documented recovery path: it must hand back
+    // the full message, byte-exact.
+    std::vector<uint8_t> recovered;
+    expect_true(receiver.recv(recovered) == static_cast<int>(payload_size),
+                "vector recv must return the whole message");
+    expect_true(recovered == payload, "the recovered payload must be byte-exact");
+    // ikcp_peeksize() reports -1 (not 0) once nothing is queued.
+    expect_true(receiver.peek_size() <= 0, "the queue must be drained after recovery");
+}
+
+void test_server_session_routing_and_auth() {
+    // get_or_create_session holds the server's only real branching logic (auth,
+    // auth rate limit, duplicate-salt rejection, session cap) and the E2E
+    // suites only reach it incidentally. route_datagram drives it directly --
+    // no bound socket and no KCP timing -- so every reject path is assertable.
+    asio::io_context io;
+    const std::string key = "remote_test_key_123456";
+    auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+
+    const auto ep_a = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40001);
+    const auto ep_b = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40002);
+    const auto ep_c = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40003);
+    const auto ep_d = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40004);
+
+    // A bare SOCKS5 CONNECT is the documented compatibility path: the first
+    // valid encrypted packet does not have to be a HELLO.
+    const std::vector<uint8_t> connect_req = {0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80};
+    const byte_view req_view(connect_req.data(), connect_req.size());
+
+    const auto salt_a = Crypto::generate_session_salt();
+    Crypto client_a(key, NONCE_DIR_CLIENT, salt_a, false);
+    auto first = client_a.encrypt(req_view);
+    auto session_a = server->route_datagram(ep_a, byte_view(first.data(), first.size()));
+    expect_true(session_a != nullptr, "a valid first packet must create a session");
+
+    // A second packet from the same endpoint reuses that session instead of
+    // creating a new one.
+    auto second = client_a.encrypt(req_view);
+    expect_true(server->route_datagram(ep_a, byte_view(second.data(), second.size())) == session_a,
+                "a repeat packet must reuse the endpoint's session");
+
+    // Wrong key: the AEAD tag cannot verify, so no session may be created.
+    Crypto wrong_key("wrong_key_0000000000", NONCE_DIR_CLIENT,
+                     Crypto::generate_session_salt(), false);
+    auto bad = wrong_key.encrypt(req_view);
+    expect_true(server->route_datagram(ep_b, byte_view(bad.data(), bad.size())) == nullptr,
+                "a wrong-key packet must be rejected");
+
+    // Duplicate salt: another endpoint must not be able to force a session that
+    // shares a live session's salt -- that would reuse the same AES-GCM key and
+    // nonce base across two sessions, which is catastrophic for GCM.
+    Crypto replayed_salt(key, NONCE_DIR_CLIENT, salt_a, false);
+    auto dup = replayed_salt.encrypt(req_view);
+    expect_true(server->route_datagram(ep_b, byte_view(dup.data(), dup.size())) == nullptr,
+                "a duplicate session salt must be rejected");
+
+    // Rate limit. First prove the very packet we will expect to be dropped IS
+    // accepted while the budget has room, so the assertion below cannot pass for
+    // some unrelated reason.
+    Crypto client_d(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto valid_d = client_d.encrypt(req_view);
+    expect_true(server->route_datagram(ep_d, byte_view(valid_d.data(), valid_d.size())) != nullptr,
+                "a valid packet must be accepted while the auth budget has room");
+
+    Crypto client_c(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto valid_c = client_c.encrypt(req_view);
+    const std::vector<uint8_t> garbage(64, 0xAB);
+
+    // The per-datagram WARNINGs this flood triggers would drown the test report;
+    // raise the level only for the loop and restore it afterwards.
+    const auto prev_level = current_log_level();
+    set_log_level(LogLevel::Error);
+    for (uint32_t i = 0; i < MAX_AUTH_ATTEMPTS_PER_SEC + 1; ++i) {
+        (void)server->route_datagram(ep_c, byte_view(garbage.data(), garbage.size()));
+    }
+    const bool rejected = server->route_datagram(ep_c, byte_view(valid_c.data(), valid_c.size())) == nullptr;
+    set_log_level(prev_level);
+    expect_true(rejected,
+                "a valid packet must be dropped once the per-second auth budget is spent");
+}
+
+void test_session_oversized_kcp_message_fails_read() {
+    // try_fulfill_read() has two distinct reject paths, neither of which was
+    // covered: a KCP message larger than FWD_BUF_SIZE (a protocol violation --
+    // consumed so KCP stays consistent, then the read is failed) and a message
+    // that fits FWD_BUF_SIZE but not the caller's buffer. Both must fail the
+    // read rather than hand back a truncated stream, which would corrupt the
+    // tunnel the proxy exists to preserve.
+    asio::io_context io;
+    const std::string key = "remote_test_key_123456";
+    const auto salt = Crypto::generate_session_salt();
+
+    // The session decrypts as the server (it learns the salt from the first
+    // datagram); the peer encrypts as the client with the same salt, so both
+    // derive matching per-direction keys.
+    auto server_crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, byte_view{}, true);
+    Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
+
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+    auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto,
+                                                "oversized-session");
+
+    // Peer KCP output -> encrypt -> session.receive_data (decrypt -> ikcp_input).
+    KcpWrapper peer(KCP_CONV);
+    peer.set_output_callback([&](byte_view plain) {
+        auto wire = peer_crypto.encrypt(plain);
+        session->receive_data(byte_view(wire.data(), wire.size()));
+    });
+    // Session output -> decrypt -> peer ikcp_input, so ACKs can flow back.
+    session->set_send_callback([&](std::vector<uint8_t> wire) {
+        try {
+            auto plain = peer_crypto.decrypt(byte_view(wire.data(), wire.size()));
+            (void)peer.input(byte_view(plain.data(), plain.size()));
+        } catch (const std::exception&) {
+            // Best effort; a datagram the peer cannot decrypt is not the point.
+        }
+    });
+
+    session->start();
+    io.restart();
+    io.poll();
+
+    uint32_t now = 0;
+    const auto pump_until = [&](const bool& done, int iterations) {
+        for (int i = 0; i < iterations && !done; ++i) {
+            now += KCP_INTERVAL_MS;
+            peer.update(now);
+            peer.flush();
+            io.restart();
+            io.poll();
+        }
+    };
+
+    // --- path 1: message fits FWD_BUF_SIZE, but not the caller's buffer ------
+    std::array<uint8_t, 16> small_buf{};
+    bool small_failed = false;
+    std::error_code small_ec;
+    session->async_read_some(asio::buffer(small_buf), [&](std::error_code ec, size_t) {
+        small_failed = true;
+        small_ec = ec;
+    });
+    io.restart();
+    io.poll();  // let the read registration reach the strand
+
+    std::vector<uint8_t> payload1(200, 0x11);
+    expect_true(peer.send(byte_view(payload1.data(), payload1.size())) >= 0,
+                "peer.send must accept the path-1 payload");
+    pump_until(small_failed, 60);
+    expect_true(small_failed, "a message larger than the caller's buffer must fail the read");
+    expect_true(small_ec == asio::error::message_size,
+                "path 1 must report message_size, not a truncated success");
+
+    // --- path 2: message larger than FWD_BUF_SIZE (protocol violation) -------
+    std::vector<uint8_t> full_buf(FWD_BUF_SIZE);
+    bool big_failed = false;
+    std::error_code big_ec;
+    session->async_read_some(asio::buffer(full_buf), [&](std::error_code ec, size_t) {
+        big_failed = true;
+        big_ec = ec;
+    });
+    io.restart();
+    io.poll();
+
+    std::vector<uint8_t> payload2(FWD_BUF_SIZE + 256, 0x22);
+    expect_true(peer.send(byte_view(payload2.data(), payload2.size())) >= 0,
+                "peer.send must accept the path-2 payload");
+    pump_until(big_failed, 120);
+    expect_true(big_failed, "a message larger than FWD_BUF_SIZE must fail the read");
+    expect_true(big_ec == asio::error::message_size,
+                "path 2 must report message_size, not a truncated success");
 }
 
 void test_session_stop_makes_inert() {
@@ -816,6 +1055,41 @@ void test_client_abort_handshake_closes_local_socket() {
 // "must NOT match" cases: loose std::stoi parsing used to turn "host:99999"
 // into port 34463 and "host:-1" into 65535, silently allowlisting the wrong
 // port. Malformed entries must match nothing, never crash, never widen.
+// The server's packet-rejection diagnostics must collapse into at most one line
+// per interval, because they otherwise fire once per hostile datagram (see
+// LogThrottle). What must NOT change is the first line of a burst: the
+// robustness suite greps the flood log for exactly those messages, so a
+// throttle that swallowed the first occurrence would turn a flood into a
+// silent one -- and silently losing the diagnostic is worse than the spam.
+void test_log_throttle() {
+    LogThrottle throttle(std::chrono::milliseconds(40));
+    uint32_t suppressed = 0;
+
+    // The first call always emits, reporting nothing suppressed.
+    suppressed = 12345;  // must be overwritten on the emitting path
+    expect_true(throttle.should_log(suppressed), "first call must emit");
+    expect_true(suppressed == 0, "first emission reports nothing suppressed");
+
+    // Everything inside the window is folded in instead of logged.
+    for (uint32_t i = 0; i < 3; ++i) {
+        suppressed = 12345;
+        expect_true(!throttle.should_log(suppressed),
+                    "a call inside the window must be suppressed");
+        expect_true(suppressed == 12345,
+                    "a suppressed call must not touch the out-param");
+        expect_true(throttle.pending() == i + 1,
+                    "pending() tracks the suppressed occurrences");
+    }
+
+    // After the window elapses the next call emits and reports the tally, which
+    // then resets -- so a flood yields one line per interval carrying the count.
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    suppressed = 0;
+    expect_true(throttle.should_log(suppressed), "post-window call must emit");
+    expect_true(suppressed == 3, "emission must report the suppressed count");
+    expect_true(throttle.pending() == 0, "the tally resets after an emission");
+}
+
 void test_allowlist_matching() {
     using kcp_proxy::parse_allow_target_entry;
     using kcp_proxy::target_matches_allowlist;
@@ -865,10 +1139,20 @@ void test_allowlist_matching() {
                 "bracketed entry must not match another port");
 
     // Malformed entries are rejected by the parser and match nothing.
+    //
+    // The over-long ports matter beyond mere strictness: the parser used to
+    // check "all digits" and then call std::stol, but digits do not imply the
+    // value fits in a long. On Windows (32-bit long) "host:3000000000" made
+    // std::stol throw std::out_of_range, and --allow-target is parsed in
+    // main()'s argv loop -- OUTSIDE its try block -- so the exception escaped
+    // as an uncaught exception and the process aborted with no diagnostic at
+    // all, instead of the documented "Error: invalid --allow-target entry".
+    // These cases must return false, never throw.
     const char* malformed[] = {
         "", ":80", "host:", "host:-1", "host:99999", "host:80x",
         "host:0", "[::1", "[::1]x", "[::1]:", "[]:80", "[::1]:99999",
-        "host:65536"
+        "host:65536",
+        "host:3000000000", "[::1]:3000000000", "host:99999999999999999999999"
     };
     for (const char* entry : malformed) {
         expect_true(!parse_allow_target_entry(entry, host, has_port, port),
@@ -907,10 +1191,14 @@ int main() {
         test_socks5_parser();
         test_socks5_reply_bind_address();
         test_restricted_targets();
+        test_log_throttle();
         test_allowlist_matching();
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
         test_kcp_wrapper_applies_constants();
+        test_kcp_wrapper_oversized_message_is_not_truncated();
+        test_server_session_routing_and_auth();
+        test_session_oversized_kcp_message_fails_read();
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();
         test_session_drained_deferred_while_send_buffer_nonempty();

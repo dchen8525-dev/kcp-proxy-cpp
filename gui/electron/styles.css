@@ -338,6 +338,12 @@ input[type="password"]:disabled {
   font-family: 'Consolas', 'Monaco', monospace;
 }
 
+/* The `hidden` attribute must beat display:flex above. Without this the counter
+   stayed visible (showing stale zeros) the whole time the proxy was stopped. */
+.traffic-indicator[hidden] {
+  display: none;
+}
+
 .traffic-up {
   color: #107c10;
 }

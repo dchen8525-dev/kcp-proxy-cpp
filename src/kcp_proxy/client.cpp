@@ -45,11 +45,40 @@ void KCPProxyClient::start() {
 }
 
 void KCPProxyClient::stop() {
-    if (!running_) return;
+    // No early return on !running_: stop() is the signal handler's only cleanup
+    // path and can run while the resolver is still in flight, before running_
+    // is ever set. Returning early there abandoned the resolver and any
+    // half-open acceptor.
     running_ = false;
+
     std::error_code ec;
+    // basic_resolver::cancel() has no error_code overload (unlike close() on
+    // the acceptor / cancel() on the timers) -- it is noexcept in practice.
+    udp_resolver_.cancel();
     tcp_acceptor_.close(ec);
+    traffic_timer_.cancel(ec);
     update_tick_timer_.cancel(ec);
+
+    // Close every live session. Each one owns a UDP socket and KCP state; with
+    // nothing here they only went away when the process did, so a graceful
+    // shutdown (SIGINT / destructor) leaked one socket per open tunnel.
+    // Snapshot under the lock, close outside it -- close() dispatches onto the
+    // session strand and must not run while we hold tick_sessions_mutex_.
+    std::vector<std::shared_ptr<KCPClientSession>> sessions;
+    {
+        std::unique_lock<std::shared_mutex> lock(tick_sessions_mutex_);
+        sessions.reserve(tick_sessions_.size());
+        for (auto& entry : tick_sessions_) {
+            if (auto session = entry.second.lock()) {
+                sessions.push_back(std::move(session));
+            }
+        }
+        tick_sessions_.clear();
+    }
+    for (auto& session : sessions) {
+        session->close();
+    }
+
     LOG_INFO("client", "stopped");
     wipe_key();
 }
@@ -578,8 +607,22 @@ void KCPProxyClient::start_traffic_reporter() {
 void KCPProxyClient::report_traffic() {
     const auto tx = tx_bytes_.load();
     const auto rx = rx_bytes_.load();
-    LOG_INFO("traffic", "TRAFFIC tx=" + std::to_string(tx) +
-             " rx=" + std::to_string(rx));
+    // The GUI parses this exact line for its counters, so it stays machine
+    // readable and fires every 2s either way. But the counters are cumulative,
+    // so an idle tunnel was repeating identical INFO lines forever (pure log
+    // spam for CLI users): report at INFO only when the numbers actually moved,
+    // and at DEBUG otherwise. The GUI's display keeps its last values, so it
+    // does not need the unchanged repeats.
+    const bool changed = (tx != last_reported_tx_) || (rx != last_reported_rx_);
+    last_reported_tx_ = tx;
+    last_reported_rx_ = rx;
+    const std::string line = "TRAFFIC tx=" + std::to_string(tx) +
+                             " rx=" + std::to_string(rx);
+    if (changed) {
+        LOG_INFO("traffic", line);
+    } else {
+        LOG_DEBUG("traffic", line);
+    }
 }
 
 void KCPProxyClient::forward_client_to_kcp(
@@ -618,9 +661,16 @@ void KCPProxyClient::forward_client_to_kcp(
         auto self = shared_from_this();
         retry->async_wait([self, client_socket, session, buf, guard, retry](const std::error_code& ec) mutable {
             if (ec) return;
-            if (session->is_connected()) {
-                self->forward_client_to_kcp(client_socket, session, buf, guard);
+            if (!session->is_connected()) {
+                // The session died while we were backing off. Returning silently
+                // left the local TCP socket open (the app only notices on its
+                // next write) and the tunnel stalled until the app closed it.
+                // Shut the local side down explicitly, like every other teardown.
+                std::error_code ignored;
+                client_socket->close(ignored);
+                return;
             }
+            self->forward_client_to_kcp(client_socket, session, buf, guard);
         });
         return;
     }

@@ -71,6 +71,7 @@ from tunnel_e2e import (  # noqa: E402  (path tweak must precede the import)
     EchoServer,
     augment_dll_path,
     free_port,
+    normalize_binary_path,
     recv_exact,
     run_case,
     socks5_connect,
@@ -1080,6 +1081,10 @@ def main():
         if not os.path.exists(path):
             print("E2E ROBUSTNESS FAILED: binary not found: %s" % path, file=sys.stderr)
             return 1
+    # Normalize before spawning: a relative path with forward slashes is not
+    # resolvable by CreateProcess on Windows (see normalize_binary_path).
+    args.server = normalize_binary_path(args.server)
+    args.client = normalize_binary_path(args.client)
     augment_dll_path(args.server)
     augment_dll_path(args.client)
 

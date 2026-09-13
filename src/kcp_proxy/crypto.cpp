@@ -321,7 +321,7 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
             return std::make_error_code(std::errc::io_error);
         }
 
-        // Wire: [session_salt(8)] + [nonce(12)] + [ciphertext + tag(16)]
+        // Wire: [session_salt(SESSION_SALT_SIZE)] + [nonce(12)] + [ciphertext + tag(16)]
         out.resize(SESSION_SALT_SIZE + NONCE_SIZE + plaintext.size() + TAG_SIZE);
         std::memcpy(out.data(), session_salt_.data(), SESSION_SALT_SIZE);
         std::memcpy(out.data() + SESSION_SALT_SIZE, nonce.data(), NONCE_SIZE);

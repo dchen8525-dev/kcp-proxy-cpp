@@ -105,7 +105,6 @@ constexpr size_t TAG_SIZE = 16;
 // guessing. The server additionally rejects any session whose salt is already
 // claimed by a live session (see KCPServer::get_or_create_session).
 constexpr size_t SESSION_SALT_SIZE = 16;
-constexpr size_t COUNTER_SIZE = 8;
 constexpr size_t AES_KEY_SIZE = 16;
 // Hard ceiling: refuse to encrypt past this counter so the session must rekey.
 // AES-GCM IND-CPA security degrades well before 2^64; pick 2^48 as a safe wall.

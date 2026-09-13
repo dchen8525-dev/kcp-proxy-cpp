@@ -4,10 +4,12 @@
 # Usage:
 #   sudo ./install-service.sh [suffix]
 #
-# Layout: this script expects kcp-proxy-server / kcp-proxy-client binaries
-# next to itself (deploy package), or in ../bin/linux (repo checkout).
-# common.sh next to this script (or in ../scripts) provides defaults;
-# built-in defaults are used as fallback.
+# Layout: this script expects the kcp-proxy-server binary next to itself
+# (deploy package), or in ../bin/linux (repo checkout). kcp-proxy-client is
+# installed too when present, but is never required: the deploy package ships
+# only the server.
+# common.sh next to this script (deploy package) or in ../runtime (repo
+# checkout) provides defaults; built-in defaults are used as fallback.
 #
 # The suffix is stored in /etc/kcp-proxy/server.env (not on the command
 # line, not in the unit name). The service wrapper derives the daily key
@@ -19,10 +21,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # ---------- config: common.sh if available, else built-in defaults ----------
-if [ -f "$SCRIPT_DIR/../runtime/common.sh" ]; then
+# Deploy package: common.sh is shipped next to this script. Repo checkout: it
+# lives in ../runtime/. The old ../../scripts/common.sh fallback never existed,
+# so the deploy package silently ignored the common.sh it had just shipped and
+# used the built-in defaults instead.
+if [ -f "$SCRIPT_DIR/common.sh" ]; then
+    source "$SCRIPT_DIR/common.sh"
+elif [ -f "$SCRIPT_DIR/../runtime/common.sh" ]; then
     source "$SCRIPT_DIR/../runtime/common.sh"
-elif [ -f "$SCRIPT_DIR/../../scripts/common.sh" ]; then
-    source "$SCRIPT_DIR/../../scripts/common.sh"
 else
     DEFAULT_SUFFIX=""
     SERVER_PORT=8388
@@ -112,8 +118,14 @@ fi
 echo "Installing binaries to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 cp -f "$SRC_BIN_DIR/kcp-proxy-server" "$INSTALL_DIR/"
-cp -f "$SRC_BIN_DIR/kcp-proxy-client" "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/kcp-proxy-server" "$INSTALL_DIR/kcp-proxy-client"
+chmod 755 "$INSTALL_DIR/kcp-proxy-server"
+# The client is optional. A server-only deploy package ships just the server,
+# and an unconditional `cp` here aborted the entire install under `set -e`
+# before the service was ever created. Install it only when it is present.
+if [ -f "$SRC_BIN_DIR/kcp-proxy-client" ]; then
+    cp -f "$SRC_BIN_DIR/kcp-proxy-client" "$INSTALL_DIR/"
+    chmod 755 "$INSTALL_DIR/kcp-proxy-client"
+fi
 
 # ---------- env file (suffix lives here, mode 600) ----------
 echo "Writing $ENV_FILE ..."

@@ -22,10 +22,13 @@ jobs:
       - name: Cache vcpkg
         uses: actions/cache@v6
         with:
+          # Only vcpkg.json exists in this repo; the old key also hashed a
+          # vcpkg-configuration.json that is not there, which just added an
+          # always-empty component to the key.
           path: |
             ~/.cache/vcpkg
             ${{ github.workspace }}/vcpkg
-          key: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-
 
       - name: Build core
@@ -91,10 +94,9 @@ jobs:
       - name: Cache vcpkg
         uses: actions/cache@v6
         with:
-          path: |
-            ${{ env.LOCALAPPDATA }}\vcpkg
-            ${{ github.workspace }}\vcpkg
-          key: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          # build_vs.bat bootstraps vcpkg into <repo>\vcpkg, not %LOCALAPPDATA%.
+          path: ${{ github.workspace }}\vcpkg
+          key: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: ${{ runner.os }}-vcpkg-c5a15727-${{ runner.arch }}-
 
       - name: Build core

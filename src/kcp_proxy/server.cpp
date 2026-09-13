@@ -39,7 +39,12 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
                      std::string host)
     : io_(io), port_(port), host_(std::move(host)),
       key_(key),
-      udp_socket_(io_),
+      // The UDP socket owns its own strand: it is a single shared object, and
+      // with -T > 1 both ends touch it from different threads (receives re-arm
+      // on the io_context, sends are called from per-session strands). Binding
+      // the socket's executor to a strand serializes every initiation and every
+      // completion on it -- see send_to_client() and do_receive().
+      udp_socket_(asio::make_strand(io_.get_executor())),
       cleanup_timer_(io_),
       receive_backoff_timer_(io_),
       update_tick_timer_(io_) {}
@@ -188,14 +193,19 @@ void KCPServer::stop() {
 void KCPServer::do_receive() {
     if (!running_) return;
 
-    recv_endpoint_ = asio::ip::udp::endpoint();
+    // Initiate through the socket's strand so a re-arm from the receive-error
+    // backoff timer (which runs on the io_context, not the strand) can never
+    // overlap a send that is being initiated from a session strand.
     auto self = shared_from_this();
-
-    udp_socket_.async_receive_from(
-        asio::buffer(udp_recv_buf_), recv_endpoint_,
-        [this, self](const std::error_code& ec, size_t bytes) {
-            handle_receive(ec, bytes);
-        });
+    asio::dispatch(udp_socket_.get_executor(), [this, self]() {
+        if (!running_) return;
+        recv_endpoint_ = asio::ip::udp::endpoint();
+        udp_socket_.async_receive_from(
+            asio::buffer(udp_recv_buf_), recv_endpoint_,
+            [this, self](const std::error_code& ec, size_t bytes) {
+                handle_receive(ec, bytes);
+            });
+    });
 }
 
 void KCPServer::handle_receive(const std::error_code& ec, size_t bytes_transferred) {
@@ -243,32 +253,43 @@ void KCPServer::handle_receive(const std::error_code& ec, size_t bytes_transferr
               " bytes from " + endpoint.address().to_string() + ":" +
               std::to_string(endpoint.port()));
 
+    route_datagram(endpoint, data);
+    do_receive();
+}
+
+std::shared_ptr<KCPSession> KCPServer::route_datagram(
+    const asio::ip::udp::endpoint& endpoint, byte_view data) {
     bool already_consumed = false;
     auto session = get_or_create_session(endpoint, data, already_consumed);
-    if (session) {
-        if (!already_consumed) {
-            LOG_DEBUG("server", session->session_id() + ": dispatching encrypted packet to session");
-            // One strand dispatch: decrypt -> ikcp_input -> try_fulfill_read, then
-            // run the session-driven logic (handle_kcp_data) in the SAME dispatch
-            // so its KCP-state reads (peek_size/wait_send) are serialized with
-            // the strand handlers that mutate KCP.
-            session->receive_data(data, [this, session, endpoint]() {
-                handle_kcp_data(session, endpoint);
-            });
-        } else {
-            LOG_DEBUG("server", session->session_id() + ": first packet already consumed (injected)");
-            asio::dispatch(session->strand(), [this, session, endpoint]() {
-                handle_kcp_data(session, endpoint);
-            });
+    if (!session) {
+        // Throttled for the same reason as the rate-limit line in
+        // get_or_create_session: one hostile datagram, one line, no upper bound.
+        uint32_t suppressed = 0;
+        if (drop_log_.should_log(suppressed)) {
+            LOG_WARNING("server", "packet dropped from " +
+                        endpoint.address().to_string() + ":" +
+                        std::to_string(endpoint.port()) + " (no session created)" +
+                        (suppressed ? " (" + std::to_string(suppressed) +
+                                      " more suppressed this interval)" : ""));
         }
-    } else {
-        LOG_WARNING("server", "packet dropped from " +
-                    endpoint.address().to_string() + ":" +
-                    std::to_string(endpoint.port()) + " (no session created)");
+        return nullptr;
     }
-    // If session is null, we silently drop -- auth failed or session cap reached.
-
-    do_receive();
+    if (!already_consumed) {
+        LOG_DEBUG("server", session->session_id() + ": dispatching encrypted packet to session");
+        // One strand dispatch: decrypt -> ikcp_input -> try_fulfill_read, then
+        // run the session-driven logic (handle_kcp_data) in the SAME dispatch
+        // so its KCP-state reads (peek_size/wait_send) are serialized with
+        // the strand handlers that mutate KCP.
+        session->receive_data(data, [this, session, endpoint]() {
+            handle_kcp_data(session, endpoint);
+        });
+    } else {
+        LOG_DEBUG("server", session->session_id() + ": first packet already consumed (injected)");
+        asio::dispatch(session->strand(), [this, session, endpoint]() {
+            handle_kcp_data(session, endpoint);
+        });
+    }
+    return session;
 }
 
 std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
@@ -353,7 +374,15 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             auth_window_start_ = now;
         }
         if (auth_attempts_window_ >= MAX_AUTH_ATTEMPTS_PER_SEC) {
-            LOG_WARNING("server", "auth attempt rate limit reached, dropping packet from " + sid);
+            // Throttled: this fires once per hostile datagram, so without the
+            // throttle a flood turns the limiter's own diagnostic into the
+            // cheapest way to burn the server's CPU and fill its log.
+            uint32_t suppressed = 0;
+            if (auth_ratelimit_log_.should_log(suppressed)) {
+                LOG_WARNING("server", "auth attempt rate limit reached, dropping packet from " + sid +
+                            (suppressed ? " (" + std::to_string(suppressed) +
+                                          " more suppressed this interval)" : ""));
+            }
             return nullptr;
         }
         ++auth_attempts_window_;
@@ -370,8 +399,18 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         decrypted = session_crypto->decrypt(encrypted_packet);
         LOG_DEBUG("server", sid + ": auth OK, decrypted " + std::to_string(decrypted.size()) + " bytes");
     } catch (const std::exception& e) {
-        LOG_WARNING("server", "FAIL_STAGE=DECRYPT_FAILED ERROR=" + std::string(e.what()) +
-                    " CLIENT_ENDPOINT=" + sid + " TARGET=-");
+        // Throttled like the other per-datagram rejection diagnostics. The auth
+        // limiter already bounds this to MAX_AUTH_ATTEMPTS_PER_SEC/s, but that is
+        // still up to 500 formatted WARNING lines per second handed to an
+        // attacker for free. The first occurrence always prints, so the
+        // robustness suite still finds FAIL_STAGE=DECRYPT_FAILED in the log.
+        uint32_t suppressed = 0;
+        if (decrypt_fail_log_.should_log(suppressed)) {
+            LOG_WARNING("server", "FAIL_STAGE=DECRYPT_FAILED ERROR=" + std::string(e.what()) +
+                        " CLIENT_ENDPOINT=" + sid + " TARGET=-" +
+                        (suppressed ? " (" + std::to_string(suppressed) +
+                                      " more suppressed this interval)" : ""));
+        }
         return nullptr;
     }
 
@@ -806,11 +845,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                 LOG_DEBUG("server", sid + ": connect completed for a replaced session, discarding");
                                 return;
                             }
-                            connections_[sid] = ClientConnection{
-                                sid,
-                                tcp_socket,
-                                std::chrono::steady_clock::now()
-                            };
+                            connections_[sid] = ClientConnection{tcp_socket};
                         }
                         // When the upstream target closes, keep the session alive
                         // until the target data already queued in KCP's send
@@ -1283,17 +1318,29 @@ void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr,
              " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));
 
     auto buf = std::make_shared<std::vector<uint8_t>>(std::move(data));
-    udp_socket_.async_send_to(
-        asio::buffer(*buf), addr,
-        [buf, addr](const std::error_code& ec, size_t bytes_sent) {
-            if (ec && ec != asio::error::operation_aborted) {
-                LOG_ERROR("server", "FAIL_STAGE=UDP_SEND_FAILED ERROR=" + ec.message() +
-                          " CLIENT_ENDPOINT=" + addr.address().to_string() +
-                          ":" + std::to_string(addr.port()) + " TARGET=-");
-            } else if (!ec) {
-                LOG_DEBUG("server", "UDP sent " + std::to_string(bytes_sent) +
-                         " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));
+    // Initiation is routed through the socket's strand. This is called from a
+    // per-session strand (the session's send callback), while the receive path
+    // re-arms on the io_context; with -T > 1 those are different threads, and
+    // asio sockets are shared objects -- concurrent initiation on one is not
+    // allowed. Capture self so the server stays alive until the initiation runs.
+    auto self = shared_from_this();
+    asio::dispatch(udp_socket_.get_executor(),
+        [this, self, buf, addr]() {
+            if (!running_ || !udp_socket_.is_open()) {
+                return;
             }
+            udp_socket_.async_send_to(
+                asio::buffer(*buf), addr,
+                [buf, addr](const std::error_code& ec, size_t bytes_sent) {
+                    if (ec && ec != asio::error::operation_aborted) {
+                        LOG_ERROR("server", "FAIL_STAGE=UDP_SEND_FAILED ERROR=" + ec.message() +
+                                  " CLIENT_ENDPOINT=" + addr.address().to_string() +
+                                  ":" + std::to_string(addr.port()) + " TARGET=-");
+                    } else if (!ec) {
+                        LOG_DEBUG("server", "UDP sent " + std::to_string(bytes_sent) +
+                                 " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));
+                    }
+                });
         });
 }
 

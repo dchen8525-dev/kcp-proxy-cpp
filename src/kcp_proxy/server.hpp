@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "kcp_session.hpp"
+#include "logger.hpp"
 #include "socks5.hpp"
 #include "byte_view.hpp"
 #include <asio.hpp>
@@ -18,9 +19,7 @@
 namespace kcp_proxy {
 
 struct ClientConnection {
-    std::string session_id;
     std::shared_ptr<asio::ip::tcp::socket> tcp_socket;
-    std::chrono::steady_clock::time_point created_at;
 };
 
 class KCPServer : public std::enable_shared_from_this<KCPServer> {
@@ -38,6 +37,15 @@ public:
     // local echo server). Each entry is "host" or "host:port"; an IPv6 host
     // may be bracketed as "[addr]:port".
     void set_allowed_targets(std::vector<std::string> targets);
+
+    // Route one received datagram: authenticate it (creating a session for an
+    // unknown endpoint on success) and hand the bytes to KCP. Returns the
+    // session that accepted the packet, or nullptr when it was rejected (auth
+    // failure, auth rate limit, duplicate session salt, session cap).
+    // handle_receive() is a thin socket wrapper around this; it is public so
+    // tests can drive the create/auth/reject logic without a bound socket.
+    std::shared_ptr<KCPSession> route_datagram(const asio::ip::udp::endpoint& addr,
+                                               byte_view data);
 
 private:
     asio::io_context& io_;
@@ -82,9 +90,26 @@ private:
 
     // Global throttle on new-session authentication attempts (unknown sources
     // only ever pay a full AEAD decrypt here). Bounds CPU burn from garbage
-    // UDP floods. Only touched on the single I/O thread.
+    // UDP floods. Non-atomic, and safe because the UDP receive path is
+    // serialized: exactly one async_receive_from is outstanding at a time and
+    // the next is armed only as the last statement of the completion handler,
+    // so two handlers never overlap here even with -T > 1. (The receive path is
+    // NOT single-threaded -- the -T flag spreads it over N io_context threads --
+    // so this invariant, not thread count, is what makes the plain fields safe.)
     uint32_t auth_attempts_window_ = 0;
     std::chrono::steady_clock::time_point auth_window_start_{};
+
+    // Throttles for the per-datagram rejection diagnostics. The auth counters
+    // above cap the *work* a flood can force, but these lines each fire once per
+    // hostile datagram and so were unbounded -- under a sustained flood the
+    // logging cost far more than the capped decrypts it reports on (see
+    // LogThrottle). Separate instances because they carry different meanings: a
+    // flood that trips the rate limiter must not also swallow the first
+    // "packet dropped" or decrypt-failure line, and vice versa. Each one always
+    // emits its first occurrence, which is what the robustness suite greps for.
+    LogThrottle auth_ratelimit_log_;
+    LogThrottle drop_log_;
+    LogThrottle decrypt_fail_log_;
 
     // Targets whitelisted via --allow-target; the SSRF guard refuses a target
     // only if it is restricted AND not in this list. Read-only after start().

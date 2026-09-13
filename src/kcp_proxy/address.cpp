@@ -27,7 +27,7 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
                            std::to_string(data[offset + 4]);
         uint16_t port = (static_cast<uint16_t>(data[offset + 5]) << 8) |
                         data[offset + 6];
-        return {host, port, 7};
+        return {host, port};
     }
 
     if (atyp == SOCKS5_ATYP_DOMAIN) {
@@ -43,9 +43,7 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         size_t port_offset = offset + 2 + domain_len;
         uint16_t port = (static_cast<uint16_t>(data[port_offset]) << 8) |
                         data[port_offset + 1];
-        // Frame consumed from `offset` (at the ATYP byte):
-        // ATYP(1) + LEN(1) + domain + PORT(2) = 4 + domain_len.
-        return {host, port, 4 + static_cast<size_t>(domain_len)};
+        return {host, port};
     }
 
     if (atyp == SOCKS5_ATYP_IPV6) {
@@ -57,7 +55,7 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         std::string host = asio::ip::address_v6(bytes).to_string();
         uint16_t port = (static_cast<uint16_t>(data[offset + 17]) << 8) |
                         data[offset + 18];
-        return {host, port, 19};
+        return {host, port};
     }
 
     throw std::invalid_argument("Unsupported address type: " + std::to_string(atyp));
@@ -194,8 +192,14 @@ bool is_restricted_target(const asio::ip::address& addr) {
             }
         }
 
+        // is_site_local() is fec0::/10, the (deprecated but still deployed)
+        // site-local range. It is neither link-local nor fc00::/7, so without
+        // this it was the one private IPv6 range the guard let through: a host
+        // with legacy site-local addressing would accept a CONNECT into its own
+        // network, which is exactly what the rest of this function refuses.
         if (v6.is_loopback() || v6.is_unspecified() || v6.is_link_local() ||
-            v6.is_multicast() || (bytes[0] & 0xFE) == 0xFC) {  // fc00::/7 unique-local
+            v6.is_site_local() || v6.is_multicast() ||
+            (bytes[0] & 0xFE) == 0xFC) {  // fc00::/7 unique-local
             return true;
         }
         // 2001:db8::/32 documentation range.

@@ -45,11 +45,30 @@ int main(int argc, char* argv[]) {
         } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
             key = cli::get_arg(argc, argv, i);
         } else if ((arg == "-T" || arg == "--threads") && i + 1 < argc) {
-            threads = std::stoul(cli::get_arg(argc, argv, i));
-            if (threads == 0 || threads > 64) {
+            // Strict digits-only parse, deliberately stricter than std::stoul.
+            // stoul throws on "-T abc" / an over-long number, and this argv loop
+            // runs OUTSIDE main()'s try block, so the exception escaped as an
+            // uncaught exception: the process aborted with no diagnostic instead
+            // of printing an error. It also accepts trailing junk ("-T 4abc"
+            // silently meant 4). The allowlist parser rejects "80x" for exactly
+            // that reason, so stay consistent. The length gate (2 digits covers
+            // the 1..64 range) keeps the conversion provably in range on every
+            // platform, so nothing can throw here.
+            const std::string value = cli::get_arg(argc, argv, i);
+            if (value.empty() || value.size() > 2 ||
+                value.find_first_not_of("0123456789") != std::string::npos) {
                 std::cerr << "Error: --threads must be between 1 and 64" << std::endl;
                 return 1;
             }
+            // Range-check BEFORE narrowing: assigning std::stoul's result
+            // straight to `unsigned int` truncated it first, so "-T 4294967297"
+            // wrapped to 1 and was accepted as a single-threaded server.
+            const unsigned long parsed = std::stoul(value);
+            if (parsed == 0 || parsed > 64) {
+                std::cerr << "Error: --threads must be between 1 and 64" << std::endl;
+                return 1;
+            }
+            threads = static_cast<unsigned int>(parsed);
         } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
             log_level = cli::get_arg(argc, argv, i);
         } else if (arg == "--allow-target" && i + 1 < argc) {
