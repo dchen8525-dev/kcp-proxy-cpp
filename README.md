@@ -8,7 +8,9 @@
 
 ## 目录与发布产物
 
-脚本的规范实现按职责位于 `scripts/runtime/`、`scripts/deploy/`、`scripts/package/` 和 `scripts/templates/`，根目录只保留 4 个入口：`build.sh`、`build_vs.bat`、`deploy.sh`、`deploy.bat`（后两者转发到 `scripts/deploy/deploy.py`）。`build/` 是 CMake 临时目录，`bin/` 是本地构建二进制，`dist/staging/` 是临时打包目录，`dist/releases/` 保存正式发布包。
+脚本的规范实现按职责位于 `scripts/runtime/`、`scripts/deploy/`、`scripts/package/` 和 `scripts/templates/`，
+根目录只保留 4 个入口：`build.sh`、`build_vs.bat`、`deploy.sh`、`deploy.bat`（后两者转发到 `scripts/deploy/deploy.py`）。
+`build/` 是 CMake 临时目录，`bin/` 是本地构建二进制，`dist/staging/` 是临时打包目录，`dist/releases/` 保存正式发布包。
 
 Electron (`gui/electron`) 是主 GUI，提供跨平台的图形界面。
 
@@ -277,7 +279,9 @@ kcp-proxy-server -k <密钥> [-H 0.0.0.0] [-p 8388] [-L info]
 | `-H, --host` | `0.0.0.0` | UDP 绑定地址 |
 | `-p, --port` | `8388` | UDP 监听端口 |
 | `-L, --log-level` | `INFO` | 日志级别 |
+| `-T, --threads` | `1` | io_context 工作线程数，范围 1–64；KCP 更新始终跑在单个共享的 10ms tick 上，多线程只用于分摊 UDP/TCP I/O |
 | `--allow-target` | （空） | 允许指定目标绕过 SSRF 防护（可重复，`主机[:端口]`）。**仅限实验室/测试**，默认空即全防护，切勿在不可信网络暴露 |
+| `KCP_PROXY_KEY`（环境变量） | （空） | 与 `-k` 等价的密钥来源；未提供 `-k` 时读取。供 GUI 调用，避免密钥出现在命令行里 |
 
 ### 客户端命令行
 
@@ -294,6 +298,7 @@ kcp-proxy-client -s <服务端地址> -k <密钥> [-p 8388] [-H 127.0.0.1] [-l 1
 | `-l, --listen-port` | `1080` | 本地 SOCKS5 监听端口 |
 | `-L, --log-level` | `INFO` | 日志级别 |
 | `--half-close-grace` | `120`（=2×超时） | 本地应用停止发送后，目标仍无数据可投递多少秒即回收隧道；只要目标还在持续投递数据就不会被回收（回收计时仅由真实数据推进，心跳不算） |
+| `KCP_PROXY_KEY`（环境变量） | （空） | 与 `-k` 等价的密钥来源；未提供 `-k` 时读取。供 GUI 调用，避免密钥出现在命令行里 |
 
 **推荐**：普通用户使用Electron GUI，更直观易用。
 

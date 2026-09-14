@@ -71,10 +71,14 @@ function findClientBinary() {
   const executable = process.platform === 'win32'
     ? 'kcp-proxy-client.exe' : 'kcp-proxy-client';
   // Same layout as main.js getClientPath(), minus the packaged-resource path
-  // that only exists inside an Electron ASAR.
+  // that only exists inside an Electron ASAR. process.platform is 'darwin' on
+  // macOS but the directory build.sh produces is 'macos'; using the raw value
+  // here made every runtime case silently self-skip on macOS.
+  const binDir = process.platform === 'win32' ? 'windows'
+    : process.platform === 'darwin' ? 'macos'
+    : 'linux';
   const candidates = [
-    path.join(__dirname, '../../../bin',
-      process.platform === 'win32' ? 'windows' : process.platform, executable),
+    path.join(__dirname, '../../../bin', binDir, executable),
     path.join(__dirname, '../../../build/Release', executable),
     path.join(__dirname, executable)
   ];

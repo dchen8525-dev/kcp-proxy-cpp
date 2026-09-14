@@ -9,12 +9,11 @@
   },
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder",
     "build:win": "electron-builder --config electron-builder.win.json",
     "build:portable": "electron-builder --config electron-builder.portable.json",
     "build:linux": "electron-builder --config electron-builder.linux.json",
     "test": "node --test",
-    "check": "node --check main.js && node --check preload.js && node --check renderer.js && node --check utils.js && node --check test/utils.test.js && node --check test/launch-contract.test.js && node --check test/pipelined-smoke.js && node -e \"require('fs').readdirSync('.').filter(f=>f.startsWith('electron-builder')&&f.endsWith('.json')).concat(['package.json']).forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\""
+    "check": "node scripts/check.js"
   },
   "author": "",
   "license": "MIT",

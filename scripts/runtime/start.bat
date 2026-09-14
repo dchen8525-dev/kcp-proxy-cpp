@@ -44,7 +44,8 @@ REM Validate the suffix and derive the Beijing date in PowerShell. The suffix
 REM travels through the environment so a value with cmd metacharacters cannot
 REM inject commands into the -Command string.
 set "KCP_SUFFIX=%SUFFIX%"
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; if ($env:KCP_SUFFIX -notmatch '^[A-Za-z0-9._-]{8,128}$') { exit 1 }; (Get-Date).ToUniversalTime().AddHours(8).ToString('yyyyMMdd')"`) do set "DATE_BEIJING=%%D"
+set "KCP_DATE_PS=$ProgressPreference='SilentlyContinue'; if ($env:KCP_SUFFIX -notmatch '^[A-Za-z0-9._-]{8,128}$') { exit 1 }; (Get-Date).ToUniversalTime().AddHours(8).ToString('yyyyMMdd')"
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "%KCP_DATE_PS%"`) do set "DATE_BEIJING=%%D"
 if not defined DATE_BEIJING (
     echo Error: suffix must be 8-128 chars of [A-Za-z0-9._-] >&2
     exit /b 1

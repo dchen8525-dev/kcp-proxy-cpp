@@ -29,7 +29,7 @@ cmake --build --preset release   # Build Release
 cmake --build --preset debug     # Build Debug
 ```
 
-Build targets: `kcp-proxy-server`, `kcp-proxy-client`
+Build targets: `kcp-proxy-server`, `kcp-proxy-client`, `kcp_proxy_test` (plus `kcp_proxy_lib`).
 
 Build outputs live under `build/` (multi-config: `build/Release/`, `build/Debug/`).
 
@@ -48,11 +48,24 @@ Key is derived via HKDF-SHA256 into AES-128-GCM keys (see README 协议与加密
 - **Local-side tooling is Python 3.12 (stdlib only, cross-platform)**; anything that runs *on the target Linux server* stays POSIX sh, because minimal Debian hosts do not guarantee `python3`.
   - Python: `scripts/deploy/deploy.py` (deploy) and `scripts/package/package.py` (packaging: standalone tar.gz/zip + deb).
   - POSIX sh: `scripts/deploy/install-service.sh`, `scripts/deploy/uninstall-service.sh`, plus the wrapper/postinst/prerm/postrm payloads embedded in packages.
-- Packaging: `python3 scripts/package/package.py standalone` (tar.gz on linux/macos, zip on windows) and `python3 scripts/package/package.py deb`. Archive permissions come from an explicit table in `package.py`, never from `stat()` — Windows has no Unix mode bits.
+- Packaging: `python3 scripts/package/package.py standalone` (tar.gz on linux/macos, zip on windows) and
+  `python3 scripts/package/package.py deb`. Archive permissions come from an explicit table in
+  `package.py`, never from `stat()` — Windows has no Unix mode bits.
 - `scripts/runtime/common.sh` is the single source of truth for ports and suffix validation — `start.sh` and `install-service.sh` source it, `deploy.py` parses it.
 - One-command deploy: `./deploy.sh user@host` (thin forwarder to `scripts/deploy/deploy.py`, Python3 stdlib + system ssh/scp, cross-platform).
-- Server side: fixed unit name `kcp-proxy-server.service` (no @template), suffix stored in `/etc/kcp-proxy/server.env` (mode 600), runs as `kcpproxy` system user. Logs append to `LOG_FILE` from server.env (default `/var/log/kcp-proxy/server.log`; empty = journald only) — rotated to `.1` past 10 MiB at each restart; the unit carves the dir out of ProtectSystem via `ReadWritePaths=-/var/log/kcp-proxy`.
-- Key = Beijing date (YYYYMMDD) + suffix, re-derived on each service (re)start. A systemd timer (`kcp-proxy-server-key-refresh.timer`, `OnCalendar=*-*-* 0/6:00:00`) restarts the service at 00:00/06:00/12:00/18:00 local time so the key follows the Beijing date change within seconds; clients must restart after the key changes. Never express this schedule with `OnBootSec=`/`OnUnitActiveSec=`: systemd drops a monotonic elapse that is already past when the timer is (re)started, leaving the timer `active (elapsed)` with no next trigger, which silently freezes the server's key and makes every client fail `DECRYPT_FAILED`. `install-service.sh` fails the install if the timer has no next elapse. Uninstall removes the timer units (a legacy `# kcp-proxy-server` cron entry is purged only with `--purge`).
+- Server side: fixed unit name `kcp-proxy-server.service` (no @template), suffix stored in
+  `/etc/kcp-proxy/server.env` (mode 600), runs as `kcpproxy` system user. Logs append to `LOG_FILE` from
+  server.env (default `/var/log/kcp-proxy/server.log`; empty = journald only) — rotated to `.1` past
+  10 MiB at each restart; the unit carves the dir out of ProtectSystem via `ReadWritePaths=-/var/log/kcp-proxy`.
+- Key = Beijing date (YYYYMMDD) + suffix, re-derived on each service (re)start. A systemd timer
+  (`kcp-proxy-server-key-refresh.timer`, `OnCalendar=*-*-* 0/6:00:00`) restarts the service at
+  00:00/06:00/12:00/18:00 local time so the key follows the Beijing date change within seconds; clients
+  must restart after the key changes.
+  Never express this schedule with `OnBootSec=`/`OnUnitActiveSec=`: systemd drops a monotonic elapse
+  that is already past when the timer is (re)started, leaving the timer `active (elapsed)` with no next
+  trigger, which silently freezes the server's key and makes every client fail `DECRYPT_FAILED`.
+  `install-service.sh` fails the install if the timer has no next elapse.
+  Uninstall removes the timer units (a legacy `# kcp-proxy-server` cron entry is purged only with `--purge`).
 
 ## Architecture
 
@@ -73,7 +86,8 @@ Key is derived via HKDF-SHA256 into AES-128-GCM keys (see README 协议与加密
 
 ### Config and Tuning
 
-All tuning is compile-time constants in `config.hpp` (KCP interval, window sizes, MTU, timeouts, crypto params). KCP runs in fastest mode: nodelay, 10ms interval, fast resend after 5 skips, no congestion control.
+All tuning is compile-time constants in `config.hpp` (KCP interval, window sizes, MTU, timeouts, crypto
+params). KCP runs in fastest mode: nodelay, 10ms interval, fast resend after 5 skips, no congestion control.
 
 ## Dependencies
 
@@ -82,8 +96,9 @@ All tuning is compile-time constants in `config.hpp` (KCP interval, window sizes
 | OpenSSL | vcpkg |
 | Asio | vcpkg (standalone, no Boost) |
 | KCP | vcpkg |
+| fmt | vcpkg (>= 10.0.0, linked as `fmt::fmt`) |
 
-All dependencies are managed by vcpkg. Build scripts automatically install them during the build process.
+All dependencies are managed by vcpkg (see `vcpkg.json` for the pinned baseline). Build scripts automatically install them during the build process.
 
 ## Platform
 

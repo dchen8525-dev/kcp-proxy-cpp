@@ -34,13 +34,23 @@ Do not log keys or payload bytes.
 
 ## Common Failure Stages
 
-- `AUTH_FAILED`: first encrypted packet could not be authenticated.
-- `DECRYPT_FAILED`: packet decryption or tag verification failed.
-- `REPLAY_DETECTED`: replay window rejected a packet.
+This is the complete list of stages the binaries emit (grep `FAIL_STAGE=` in `src/` to verify):
+
+- `DECRYPT_FAILED`: packet decryption or tag verification failed — in practice a wrong key, an
+  unauthenticated packet, or a session-salt mismatch.
+- `KCP_HANDSHAKE_FAILED`: the protocol handshake read failed before SOCKS5 started.
+- `KCP_INPUT_FAILED`: `ikcp_input()` rejected a segment (`ret_<n>`).
+- `KCP_NO_RECV`: the downstream KCP read failed or returned zero bytes.
 - `SOCKS5_PARSE_FAILED`: SOCKS5 request was invalid or too large.
 - `SOCKS5_UNSUPPORTED_COMMAND`: command was `BIND`, `UDP ASSOCIATE`, or unknown.
+- `SSRF_BLOCKED`: the requested target is a restricted address (loopback, private, link-local, …)
+  and the server refuses to connect to it. Use `--allow-target` only in a lab.
 - `DNS_RESOLVE_FAILED`: domain resolution failed.
-- `TCP_CONNECT_FAILED`: all outbound TCP connect attempts failed.
+- `TCP_CONNECT_FAILED`: all outbound TCP connect attempts failed, or the connect timeout fired.
 - `TCP_READ_FAILED` / `TCP_WRITE_FAILED`: remote TCP stream failed during forwarding.
 - `UDP_SEND_FAILED`: UDP send failed.
 - `SESSION_TIMEOUT`: session idle/KCP timeout cleanup.
+
+A failure to reach `CPP_REMOTE_REACHABLE` on the Android side (server stopped, wrong key, UDP blocked)
+does not surface as a stage on the server at all — there is no session to log one from, because the
+server never authenticates a packet. Look for the absence of `new session:` instead.

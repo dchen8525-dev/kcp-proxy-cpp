@@ -46,14 +46,16 @@
 
 ## 4. 测试新增 / 更新（Tests added/updated）
 
-- C++ 单测：`ctest` 中 `kcp_proxy_test` **1/1 Passed**（无新增用例；第 7 项改动由运行时启动日志验证）。
+- C++ 单测：`ctest` 中 `kcp_proxy_test` 通过（本轮新增 SOCKS5 响应解析用例，见下方
+  `test_socks5_reply_parser`）。
 - GUI（electron）`node --test`：15 项中 14 通过；唯一失败的 `test/pipelined-smoke.js` 依赖外部代理监听
   `11080`，属环境相关，与本轮改动无关（且本机当前无 `node_modules`）。
 
 ## 5. C++ 构建 / CTest 结果（C++ build / CTest result）
 
 - Release 构建全绿：`kcp-proxy-server.exe` / `kcp-proxy-client.exe` / `kcp_proxy_test.exe` 均编译通过。
-- `ctest --test-dir build -C Release --output-on-failure` → **1/1 Passed**。
+- `ctest --test-dir build -C Release --output-on-failure` → 全部通过（当前注册 4 个测试：
+  `kcp_proxy_test`、`kcp_proxy_smoke`、`kcp_proxy_e2e_tunnel`、`kcp_proxy_e2e_robustness`）。
 - `git diff --check` → 工作区干净（无空白错误、无未提交改动）。
 
 ## 6. C++ 本地 curl 端到端结果（C++ local curl result）

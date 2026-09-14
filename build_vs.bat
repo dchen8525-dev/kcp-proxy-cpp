@@ -23,6 +23,8 @@ echo ========================================
 echo  KCP Proxy Build (Windows)
 echo ========================================
 
+echo [1/5] Detecting Visual Studio...
+
 REM === Detect Visual Studio (vswhere first, then scan install roots) ===
 set "VS_FOUND="
 set "VSROOT="
@@ -99,7 +101,7 @@ if not defined USE_VCPKG (
     )
 )
 if not defined USE_VCPKG (
-    echo [3/5] Bootstrapping pinned vcpkg...
+    echo [2/5] Bootstrapping pinned vcpkg...
     set "VCPKG_COMMIT=c5a15727ee70fddf0296f0d8aafc3f58916fefac"
     git clone https://github.com/microsoft/vcpkg.git "%ROOT%vcpkg"
     if errorlevel 1 exit /b 1
@@ -109,7 +111,7 @@ if not defined USE_VCPKG (
     if errorlevel 1 exit /b 1
     set "VCPKG_ROOT=%ROOT%vcpkg"
 )
-echo [2/5] Using vcpkg at !VCPKG_ROOT!
+echo      Using vcpkg at !VCPKG_ROOT!
 if not exist "!VCPKG_ROOT!\vcpkg.exe" (
     echo ERROR: vcpkg.exe not found under !VCPKG_ROOT!
     exit /b 1
@@ -135,6 +137,7 @@ ctest --test-dir build -C Release --output-on-failure
 if errorlevel 1 exit /b 1
 
 echo.
+echo [5/5] Staging binaries and runtime DLLs...
 set "OUTDIR=%ROOT%bin\windows"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 copy /Y "build\Release\kcp-proxy-server.exe" "%OUTDIR%\" >nul

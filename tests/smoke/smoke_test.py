@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import re
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -149,12 +150,70 @@ def test_gui_never_puts_the_key_on_the_command_line():
             "the GUI must spawn with an argv array, never a shell string")
     require("'-k'" not in main and "'--key'" not in main,
             "the GUI must not put the key on the client's command line")
-    require("KCP_PROXY_KEY" in main,
-            "the GUI must hand the key to the client through the environment")
+
+    # The handoff itself lives in the pure helper (main.js only mentions the
+    # variable in a comment), so assert on the file that actually sets it --
+    # checking main.js used to pass even with the real assignment deleted.
+    utils = read("gui/electron/utils.js")
+    require("KCP_PROXY_KEY" in utils and "buildClientEnv" in utils,
+            "utils.js must hand the key to the client through the environment")
+    require(re.search(r"KCP_PROXY_KEY:\s*key", utils) is not None,
+            "buildClientEnv must assign the key to KCP_PROXY_KEY")
 
     # ...and the client must actually read that variable, or the GUI is broken.
     require('get_env("KCP_PROXY_KEY")' in read("src/main_client.cpp"),
             "the client must read KCP_PROXY_KEY from the environment")
+
+
+# --------------------------------------------------------------------------- #
+# the GUI's client-binary search path
+# --------------------------------------------------------------------------- #
+def test_gui_finds_the_dev_build():
+    main = read("gui/electron/main.js")
+
+    # Regression guard: the dev-mode candidate used '../../..' from
+    # gui/electron, which resolves to the PARENT of the repository, so a
+    # machine with only a CMake build tree got "client not found". From
+    # gui/electron the repo root is two levels up.
+    newline = chr(10)
+    start = main.index("function getClientPath")
+    block = main[start:main.index(newline + "}", start)]
+    require("'../../../build" not in block and '"../../../build' not in block,
+            "getClientPath must not reach above the repository root for build/Release")
+    require("'../../build/Release'" in block,
+            "getClientPath must look in <repo>/build/Release")
+
+
+def test_gui_maps_darwin_to_the_macos_bin_dir():
+    # main.js maps process.platform 'darwin' onto the bin/macos directory that
+    # build.sh produces; the runtime test helper must agree or every case
+    # silently self-skips on macOS.
+    test_src = read("gui/electron/test/launch-contract.test.js")
+    require("'darwin' ? 'macos'" in test_src,
+            "launch-contract.test.js must map darwin onto the macos bin dir")
+
+
+# --------------------------------------------------------------------------- #
+# deploy tooling (the one path that is fully local and was never executed)
+# --------------------------------------------------------------------------- #
+def test_deploy_dry_run():
+    # --dry-run is the only branch of deploy.py that touches neither SSH nor
+    # the network, which is exactly why it was never run by CI: the assertions
+    # above only grep the file's text. --uninstall narrows the payload to
+    # tracked scripts, so this executes the real packaging + archive-validation
+    # code on every platform (no bin/linux binary required).
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "deploy" / "deploy.py"),
+         "root@localhost", "--uninstall", "--dry-run"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+    require(result.returncode == 0,
+            f"deploy.py --dry-run failed ({result.returncode}): {result.stderr.strip()}")
+    require("uninstall-service.sh" in result.stdout,
+            "the dry-run package must contain uninstall-service.sh")
+    require("common.sh" in result.stdout,
+            "the dry-run package must contain common.sh")
+    require("SHA256:" in result.stdout,
+            "the dry-run must report the package checksum")
 
 
 # --------------------------------------------------------------------------- #
@@ -308,6 +367,9 @@ TESTS = [
     test_no_committed_secrets,
     test_deploy_safety,
     test_gui_never_puts_the_key_on_the_command_line,
+    test_gui_finds_the_dev_build,
+    test_gui_maps_darwin_to_the_macos_bin_dir,
+    test_deploy_dry_run,
     test_service_scripts,
     test_vcpkg_pins_agree,
     test_versions_agree,

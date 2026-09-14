@@ -98,4 +98,67 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
     return result;
 }
 
+SOCKS5ReplyResult parse_socks5_reply(const std::vector<uint8_t>& data) {
+    SOCKS5ReplyResult result;
+    // VER + REP + RSV + ATYP; ATYP is needed before the length can be known.
+    if (data.size() < 4) {
+        return result;
+    }
+
+    if (data[0] != SOCKS5_VERSION) {
+        result.status = SOCKS5ReplyStatus::Invalid;
+        result.error = "invalid SOCKS5 reply version: " + std::to_string(data[0]);
+        return result;
+    }
+
+    // Same RSV rule as the request parser: reserved, and must be 0x00.
+    if (data[2] != 0x00) {
+        result.status = SOCKS5ReplyStatus::Invalid;
+        result.error = "invalid SOCKS5 reply reserved byte: " + std::to_string(data[2]);
+        return result;
+    }
+
+    const uint8_t atyp = data[3];
+    size_t need = 0;
+    if (atyp == SOCKS5_ATYP_IPV4) {
+        need = 4 + 4 + 2;
+    } else if (atyp == SOCKS5_ATYP_IPV6) {
+        need = 4 + 16 + 2;
+    } else if (atyp == SOCKS5_ATYP_DOMAIN) {
+        if (data.size() < 5) {
+            return result;
+        }
+        const size_t domain_len = data[4];
+        if (domain_len == 0) {
+            result.status = SOCKS5ReplyStatus::Invalid;
+            result.error = "empty domain in SOCKS5 reply";
+            return result;
+        }
+        need = 4 + 1 + domain_len + 2;
+    } else {
+        result.status = SOCKS5ReplyStatus::Invalid;
+        result.error = "unsupported reply address type: " + std::to_string(atyp);
+        return result;
+    }
+
+    if (data.size() < need) {
+        return result;
+    }
+
+    try {
+        auto parsed = parse_address(data.data(), need, 3);
+        SOCKS5Reply reply;
+        reply.reply = data[1];
+        reply.host = parsed.host;
+        reply.port = parsed.port;
+        reply.length = need;
+        result.reply = std::move(reply);
+        result.status = SOCKS5ReplyStatus::Complete;
+    } catch (const std::exception& e) {
+        result.status = SOCKS5ReplyStatus::Invalid;
+        result.error = e.what();
+    }
+    return result;
+}
+
 } // namespace kcp_proxy

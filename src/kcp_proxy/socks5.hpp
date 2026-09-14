@@ -43,4 +43,35 @@ struct SOCKS5ParseResult {
 
 SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data);
 
+// A fully validated SOCKS5 reply (RFC 1928 §6).
+struct SOCKS5Reply {
+    uint8_t reply = SOCKS5_REPLY_GENERAL_FAILURE;
+    std::string host;
+    uint16_t port = 0;
+    // How many bytes of the input the reply occupies. A KCP message can carry
+    // target payload right after the reply, so the caller must consume exactly
+    // this many bytes and forward the remainder — dropping it truncates the
+    // first response the local app sees.
+    size_t length = 0;
+};
+
+enum class SOCKS5ReplyStatus {
+    NeedMore,
+    Complete,
+    Invalid
+};
+
+struct SOCKS5ReplyResult {
+    SOCKS5ReplyStatus status = SOCKS5ReplyStatus::NeedMore;
+    // Only engaged when status == Complete.
+    std::optional<SOCKS5Reply> reply;
+    std::string error;
+};
+
+// Parse a SOCKS5 CONNECT reply. Unlike the client's old inline check (which
+// looked at byte[1] only), this validates VER, RSV, ATYP and the total length
+// implied by ATYP, and reports NeedMore so a reply split across several KCP
+// messages is accumulated instead of being mistaken for a complete one.
+SOCKS5ReplyResult parse_socks5_reply(const std::vector<uint8_t>& data);
+
 } // namespace kcp_proxy

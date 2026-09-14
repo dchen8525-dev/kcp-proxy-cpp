@@ -145,7 +145,7 @@ function getClientPath() {
     path.join(process.resourcesPath, executable),
     // Dev-mode layout: gui/electron -> ../../bin/<os> (repo root's bin dir).
     path.join(__dirname, '../../bin', binDir, executable),
-    path.join(__dirname, '../../../build/Release', executable),
+    path.join(__dirname, '../../build/Release', executable),
     path.join(__dirname, executable)
   ];
 

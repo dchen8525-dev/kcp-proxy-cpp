@@ -152,7 +152,7 @@ Current unit coverage includes:
 - Tamper detection
 - Replay rejection
 - Old counter rejection
-- Packet older than the 64-packet replay window rejection
+- Packet older than the 2048-packet replay window rejection
 - SOCKS5 IPv4, IPv6, and domain parsing
 - SOCKS5 byte-by-byte partial request handling
 - Extra payload preservation after CONNECT
@@ -160,6 +160,9 @@ Current unit coverage includes:
 - UDP ASSOCIATE parse-before-reject behavior
 - Invalid SOCKS5 version rejection
 - SOCKS5 reply bind-address encoding
+- SOCKS5 reply parsing: complete IPv4/IPv6/domain replies, byte-by-byte partial
+  replies, trailing target payload, non-zero REP, invalid VER/RSV/ATYP, empty
+  domain, and round-tripping a built reply
 - Restricted-target classification (loopback, private, link-local, CGN, and
   IPv6 transition forms such as 6to4/Teredo/NAT64)
 - Stacked `async_read_some` rejection with `already_started`

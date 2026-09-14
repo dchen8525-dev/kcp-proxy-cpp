@@ -132,7 +132,11 @@ KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=256 rcvWnd
 
 ## Failure Stages
 
-Logs use these stable stage names where applicable: `AUTH_FAILED`, `DECRYPT_FAILED`, `REPLAY_DETECTED`,
-`KCP_INPUT_FAILED`, `KCP_TIMEOUT`, `SOCKS5_PARSE_FAILED`, `SOCKS5_UNSUPPORTED_COMMAND`,
+Logs use these stable stage names where applicable: `DECRYPT_FAILED`, `KCP_HANDSHAKE_FAILED`,
+`KCP_INPUT_FAILED`, `KCP_NO_RECV`, `SOCKS5_PARSE_FAILED`, `SOCKS5_UNSUPPORTED_COMMAND`, `SSRF_BLOCKED`,
 `DNS_RESOLVE_FAILED`, `TCP_CONNECT_FAILED`, `TCP_READ_FAILED`, `TCP_WRITE_FAILED`, `UDP_SEND_FAILED`,
 and `SESSION_TIMEOUT`.
+
+This is the complete set: it is what `FAIL_STAGE=`/handshake-failure log lines in `src/` actually
+emit, so the list can be grepped against the binary. Every one appears in the server's log output;
+`DECRYPT_FAILED` and `KCP_INPUT_FAILED` also appear on the client side.

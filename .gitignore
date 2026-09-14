@@ -73,6 +73,7 @@ gui/electron/node_modules/
 
 # Agent workspace memory (private to the AI assistant, not project source)
 .workbuddy/
+.commandcode/
 
 # Local deploy helper (contains server credentials; kept out of the repo)
 scripts/deploy/sshrun.py

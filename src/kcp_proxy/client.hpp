@@ -5,6 +5,7 @@
 #include "byte_view.hpp"
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -130,6 +131,20 @@ private:
                              uint8_t cmd, const std::string& host, uint16_t port,
                              std::shared_ptr<asio::steady_timer> handshake_deadline,
                              std::shared_ptr<std::atomic<bool>> handshake_cancelled);
+
+    // Read and validate the server's SOCKS5 CONNECT reply. A reply can be split
+    // across several KCP messages, and one message can carry target payload
+    // after it, so this accumulates into `accum` and re-arms until
+    // parse_socks5_reply() reports Complete. Only then is the handshake done:
+    // the reply (plus any trailing payload) is written to the local app and the
+    // forwarding loops start.
+    void read_socks5_reply(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                           std::shared_ptr<KCPClientSession> session,
+                           std::shared_ptr<std::vector<uint8_t>> accum,
+                           std::chrono::steady_clock::time_point handshake_start,
+                           std::shared_ptr<asio::steady_timer> handshake_deadline,
+                           std::shared_ptr<std::atomic<bool>> handshake_cancelled,
+                           std::shared_ptr<HalfCloseGuard> half_close);
 
     void forward_client_to_kcp(std::shared_ptr<asio::ip::tcp::socket> client_socket,
                                std::shared_ptr<KCPClientSession> session,

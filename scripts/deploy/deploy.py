@@ -66,7 +66,7 @@ def die(msg, code=1):
 
 
 def load_common_defaults():
-    """Parse simple VAR=value lines from scripts/common.sh."""
+    """Parse simple VAR=value lines from scripts/runtime/common.sh."""
     defaults = {}
     if not COMMON_SH.is_file():
         return defaults

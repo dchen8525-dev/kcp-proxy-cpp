@@ -276,6 +276,127 @@ void test_socks5_reply_bind_address() {
     expect_true(local[4] == 127 && local[7] == 1, "IPv4 bind reply mismatch");
 }
 
+// The client used to validate the server's CONNECT reply with a two-line check
+// (bytes >= 2 and byte[1] == 0), so a wrong-version, wrong-ATYP or truncated
+// reply was accepted as a live tunnel and any trailing payload was dropped.
+void test_socks5_reply_parser() {
+    // VER REP RSV ATYP BND.ADDR BND.PORT for a complete IPv4 reply.
+    std::vector<uint8_t> ipv4{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00,
+                              SOCKS5_ATYP_IPV4, 93, 184, 216, 34, 0x01, 0xBB};
+    auto parsed = parse_socks5_reply(ipv4);
+    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "IPv4 reply did not parse");
+    expect_true(parsed.reply.has_value(), "IPv4 reply missing");
+    expect_true(parsed.reply->reply == SOCKS5_REPLY_SUCCEEDED, "IPv4 reply code mismatch");
+    expect_true(parsed.reply->host == "93.184.216.34", "IPv4 bind host mismatch");
+    expect_true(parsed.reply->port == 443, "IPv4 bind port mismatch");
+    expect_true(parsed.reply->length == 10, "IPv4 reply length mismatch");
+
+    // Every strict prefix must report NeedMore, never Complete: a reply split
+    // across KCP messages has to be accumulated, not acted upon early.
+    for (size_t i = 0; i < ipv4.size(); ++i) {
+        std::vector<uint8_t> partial(ipv4.begin(),
+                                     ipv4.begin() + static_cast<std::ptrdiff_t>(i));
+        auto r = parse_socks5_reply(partial);
+        expect_true(r.status == SOCKS5ReplyStatus::NeedMore, "partial reply should need more");
+        expect_true(!r.reply.has_value(), "partial reply must not engage a reply");
+    }
+
+    // The old check accepted a two-byte prefix as success.
+    std::vector<uint8_t> two_bytes{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED};
+    expect_true(parse_socks5_reply(two_bytes).status == SOCKS5ReplyStatus::NeedMore,
+                "a two-byte reply must not count as complete");
+
+    // Target payload can ride along in the same KCP message. It must be left
+    // for the caller (length excludes it) instead of being discarded.
+    auto with_payload = ipv4;
+    with_payload.push_back('G');
+    with_payload.push_back('E');
+    with_payload.push_back('T');
+    parsed = parse_socks5_reply(with_payload);
+    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "reply with payload did not parse");
+    expect_true(parsed.reply->length == 10, "reply length must exclude trailing payload");
+    expect_true(with_payload.size() - parsed.reply->length == 3, "trailing payload not preserved");
+
+    // A non-zero REP still parses (the client maps it to an error reply).
+    std::vector<uint8_t> refused = ipv4;
+    refused[1] = SOCKS5_REPLY_CONNECTION_REFUSED;
+    parsed = parse_socks5_reply(refused);
+    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "rejected reply did not parse");
+    expect_true(parsed.reply->reply == SOCKS5_REPLY_CONNECTION_REFUSED, "reply code lost");
+
+    // IPv6 bind address.
+    std::vector<uint8_t> ipv6{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, SOCKS5_ATYP_IPV6};
+    ipv6.insert(ipv6.end(), 15, 0);
+    ipv6.push_back(0x01);
+    ipv6.push_back(0x00);
+    ipv6.push_back(0x50);
+    for (size_t i = 0; i < ipv6.size(); ++i) {
+        std::vector<uint8_t> partial(ipv6.begin(),
+                                     ipv6.begin() + static_cast<std::ptrdiff_t>(i));
+        expect_true(parse_socks5_reply(partial).status == SOCKS5ReplyStatus::NeedMore,
+                    "partial IPv6 reply should need more");
+    }
+    parsed = parse_socks5_reply(ipv6);
+    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "IPv6 reply did not parse");
+    expect_true(parsed.reply->length == 22, "IPv6 reply length mismatch");
+    expect_true(parsed.reply->port == 80, "IPv6 bind port mismatch");
+
+    // Domain bind address, including its variable-length form.
+    std::vector<uint8_t> domain{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00,
+                                SOCKS5_ATYP_DOMAIN, 11};
+    const char* name = "example.com";
+    domain.insert(domain.end(), name, name + 11);
+    domain.push_back(0x00);
+    domain.push_back(0x50);
+    for (size_t i = 0; i < domain.size(); ++i) {
+        std::vector<uint8_t> partial(domain.begin(),
+                                     domain.begin() + static_cast<std::ptrdiff_t>(i));
+        expect_true(parse_socks5_reply(partial).status == SOCKS5ReplyStatus::NeedMore,
+                    "partial domain reply should need more");
+    }
+    parsed = parse_socks5_reply(domain);
+    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "domain reply did not parse");
+    expect_true(parsed.reply->host == "example.com", "domain bind host mismatch");
+    expect_true(parsed.reply->port == 80, "domain bind port mismatch");
+    expect_true(parsed.reply->length == 18, "domain reply length mismatch");
+
+    // Malformed replies must be Invalid, not Complete and not NeedMore (a
+    // NeedMore here would hang the handshake until the deadline).
+    std::vector<uint8_t> bad_ver = ipv4;
+    bad_ver[0] = 0x04;
+    expect_true(parse_socks5_reply(bad_ver).status == SOCKS5ReplyStatus::Invalid,
+                "bad reply version should be invalid");
+
+    std::vector<uint8_t> bad_rsv = ipv4;
+    bad_rsv[2] = 0x01;
+    expect_true(parse_socks5_reply(bad_rsv).status == SOCKS5ReplyStatus::Invalid,
+                "a non-zero reply reserved byte should be invalid");
+
+    std::vector<uint8_t> bad_atyp{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, 0x09, 0, 0};
+    expect_true(parse_socks5_reply(bad_atyp).status == SOCKS5ReplyStatus::Invalid,
+                "unsupported reply ATYP should be invalid");
+
+    std::vector<uint8_t> empty_domain{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00,
+                                      SOCKS5_ATYP_DOMAIN, 0x00};
+    expect_true(parse_socks5_reply(empty_domain).status == SOCKS5ReplyStatus::Invalid,
+                "empty reply domain should be invalid");
+
+    expect_true(parse_socks5_reply({}).status == SOCKS5ReplyStatus::NeedMore,
+                "an empty buffer should ask for more");
+
+    // Round-trip: what the server builds must parse back to the same values, so
+    // the two ends cannot drift apart.
+    SOCKS5Response wire;
+    wire.reply = SOCKS5_REPLY_SUCCEEDED;
+    wire.host = "127.0.0.1";
+    wire.port = 54321;
+    parsed = parse_socks5_reply(wire.build());
+    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "built reply did not parse");
+    expect_true(parsed.reply->host == "127.0.0.1", "built reply host mismatch");
+    expect_true(parsed.reply->port == 54321, "built reply port mismatch");
+    expect_true(parsed.reply->length == wire.build().size(), "built reply length mismatch");
+}
+
 void test_restricted_targets() {
     // IPv4 basics.
     expect_true(is_restricted_target(asio::ip::make_address("127.0.0.1")), "v4 loopback");
@@ -1190,6 +1311,7 @@ int main() {
         test_crypto_roundtrip_and_failures();
         test_socks5_parser();
         test_socks5_reply_bind_address();
+        test_socks5_reply_parser();
         test_restricted_targets();
         test_log_throttle();
         test_allowlist_matching();
