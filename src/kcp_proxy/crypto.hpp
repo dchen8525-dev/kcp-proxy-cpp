@@ -109,6 +109,13 @@ public:
     // instead of black-holing the reconnect for up to the idle timeout.
     bool matches_salt(byte_view packet) const;
 
+    // This session's 16-byte salt, empty until the server learns it from the
+    // first datagram. Both peers share the same value. Not secret (it is
+    // carried in cleartext on every wire datagram), but unique per session.
+    // Used to scope the application-layer keepalive sentinel so a real 21-byte
+    // payload can never collide with it (see KcpTunnel::is_keepalive).
+    byte_view session_salt() const { return byte_view(session_salt_.data(), session_salt_.size()); }
+
 private:
     static std::array<uint8_t, NONCE_SIZE> generate_nonce(uint64_t counter, uint8_t direction);
     // Replay window: `check_replay_window` is a pure read (does not mutate), so

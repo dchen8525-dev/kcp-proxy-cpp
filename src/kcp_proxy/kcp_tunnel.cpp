@@ -4,6 +4,7 @@
 #include "kcp_proxy/time_util.hpp"
 #include <fmt/format.h>
 #include <cstring>
+#include <string_view>
 #include <utility>
 
 namespace kcp_proxy {
@@ -169,9 +170,13 @@ void KcpTunnel::try_fulfill_read() {
 
     // Drop application-layer keepalive heartbeats: they are not real stream
     // data and must never be forwarded to the downstream TCP socket.
-    if (size == static_cast<int>(std::strlen(KCP_CONTROL_KEEPALIVE)) &&
-        std::memcmp(kcp_recv_buf_.data(), KCP_CONTROL_KEEPALIVE,
-                    static_cast<size_t>(size)) == 0) {
+    //
+    // The sentinel is the magic string scoped by this session's salt, so a
+    // genuine payload can never be mistaken for it: the full keepalive is
+    // "KCP_PROXY_KEEPALIVE_V1" || session_salt (16 random bytes), and matching
+    // requires the salt exactly. A real segment carrying the bare 21-byte magic
+    // (previously ambiguous) is forwarded normally.
+    if (is_keepalive(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
         LOG_DEBUG(log_module_, log_msg("keepalive received, dropping"));
         return;
     }
@@ -228,15 +233,40 @@ void KcpTunnel::maybe_send_keepalive() {
         kcp_.peek_size() > 0) {
         return;
     }
-    const auto* kb = reinterpret_cast<const uint8_t*>(KCP_CONTROL_KEEPALIVE);
-    const size_t klen = std::strlen(KCP_CONTROL_KEEPALIVE);
+    // Salt is guaranteed set: it is learned before the handshake sequence that
+    // set handshake_done_ (client generates it at construction; server learns
+    // it from the first datagram). Send magic || salt so the peer can unambigu-
+    // ously recognize the heartbeat and never mistake it for tunnel data.
+    auto kb = build_keepalive_payload();
+    const size_t klen = kb.size();
     // ikcp_send returns the number of bytes queued (>= 0) on success, NOT 0 --
     // compare against < 0 or the throttle never engages and a keepalive is
     // injected on every 10ms tick once the interval passes.
-    if (kcp_.send(byte_view(kb, klen)) >= 0) {
+    if (kcp_.send(byte_view(kb.data(), klen)) >= 0) {
         last_keepalive_us_.store(now);
         LOG_DEBUG(log_module_, log_msg("keepalive sent"));
     }
+}
+
+// Keepalive body = magic || session_salt. Requires the salt (shared with the
+// peer); a tunnel that has not learned it (e.g. server before the first packet)
+// has an empty payload so nothing is forwarded as if it were a keepalive.
+std::vector<uint8_t> KcpTunnel::build_keepalive_payload() const {
+    std::vector<uint8_t> body;
+    const std::string_view magic = KCP_CONTROL_KEEPALIVE;
+    body.insert(body.end(), magic.begin(), magic.end());
+    const byte_view salt = crypto_->session_salt();
+    body.insert(body.end(), salt.begin(), salt.end());
+    return body;
+}
+
+bool KcpTunnel::is_keepalive(const uint8_t* data, size_t size) const {
+    const byte_view salt = crypto_->session_salt();
+    const size_t magic_len = std::strlen(KCP_CONTROL_KEEPALIVE);
+    if (size != magic_len + salt.size()) return false;
+    if (std::memcmp(data, KCP_CONTROL_KEEPALIVE, magic_len) != 0) return false;
+    if (salt.size() > 0 && std::memcmp(data + magic_len, salt.data(), salt.size()) != 0) return false;
+    return true;
 }
 
 } // namespace kcp_proxy

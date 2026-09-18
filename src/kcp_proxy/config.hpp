@@ -142,11 +142,14 @@ constexpr uint8_t SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED = 0x08;
 
 inline constexpr char KCP_CONTROL_HELLO[] = "KCP_PROXY_HELLO_V1";
 inline constexpr char KCP_CONTROL_HELLO_ACK[] = "KCP_PROXY_HELLO_ACK_V1";
-// Application-layer keepalive payload. Sent as its own KCP message when a tunnel
-// has been idle for KCP_KEEPALIVE_SEC. The receiver drops it instead of
-// forwarding it to the downstream TCP socket. NOTE: Android CPP_REMOTE must be
-// taught to recognize and drop this sentinel too, otherwise it would be
-// forwarded into the tunnel as garbage.
+// Application-layer keepalive magic. Sent as its own KCP message when a tunnel
+// has been idle for KCP_KEEPALIVE_SEC, with this session's 16-byte salt
+// appended (see KcpTunnel::build_keepalive_payload). The receiver drops an
+// exact `magic || session_salt` match instead of forwarding it to the
+// downstream TCP socket. Scoping with the per-session salt means a real payload
+// can never be mistaken for the heartbeat. NOTE: Android CPP_REMOTE must build
+// and drop the same `magic || session_salt` heartbeat too, otherwise it would
+// forward it into the tunnel as garbage.
 inline constexpr char KCP_CONTROL_KEEPALIVE[] = "KCP_PROXY_KEEPALIVE_V1";
 
 // One-line summary of the KCP settings actually in force, rendered from the

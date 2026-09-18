@@ -80,13 +80,16 @@ Failing to prepend/verify the salt will cause the server to reject traffic (salt
 
 To prevent a live but idle tunnel (e.g. an idle SSH session) from being reaped by the
 `KCP_TIMEOUT_SEC` (60s) idle sweep, each side sends an application-layer heartbeat when it has been
-silent for longer than `KCP_KEEPALIVE_SEC` (30s). The heartbeat payload is the sentinel
-`KCP_PROXY_KEEPALIVE_V1` ("KCP_PROXY_KEEPALIVE_V1"), sent as its own KCP message. The receiver recognizes
-this exact payload in `try_fulfill_read` and drops it instead of forwarding it into the downstream TCP
-socket.
+silent for longer than `KCP_KEEPALIVE_SEC` (30s). The heartbeat payload is the fixed magic
+`KCP_PROXY_KEEPALIVE_V1` immediately followed by this session's 16-byte `session_salt`, sent as its
+own KCP message. The receiver recognizes an exact match of `magic || session_salt` in
+`try_fulfill_read` and drops it instead of forwarding it into the downstream TCP socket. Scoping the
+sentinel with the per-session salt (unique random bytes shared by both peers) guarantees a genuine
+payload — even the bare 21-byte magic — can never be mistaken for a heartbeat, so no real stream data
+is ever silently dropped.
 
-**Android CPP_REMOTE must recognize and drop `KCP_PROXY_KEEPALIVE_V1`** as well; otherwise it would be
-forwarded into the tunnel as garbage data.
+**Android CPP_REMOTE must build and drop the same `magic || session_salt`** heartbeat; otherwise it
+would be forwarded into the tunnel as garbage data.
 
 ## SOCKS5
 

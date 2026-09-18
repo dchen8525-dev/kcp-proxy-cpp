@@ -121,6 +121,13 @@ protected:
     // Inject the application-layer keepalive if the cadence is due. Called from
     // the tick, after the handshake is done.
     void maybe_send_keepalive();
+    // Keepalive body = magic || session_salt (see is_keepalive).
+    std::vector<uint8_t> build_keepalive_payload() const;
+    // True if `data[0..size)` is this session's keepalive: the fixed magic
+    // string immediately followed by this session's salt. Scoping the sentinel
+    // with the per-session salt means a genuine payload can never collide with
+    // it -- only a peer that shares this session's salt can produce a match.
+    bool is_keepalive(const uint8_t* data, size_t size) const;
     void touch_activity();
 
     // "tag: text" when a tag is set (server sessions), just "text" otherwise.

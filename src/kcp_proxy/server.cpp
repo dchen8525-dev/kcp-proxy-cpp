@@ -972,7 +972,12 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
         LOG_DEBUG("server", session_id + ": backpressure (wait_send=" +
                   std::to_string(session->wait_send()) +
                   " >= threshold=" + std::to_string(KCP_BACKPRESSURE_THRESHOLD) + "), delaying read");
-        auto retry = std::make_shared<asio::steady_timer>(io_);
+        // Timer bound to the session strand so the retry callback serializes with
+        // the strand handlers that read session state (is_running/wait_send), and
+        // so stop()/io stop aborts it via operation_aborted instead of letting it
+        // fire on a replaced/stopped session. The handler still re-checks
+        // is_running() to cover the replaced-session case.
+        auto retry = std::make_shared<asio::steady_timer>(session->strand());
         retry->expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS * 4));
         auto self = shared_from_this();
         retry->async_wait([self, session_id = std::move(session_id), session,

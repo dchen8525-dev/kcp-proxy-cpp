@@ -737,7 +737,11 @@ void KCPProxyClient::forward_client_to_kcp(
                   std::to_string(session->wait_send()) +
                   " >= threshold=" + std::to_string(KCP_BACKPRESSURE_THRESHOLD) +
                   "), delaying read");
-        auto retry = std::make_shared<asio::steady_timer>(io_);
+        // Timer bound to the session strand: the back-pressure retry callback
+        // then serializes with every other strand handler that touches KCP/session
+        // state (is_connected, wait_send), and on shutdown it is completed with
+        // operation_aborted instead of lingering on the raw io_context.
+        auto retry = std::make_shared<asio::steady_timer>(session->strand());
         retry->expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS * 4));
         auto self = shared_from_this();
         retry->async_wait([self, client_socket, session, buf, guard, retry](const std::error_code& ec) mutable {
