@@ -144,6 +144,10 @@ let isRunning = false;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let isManualStop = false; // Track if user manually stopped
+// One in-flight connection test at a time. test-connection is idempotent and
+// only informative, so a second concurrent probe must not spawn another client
+// process (each would bind its own UDP/SOCKS ports and linger until timeout).
+let connectivityTestInFlight = false;
 
 // Path to kcp-proxy-client executable
 function getClientPath() {
@@ -483,11 +487,12 @@ async function startProxy(opts = {}) {
   const args = buildClientArgs({ serverHost, serverPort, localPort });
 
   try {
-    clientProcess = spawn(clientPath, args, {
+    const proc = spawn(clientPath, args, {
       cwd: path.dirname(clientPath),
       stdio: ['ignore', 'pipe', 'pipe'],
       env: buildClientEnv(key)
     });
+    clientProcess = proc;
 
     isRunning = true;
     updateStatus(true);
@@ -495,14 +500,14 @@ async function startProxy(opts = {}) {
 
     // Capture stdout (client rarely uses it — everything goes to stderr)
     const pushStdoutLine = createLogLineStream((line) => sendLog(line, 'info'));
-    clientProcess.stdout.on('data', (data) => pushStdoutLine(data));
+    proc.stdout.on('data', (data) => pushStdoutLine(data));
 
     // Capture stderr (client logs to stderr)
     const pushStderrLine = createLogLineStream(handleClientLine);
-    clientProcess.stderr.on('data', (data) => pushStderrLine(data));
+    proc.stderr.on('data', (data) => pushStderrLine(data));
 
     // Handle process exit
-    clientProcess.on('close', (code) => {
+    proc.on('close', (code) => {
       isRunning = false;
       updateStatus(false);
       if (isManualStop) {
@@ -516,7 +521,10 @@ async function startProxy(opts = {}) {
       } else {
         sendLog(`进程已退出 (代码: ${code})`, 'warn');
       }
-      clientProcess = null;
+      // Only clear the reference if it still points at THIS process: a stop/
+      // start within this close window would otherwise null out a freshly
+      // started proxy.
+      if (clientProcess === proc) clientProcess = null;
 
       // Auto reconnect if enabled and not manually stopped
       if (!isManualStop && store.get('autoReconnect')) {
@@ -524,11 +532,11 @@ async function startProxy(opts = {}) {
       }
     });
 
-    clientProcess.on('error', (err) => {
+    proc.on('error', (err) => {
       isRunning = false;
       updateStatus(false);
       sendLog(`进程启动失败: ${err.message}`, 'error');
-      clientProcess = null;
+      if (clientProcess === proc) clientProcess = null;
 
       // Auto reconnect on error
       if (!isManualStop && store.get('autoReconnect')) {
@@ -541,7 +549,55 @@ async function startProxy(opts = {}) {
   }
 }
 
-// Stop proxy client process
+// Gracefully stop a spawned client process and wait for it to actually exit:
+// SIGTERM first, escalate to SIGKILL after `graceMs` if still running, and
+// resolve when it is gone. The escalation timer is cancelled the moment the
+// process exits, so it can never dangle holding a dead ChildProcess reference
+// (the old inline setTimeout in stopProxy leaked one pending timer per stop).
+// Resolves with whether a process was present and stopped.
+function terminateClientProcess(proc, graceMs = 3000) {
+  return new Promise((resolve) => {
+    if (!proc || proc.exitCode !== null) {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    let escalateTimer = null;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (escalateTimer) clearTimeout(escalateTimer);
+      resolve(true);
+    };
+
+    escalateTimer = setTimeout(() => {
+      // exitCode === null means still running. (subprocess.killed is true the
+      // moment SIGTERM is *delivered*, so a !killed check would be unreachable
+      // on POSIX once SIGTERM is sent.) SIGKILL second, then resolve shortly
+      // after -- close may already have fired, or the kill failed silently.
+      if (proc.exitCode === null) {
+        try { proc.kill('SIGKILL'); } catch { /* already dying */ }
+        setTimeout(finish, 250);
+      } else {
+        finish();
+      }
+    }, graceMs);
+
+    proc.once('close', finish);
+    proc.once('error', finish);
+    try {
+      proc.kill('SIGTERM');
+    } catch (err) {
+      // Rarely, a process that already exited races the kill; treat as done.
+      finish();
+    }
+  });
+}
+
+// Stop proxy client process. Returns a Promise that resolves once the child has
+// actually exited (true if one was running, false if there was nothing to stop),
+// so callers can react to real shutdown state instead of a hard-coded value.
 function stopProxy() {
   isManualStop = true; // Mark as manual stop to prevent auto reconnect
   reconnectAttempts = 0;
@@ -550,29 +606,18 @@ function stopProxy() {
     reconnectTimer = null;
   }
 
-  if (!clientProcess) {
+  // Capture THIS process: the module-level clientProcess may already point to
+  // a new process if the user restarts within the stop window, and killing that
+  // would murder a freshly started proxy. terminateClientProcess cleans up its
+  // own escalation timer, so rapid start/stop cycles don't accumulate timers.
+  const proc = clientProcess;
+  if (!proc) {
     isRunning = false;
     updateStatus(false);
-    return;
+    return Promise.resolve(false);
   }
 
-  try {
-    // Capture THIS process: the module-level clientProcess may already point
-    // to a new process if the user restarts within the 3s window, and killing
-    // that would murder a freshly started proxy.
-    const proc = clientProcess;
-    proc.kill('SIGTERM');
-    setTimeout(() => {
-      // exitCode === null means still running. (subprocess.killed is true the
-      // moment SIGTERM is *delivered*, so the old !killed check made this
-      // escalation unreachable on POSIX.)
-      if (proc.exitCode === null) {
-        proc.kill('SIGKILL');
-      }
-    }, 3000);
-  } catch (err) {
-    sendLog(`停止失败: ${err.message}`, 'error');
-  }
+  return terminateClientProcess(proc);
 }
 
 // Schedule auto reconnect
@@ -747,9 +792,10 @@ ipcMain.handle('start-proxy', async () => {
   return isRunning;
 });
 
-ipcMain.handle('stop-proxy', () => {
-  stopProxy();
-  return false;
+ipcMain.handle('stop-proxy', async () => {
+  // stopProxy resolves once the child has truly exited; surface that as the
+  // IPC result so the renderer sees real shutdown state (was something stopped?).
+  return stopProxy();
 });
 
 ipcMain.handle('get-status', () => isRunning);
@@ -774,6 +820,7 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
     let timer = null;
     let proc = null;
     let probeSock = null;
+    let probeDriven = false; // guard: connect to the probe listener at most once
 
     const finish = (result) => {
       if (settled) return;
@@ -824,8 +871,14 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
 
     // The client logs to stderr (line-streamed, UTF-8/GBK aware).
     const pushProbeLine = createLogLineStream((line) => {
-      // Listener is up (logged after listen()) → trigger the handshake.
-      if (line.includes('SOCKS5 proxy listening')) driveProbe();
+      // Listener is up (logged after listen()) → trigger the handshake. The
+      // 'SOCKS5 proxy listening' line may be emitted more than once (or split
+      // across chunks), so only drive the probe the first time — each driveProbe
+      // opens its own net.connect and leaks a socket unless it is destroyed.
+      if (line.includes('SOCKS5 proxy listening') && !probeDriven) {
+        probeDriven = true;
+        driveProbe();
+      }
       if (line.includes('KCP handshake confirmed')) {
         finish({ ok: true, message: `连接成功: KCP 握手确认 (${host}:${port})` });
         return;
@@ -862,6 +915,20 @@ function getFreePort() {
 }
 
 ipcMain.handle('test-connection', async (event, host, port) => {
+  if (connectivityTestInFlight) {
+    return { ok: false, message: '已有连接测试正在进行，请稍候' };
+  }
+  connectivityTestInFlight = true;
+  try {
+    return await runConnectivityTest(host, port);
+  } finally {
+    connectivityTestInFlight = false;
+  }
+});
+
+// The actual probe work, guarded by the connectivityTestInFlight lock so only
+// one test-connection can run concurrently.
+async function runConnectivityTest(host, port) {
   const h = (host || store.get('serverHost') || '').trim();
   const p = parseInt(port || store.get('serverPort'), 10);
 
@@ -900,7 +967,7 @@ ipcMain.handle('test-connection', async (event, host, port) => {
   }
 
   return probeKcpHandshake(clientPath, h, p);
-});
+}
 
 ipcMain.on('window-minimize', () => {
   mainWindow?.minimize();
@@ -1069,7 +1136,7 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   app.isQuitting = true;
   // Suppress auto-reconnect: the child's 'close' handler would otherwise call
   // scheduleReconnect() and could spawn a fresh client while the app exits.
@@ -1078,8 +1145,19 @@ app.on('before-quit', () => {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-  if (clientProcess) {
-    clientProcess.kill();
+
+  // Wait for the proxy child to actually exit before quitting. Otherwise the
+  // kill is fire-and-forget and the client can linger holding the local SOCKS
+  // port. preventDefault + a bounded grace keeps quit responsive even if the
+  // child never exits on its own. Null out clientProcess first so the second
+  // app.quit() (which re-fires before-quit) can never re-enter this path.
+  const proc = clientProcess;
+  if (proc) {
+    event.preventDefault();
+    clientProcess = null;
+    terminateClientProcess(proc).finally(() => {
+      app.quit();
+    });
   }
 });
 
