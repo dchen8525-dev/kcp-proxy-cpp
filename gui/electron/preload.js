@@ -2,10 +2,16 @@ const { contextBridge, ipcRenderer } = require('electron');
 const { formatBytes, validateLaunchConfig } = require('./utils');
 
 // Track registered listeners for cleanup
+const channelListeners = new Map();
+
 function safeOn(channel, callback) {
-  // Remove previous listener for this channel to prevent leaks
-  ipcRenderer.removeAllListeners(channel);
-  ipcRenderer.on(channel, (event, data) => callback(data));
+  // Remove only the listener this helper registered for the channel — a
+  // blanket removeAllListeners(channel) would also wipe any other subscriber.
+  const prev = channelListeners.get(channel);
+  if (prev) ipcRenderer.removeListener(channel, prev);
+  const listener = (event, data) => callback(data);
+  channelListeners.set(channel, listener);
+  ipcRenderer.on(channel, listener);
 }
 
 // Expose protected methods to renderer

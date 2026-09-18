@@ -363,7 +363,10 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
 std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>& out) noexcept {
     try {
         if (ciphertext.size() < SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE) {
-            LOG_ERROR("crypto", fmt::format("decrypt: ciphertext too short ({} < {})",
+            // Per-packet attacker-controlled input: callers log throttled
+            // rejections (server auth path, session data path), so keep this
+            // at DEBUG to avoid an unthrottled per-datagram log flood.
+            LOG_DEBUG("crypto", fmt::format("decrypt: ciphertext too short ({} < {})",
                       ciphertext.size(), SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE));
             return std::make_error_code(std::errc::invalid_argument);
         }
@@ -445,7 +448,9 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
 
         int final_len = 0;
         if (EVP_DecryptFinal_ex(*decrypt_ctx_, out.data() + out_len, &final_len) <= 0) {
-            LOG_ERROR("crypto", fmt::format("decrypt: AEAD tag verification failed (corrupted/wrong key), counter={}", counter));
+            // Tag failure on attacker-controlled datagrams is routine noise;
+            // callers emit throttled rejections, so keep this at DEBUG.
+            LOG_DEBUG("crypto", fmt::format("decrypt: AEAD tag verification failed (corrupted/wrong key), counter={}", counter));
             out.clear();
             return make_error_code(crypto_errors::errc::auth_failed);
         }

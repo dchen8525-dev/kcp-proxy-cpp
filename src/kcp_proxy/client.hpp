@@ -95,6 +95,11 @@ private:
     // no teardown path needs an explicit deregistration hook. The snapshot
     // buffer is reused every tick (never reallocated in steady state).
     asio::steady_timer update_tick_timer_;
+    // Accept-error backoff: on a persistent accept failure (e.g. fd exhaustion)
+    // the acceptor re-arms through this short timer instead of busy-spinning
+    // with one unthrottled log per iteration (mirrors the server's UDP receive
+    // backoff). Cancelled in stop().
+    asio::steady_timer accept_retry_timer_;
     std::unordered_map<KCPClientSession*, std::weak_ptr<KCPClientSession>> tick_sessions_;
     std::shared_mutex tick_sessions_mutex_;
     std::vector<std::weak_ptr<KCPClientSession>> tick_snapshot_;

@@ -35,6 +35,10 @@ void KCPClientSession::connect(std::function<void(bool)> handler) {
 }
 
 void KCPClientSession::on_connect(std::function<void(bool)> handler) {
+    // Created before the try so the catch can still deliver the callback if an
+    // exception escapes after the handler was moved here (a moved-from
+    // std::function would silently swallow the notification).
+    auto completion = std::make_shared<std::function<void(bool)>>(std::move(handler));
     try {
         udp_socket_.emplace(strand());
         const auto protocol = server_addr_.protocol();
@@ -78,7 +82,6 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
 
         auto ack_buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
         auto self = shared_from_this();
-        auto completion = std::make_shared<std::function<void(bool)>>(std::move(handler));
         async_read_some(asio::buffer(*ack_buf),
             [this, self, ack_buf, completion](const std::error_code& ec, size_t bytes) mutable {
                 // Timer may have already cancelled the pending read. If the
@@ -137,7 +140,14 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
             udp_socket_->close(ignored);
             udp_socket_.reset();
         }
-        if (handler) handler(false);
+        // Deliver the failure through `completion`: `handler` was moved into
+        // it above and may be empty here. connect_pending_ was cleared by
+        // on_close(), so the async read/timer handlers cannot fire it twice.
+        if (*completion) {
+            auto h = std::move(*completion);
+            *completion = nullptr;
+            h(false);
+        }
     }
 }
 
@@ -278,7 +288,9 @@ void KCPClientSession::on_receive(byte_view packet) {
     }
     if (ec) {
         metrics_.decrypt_errors.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR("kcp_client", "UDP receive error: " + ec.message());
+        // Same packet-level noise class as KCPSession::on_receive: keep at
+        // DEBUG, the decrypt_errors metric stays the INFO-visible signal.
+        LOG_DEBUG("kcp_client", "UDP decrypt failed: " + ec.message());
         return;
     }
     touch_activity();

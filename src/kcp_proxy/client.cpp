@@ -33,7 +33,7 @@ KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host,
       key_(std::move(key)), listen_host_(std::move(listen_host)),
       listen_port_(listen_port), half_close_grace_sec_(half_close_grace_sec),
       tcp_acceptor_(io_), udp_resolver_(io_), traffic_timer_(io),
-      update_tick_timer_(io) {
+      update_tick_timer_(io), accept_retry_timer_(io) {
 }
 
 KCPProxyClient::~KCPProxyClient() {
@@ -58,6 +58,7 @@ void KCPProxyClient::stop() {
     tcp_acceptor_.close(ec);
     traffic_timer_.cancel(ec);
     update_tick_timer_.cancel(ec);
+    accept_retry_timer_.cancel(ec);
 
     // Close every live session. Each one owns a UDP socket and KCP state; with
     // nothing here they only went away when the process did, so a graceful
@@ -180,7 +181,13 @@ void KCPProxyClient::do_accept() {
             if (ec) {
                 if (running_) {
                     LOG_ERROR("client", "accept error: " + ec.message());
-                    do_accept();
+                    // Back off before re-arming: a persistent accept failure
+                    // (e.g. fd exhaustion) would otherwise busy-spin with one
+                    // log per iteration. The timer is cancelled in stop().
+                    accept_retry_timer_.expires_after(std::chrono::milliseconds(10));
+                    accept_retry_timer_.async_wait([this, self](const std::error_code& wait_ec) {
+                        if (!wait_ec) do_accept();
+                    });
                 }
                 return;
             }
@@ -335,7 +342,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                 if (ver != SOCKS5_VERSION) {
                     LOG_ERROR("client", "bad SOCKS5 version: " + std::to_string(ver));
                     auto ver_resp = std::make_shared<std::array<uint8_t, 2>>();
-                    (*ver_resp)[0] = 0x00;
+                    (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
                         [this, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
@@ -366,16 +373,31 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                             return;
                         }
 
-                        LOG_INFO("client", "sending SOCKS5 greeting response (no auth)");
+                        // RFC 1928: select NO AUTHENTICATION only if the
+                        // client actually offered it; otherwise reply 0xFF
+                        // and close.
+                        bool no_auth_offered = false;
+                        for (uint8_t m : *methods_buf) {
+                            if (m == SOCKS5_AUTH_NONE) { no_auth_offered = true; break; }
+                        }
+
+                        LOG_INFO("client", std::string("sending SOCKS5 greeting response (") +
+                                 (no_auth_offered ? "no auth" : "no acceptable methods") + ")");
                         auto resp_buf = std::make_shared<std::array<uint8_t, 2>>();
                         (*resp_buf)[0] = SOCKS5_VERSION;
-                        (*resp_buf)[1] = SOCKS5_AUTH_NONE;
+                        (*resp_buf)[1] = no_auth_offered ? SOCKS5_AUTH_NONE
+                                                         : SOCKS5_AUTH_NO_ACCEPTABLE;
                         asio::async_write(*client, asio::buffer(*resp_buf),
-                            [this, client, session, resp_buf, handshake_deadline, handshake_cancelled, self]
+                            [this, client, session, resp_buf, handshake_deadline, handshake_cancelled, self, no_auth_offered]
                             (const std::error_code& ec3, size_t) {
                                 if (handshake_cancelled->load()) return;
                                 if (ec3) {
                                     LOG_DEBUG("client", "send greeting error (" + sock_err(ec3) + ")");
+                                    abort_handshake(client, session, handshake_deadline, handshake_cancelled);
+                                    return;
+                                }
+                                if (!no_auth_offered) {
+                                    LOG_WARNING("client", "client offered no usable auth method, closing");
                                     abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                                     return;
                                 }
@@ -559,6 +581,15 @@ void KCPProxyClient::read_socks5_reply(
 
             const auto parsed = parse_socks5_reply(*accum);
             if (parsed.status == SOCKS5ReplyStatus::NeedMore) {
+                // Cap accumulation: a reply that never completes would grow
+                // memory one KCP message at a time. The server-side request
+                // parser rejects past FWD_BUF_SIZE the same way.
+                if (accum->size() > FWD_BUF_SIZE) {
+                    LOG_ERROR("client", "SOCKS5 reply too large (" +
+                              std::to_string(accum->size()) + " bytes), failing");
+                    fail_with_reply(SOCKS5_REPLY_GENERAL_FAILURE);
+                    return;
+                }
                 // Truncated reply: keep reading. Acting on the first two bytes
                 // treated a half-received reply as success.
                 read_socks5_reply(client_socket, session, accum, handshake_start,
@@ -793,6 +824,12 @@ void KCPProxyClient::forward_kcp_to_client(
                 } else if (ec) {
                     LOG_ERROR("client", "KCP read error: " + ec.message());
                 }
+                // Tunnel over: release the half-close grace timer so it does
+                // not pin this teardown's captures until the deadline fires.
+                if (guard) {
+                    std::error_code timer_ec;
+                    guard->deadline.cancel(timer_ec);
+                }
                 std::error_code ignored;
                 client_socket->close(ignored);
                 session->close();
@@ -825,6 +862,10 @@ void KCPProxyClient::forward_kcp_to_client(
                         // socket open while forward_client_to_kcp keeps reading
                         // into the dead session (send_data silently no-ops) —
                         // a black-hole connection for the local app.
+                        if (guard) {
+                            std::error_code timer_ec;
+                            guard->deadline.cancel(timer_ec);
+                        }
                         std::error_code ignored;
                         client_socket->close(ignored);
                         session->close();

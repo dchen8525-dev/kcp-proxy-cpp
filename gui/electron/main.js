@@ -33,7 +33,19 @@ class ConfigStore {
     try {
       const raw = fs.readFileSync(this.filePath, 'utf-8');
       this._data = { ...this.defaults, ...JSON.parse(raw) };
-    } catch {
+    } catch (err) {
+      // ENOENT is a normal first run; anything else (truncated/corrupt JSON)
+      // must not silently reset the user's settings — warn and preserve the
+      // file for forensics before falling back to defaults.
+      if (err && err.code !== 'ENOENT') {
+        console.error('Config file unreadable, resetting to defaults:', err.message);
+        try {
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          fs.renameSync(this.filePath, `${this.filePath}.corrupt-${stamp}`);
+        } catch (backupErr) {
+          console.error('Failed to back up corrupt config:', backupErr.message);
+        }
+      }
       this._data = { ...this.defaults };
     }
   }
@@ -52,7 +64,11 @@ class ConfigStore {
     try {
       const dir = path.dirname(this.filePath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(this.filePath, JSON.stringify(this._data, null, 2), 'utf-8');
+      // Atomic write: tmp file + rename (same volume, so atomic on Windows).
+      // A crash mid-write then damages only the tmp file, never config.json.
+      const tmpPath = this.filePath + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(this._data, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, this.filePath);
     } catch (err) {
       console.error('Failed to save config:', err.message);
     }
@@ -565,8 +581,17 @@ function scheduleReconnect() {
   // 'close' for the same process, which would otherwise burn two attempts.
   if (reconnectTimer) return;
 
-  const maxAttempts = store.get('maxReconnectAttempts');
-  const delay = store.get('reconnectDelay');
+  // These values come from user-editable config.json: coerce and clamp, or a
+  // hand-corrupted value (e.g. "reconnectDelay": "abc") becomes NaN →
+  // setTimeout(0) → a tight spawn-fail-respawn storm.
+  const rawMax = Number(store.get('maxReconnectAttempts'));
+  const maxAttempts = Number.isFinite(rawMax)
+    ? Math.min(Math.max(Math.trunc(rawMax), 0), 100)
+    : store.defaults.maxReconnectAttempts;
+  const rawDelay = Number(store.get('reconnectDelay'));
+  const delay = Number.isFinite(rawDelay)
+    ? Math.min(Math.max(rawDelay, 1000), 60000)
+    : store.defaults.reconnectDelay;
 
   // Check if max attempts reached (0 = unlimited)
   if (maxAttempts > 0 && reconnectAttempts >= maxAttempts) {
@@ -641,6 +666,7 @@ function decodeLogLine(buf) {
 
 // Split client output into complete lines across chunk events. Chunks are not
 // guaranteed to be line-aligned, so a partial trailing line is buffered.
+const MAX_PENDING_LOG_BYTES = 1024 * 1024;
 function createLogLineStream(onLine) {
   let pending = Buffer.alloc(0);
   return (chunk) => {
@@ -654,6 +680,13 @@ function createLogLineStream(onLine) {
       }
       const text = decodeLogLine(line);
       if (text.trim()) onLine(text);
+    }
+    // A line that never terminates would grow this buffer without bound;
+    // flush it as its own line so memory stays capped (nothing is dropped).
+    if (pending.length > MAX_PENDING_LOG_BYTES) {
+      const text = decodeLogLine(pending);
+      if (text.trim()) onLine(text);
+      pending = Buffer.alloc(0);
     }
   };
 }
@@ -861,7 +894,9 @@ ipcMain.handle('test-connection', async (event, host, port) => {
   // 2) End-to-end KCP handshake probe (requires the client binary).
   const clientPath = getClientPath();
   if (!clientPath) {
-    return { ok: true, message: `域名解析成功 (${h} → ${address})；未找到客户端程序，无法测试 UDP 握手` };
+    // DNS alone is not a passed connection test: without the client binary the
+    // KCP handshake was never exercised, so this must not render as success.
+    return { ok: false, message: `域名解析成功 (${h} → ${address})，但未找到客户端程序，无法测试 UDP 握手` };
   }
 
   return probeKcpHandshake(clientPath, h, p);
@@ -881,9 +916,15 @@ ipcMain.on('window-maximize', () => {
 });
 
 ipcMain.on('window-close', () => {
-  if (mainWindow) {
-    mainWindow.hide();
+  if (!mainWindow) return;
+  // Same guard as the 'close' handler above: with no tray (createTray failed,
+  // e.g. Linux without a status notifier), hiding leaves no way to bring the
+  // window back — close for real instead.
+  if (!tray) {
+    mainWindow.close();
+    return;
   }
+  mainWindow.hide();
 });
 
 // ── App lifecycle ──
@@ -1001,7 +1042,10 @@ function removeLegacyAutoStartEntry() {
   if (process.platform !== 'win32' || store.get('legacyAutoStartCleared')) return;
   store.set('legacyAutoStartCleared', true);
   const regKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
-  spawn('reg', ['delete', regKey, '/v', 'KcpProxyGui', '/f'], {
+  // Absolute path: a bare 'reg' resolves through PATH/CWD search order, and a
+  // writable install dir (per-user install) could shadow System32\reg.exe.
+  const regExe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe');
+  spawn(regExe, ['delete', regKey, '/v', 'KcpProxyGui', '/f'], {
     windowsHide: true
   }).on('error', (err) => sendLog(`清除遗留开机自启项失败: ${err.message}`, 'warn'));
 }

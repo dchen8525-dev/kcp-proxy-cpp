@@ -107,7 +107,10 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
     }
     if (ec) {
         metrics_.decrypt_errors.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR("kcp_session", fmt::format("FAIL_STAGE=DECRYPT_FAILED ERROR={} CLIENT_ENDPOINT={} TARGET=-",
+        // Per-packet attacker-controlled noise: the decrypt_errors metric
+        // above remains the INFO-visible signal, so keep the log at DEBUG
+        // (AGENTS.md §8: no per-packet spam at INFO).
+        LOG_DEBUG("kcp_session", fmt::format("FAIL_STAGE=DECRYPT_FAILED ERROR={} CLIENT_ENDPOINT={} TARGET=-",
                     ec.message(), session_id_));
         return;
     }

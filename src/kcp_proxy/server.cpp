@@ -246,6 +246,11 @@ void KCPServer::handle_receive(const std::error_code& ec, size_t bytes_transferr
         return;
     }
 
+    // stop() may have run while this receive was in flight: its session maps
+    // are already swapped out, so routing now would insert an orphaned session
+    // that is never ticked or swept.
+    if (!running_) return;
+
     auto endpoint = recv_endpoint_;
     byte_view data(udp_recv_buf_.data(), bytes_transferred);
 
