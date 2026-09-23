@@ -297,6 +297,18 @@ std::shared_ptr<KCPSession> KCPServer::route_datagram(
     return session;
 }
 
+void KCPServer::drop_replaced_target_locked(const std::string& sid) {
+    auto conn_it = connections_.find(sid);
+    if (conn_it == connections_.end()) {
+        return;
+    }
+    if (conn_it->second.tcp_socket && conn_it->second.tcp_socket->is_open()) {
+        std::error_code close_ec;
+        conn_it->second.tcp_socket->close(close_ec);
+    }
+    connections_.erase(conn_it);
+}
+
 std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,
     bool& already_consumed) {
@@ -320,43 +332,41 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     }
 
     // Slow path: session missing or stale. Take the write lock to mutate.
+    //
+    // A LIVE session at this endpoint that is speaking a DIFFERENT salt is
+    // either a genuine reconnect (the client reused its ephemeral source port)
+    // or a forged datagram sent from a spoofed source. The salt rides in
+    // cleartext, so the two are indistinguishable here -- and this check runs
+    // BEFORE the auth decrypt below, which means acting on it would let a
+    // single unauthenticated datagram tear down a live tunnel and its upstream
+    // TCP connection (unthrottled: this is also upstream of the auth rate
+    // limiter). So do NOT evict a live incumbent here. Remember that one exists
+    // and replace it after the packet authenticates; only a dead/stopped
+    // session, which holds nothing worth protecting, is reclaimed now.
+    bool live_salt_mismatch = false;
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
         auto it = sessions_.find(sid);
         if (it != sessions_.end()) {
-            // Reuse the existing session only if it is alive AND speaking the
-            // same session salt. Otherwise (dead/stopped, or a new session
-            // colliding after a reconnect) close it and let a new one be
-            // created below.
-            if (it->second && it->second->is_alive() && it->second->is_running() &&
-                it->second->salt_matches(encrypted_packet)) {
-                return it->second;
-            }
-            // Session is dead/stopped or salt-mismatched - clean it up.
-            LOG_DEBUG("server", sid + ": stale or salt-mismatched session found, replacing");
-            if (it->second) {
-                it->second->stop();
-            }
-            sessions_.erase(it);
-            // Close the replaced session's upstream TCP socket too (do_cleanup
-            // does the same for idle-reaped sessions). Erasing the connections_
-            // entry alone would orphan the socket: the forward_tcp_to_kcp loop
-            // holds its own shared_ptr to it, and since close_connection can no
-            // longer find the entry, the target connection would stay open
-            // until the remote end closed it on its own. Closing here also
-            // aborts the old session's pending reads/writes on that socket, so
-            // a mid-connect old session can never re-insert connections_[sid]
-            // after the new session took over the endpoint.
-            auto conn_it = connections_.find(sid);
-            if (conn_it != connections_.end()) {
-                if (conn_it->second.tcp_socket && conn_it->second.tcp_socket->is_open()) {
-                    std::error_code close_ec;
-                    conn_it->second.tcp_socket->close(close_ec);
+            if (it->second && it->second->is_alive() && it->second->is_running()) {
+                if (it->second->salt_matches(encrypted_packet)) {
+                    return it->second;
                 }
-                connections_.erase(conn_it);
+                live_salt_mismatch = true;
+            } else {
+                LOG_DEBUG("server", sid + ": stale session found, replacing");
+                if (it->second) {
+                    it->second->stop();
+                }
+                sessions_.erase(it);
+                drop_replaced_target_locked(sid);
             }
         }
-        if (sessions_.size() >= MAX_CONCURRENT_SESSIONS) {
+        // The replacement below drops the incumbent, so it does not count
+        // against the cap.
+        const size_t effective =
+            sessions_.size() - (live_salt_mismatch ? size_t{1} : size_t{0});
+        if (effective >= MAX_CONCURRENT_SESSIONS) {
             LOG_WARNING("server", fmt::format("session cap reached ({}) dropping packet from {}",
                         MAX_CONCURRENT_SESSIONS, sid));
             return nullptr;
@@ -427,7 +437,20 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         // beaten us here in a different I/O thread.
         auto it = sessions_.find(sid);
         if (it != sessions_.end()) {
-            return it->second;
+            if (it->second && it->second->is_alive() && it->second->is_running() &&
+                it->second->salt_matches(encrypted_packet)) {
+                return it->second;
+            }
+            // This packet decrypted, so it is genuine: a live session still
+            // holding this endpoint under a different salt is a real reconnect
+            // on a reused source port rather than a forgery, and replacing it
+            // is exactly what the deferred eviction above was waiting for.
+            LOG_DEBUG("server", sid + ": authenticated reconnect, replacing session");
+            if (it->second) {
+                it->second->stop();
+            }
+            sessions_.erase(it);
+            drop_replaced_target_locked(sid);
         }
         if (sessions_.size() >= MAX_CONCURRENT_SESSIONS) {
             LOG_WARNING("server", "session cap reached (" +
@@ -440,9 +463,10 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         // salt, a malicious client could force a same-key session against a live
         // target by simply reusing its salt, and AES-GCM nonce/IV reuse would be
         // catastrophic. Refuse to create a session whose salt a live session
-        // already claims. (The first slow-path block above already erased any
-        // dead or salt-mismatched session for this endpoint, so a client
-        // reconnecting on the same source port with a fresh salt is unaffected.)
+        // already claims. (Any dead session for this endpoint, or a live one
+        // this authenticated packet is replacing, was already erased above, so
+        // a client reconnecting on the same source port with a fresh salt is
+        // unaffected.)
         for (const auto& [other_sid, other] : sessions_) {
             if (other_sid == sid) continue;
             if (other && other->is_alive() && other->is_running() &&

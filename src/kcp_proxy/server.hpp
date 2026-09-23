@@ -127,6 +127,16 @@ private:
     std::shared_ptr<KCPSession> get_or_create_session(
         const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,
         bool& already_consumed);
+    // Close and forget the upstream TCP socket registered under `sid`, as part
+    // of replacing the session that owned it. Caller must hold sessions_mutex_
+    // exclusively. Erasing the connections_ entry alone would orphan the
+    // socket: the forward_tcp_to_kcp loop holds its own shared_ptr to it, and
+    // once the entry is gone close_connection can no longer find it, so the
+    // target connection would stay open until the remote end closed it.
+    // Closing here also aborts the old session's pending reads/writes on that
+    // socket, so a mid-connect old session can never re-insert connections_[sid]
+    // after the new session took over the endpoint.
+    void drop_replaced_target_locked(const std::string& sid);
     void handle_kcp_data(std::shared_ptr<KCPSession> session,
                          const asio::ip::udp::endpoint& sender);
     void handle_socks5_request(std::shared_ptr<KCPSession> session);
