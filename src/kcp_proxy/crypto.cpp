@@ -143,11 +143,19 @@ void Crypto::derive_session_keys(byte_view session_salt) {
                 dec_info, decrypt_key_.data(), decrypt_key_.size());
 
     // Per-session starting counter, derived from the salt (first 6 bytes,
-    // big-endian, so it stays below MAX_COUNTER = 2^48). The counter fills the
-    // nonce, so embedding the salt here makes each session's nonce sequence
-    // unique. Combined with the server's duplicate-salt rejection, two sessions
-    // can never reuse a nonce/IV pair even if a malicious client tries to force
-    // a shared key by reusing another session's salt.
+    // big-endian, so it stays below MAX_COUNTER = 2^48).
+    //
+    // This derivation does NOT make the nonce sequence unique across sessions
+    // that share a salt. The key is HKDF(PSK, APP_SALT || salt) and this counter
+    // is a pure function of that same salt, so two sessions with an identical
+    // salt end up with the same key AND the same IV sequence -- the derivation
+    // adds nothing, because a different salt already implied a different key.
+    // The salt being unique per session is therefore load-bearing, and the only
+    // thing enforcing it is the duplicate-salt rejection in
+    // KCPServer::get_or_create_session, which covers LIVE sessions only: a peer
+    // that reuses a salt sequentially gets a fresh session with a recycled IV
+    // sequence, and nothing here can detect it. (The docs mandate a fresh random
+    // salt per session for exactly this reason.)
     uint64_t start_counter = 0;
     for (int i = 0; i < 6; ++i) {
         start_counter = (start_counter << 8) | session_salt[i];
@@ -175,7 +183,17 @@ void Crypto::derive_session_keys(byte_view session_salt) {
     }
 }
 
-Crypto::~Crypto() = default;
+Crypto::~Crypto() {
+    // Wipe the DERIVED traffic keys, not just the PSK. derive_session_keys()
+    // cleanses key_ as soon as the key schedule is baked into the EVP contexts,
+    // but encrypt_key_/decrypt_key_ are the keys that actually protect the
+    // traffic, and every session's Crypto is heap-allocated -- so without this
+    // they stayed readable in freed heap (and in any core dump) long after the
+    // session ended. session_salt_ is carried in cleartext on the wire and
+    // needs no wiping.
+    OPENSSL_cleanse(encrypt_key_.data(), encrypt_key_.size());
+    OPENSSL_cleanse(decrypt_key_.data(), decrypt_key_.size());
+}
 
 std::array<uint8_t, NONCE_SIZE> Crypto::generate_nonce(uint64_t counter, uint8_t direction) {
     std::array<uint8_t, NONCE_SIZE> nonce{};

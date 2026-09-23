@@ -74,15 +74,17 @@ public:
     Crypto& operator=(Crypto&&) = delete;
 
     // Wire format: [session_salt(16)] + [nonce(12)] + [ciphertext + tag(16)]
-    // session_salt is carried in cleartext and is unique per session; both
+    // session_salt is carried in cleartext and MUST be unique per session; both
     // peers derive the per-session AEAD key from PSK + session_salt via
-    // HKDF-SHA256. This guarantees every session uses an independent key, so
-    // counter/nonce values never collide across sessions (AES-GCM nonce reuse
-    // would otherwise be catastrophic). The client generates the salt and
-    // sends it on every datagram; the server learns it from the first packet.
-    // The nonce counter's starting value is derived from the salt (see
-    // crypto.cpp derive_session_keys), so the nonce sequence is session-unique
-    // even between sessions that were forced to share a key.
+    // HKDF-SHA256, so a unique salt means an independent key and no
+    // cross-session nonce collision (AES-GCM nonce reuse would otherwise be
+    // catastrophic). The client generates the salt and sends it on every
+    // datagram; the server learns it from the first packet.
+    // The nonce counter's starting value is derived from that same salt (see
+    // crypto.cpp derive_session_keys), which is why salt uniqueness is
+    // load-bearing rather than a nicety: two sessions that share a salt share
+    // both the key and the IV sequence, and nothing in this class can detect
+    // it. The server's duplicate-salt rejection covers live sessions only.
 
     // Exception-throwing versions (compatible with existing code)
     [[nodiscard]] std::vector<uint8_t> encrypt(byte_view plaintext);
