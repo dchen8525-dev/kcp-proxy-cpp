@@ -3,7 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'">
+  <!-- style-src keeps 'unsafe-inline' because it is harmless here and removing
+       it has bitten frameless windows before; the directives that actually
+       close vectors are the explicit none's below. object-src/base-uri/
+       form-action are not covered by default-src in every engine, and nothing
+       in this UI embeds a plugin, uses a <base> tag, or submits a form. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>KCP Proxy Client</title>
   <link rel="stylesheet" href="styles.css">
 </head>

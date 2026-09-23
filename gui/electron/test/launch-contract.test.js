@@ -42,14 +42,20 @@ test('buildClientArgs emits exactly the connect parameters', () => {
 });
 
 test('buildClientArgs never carries the key on the command line', () => {
+  // A `key` is passed in on purpose: buildClientArgs takes none today, so this
+  // pins that adding one cannot start forwarding the secret without failing
+  // here. (Without it the value scan below was vacuous -- it could never fire.)
   const args = buildClientArgs({
-    serverHost: 'h', serverPort: '8388', localPort: '1080'
+    serverHost: 'h', serverPort: '8388', localPort: '1080', key: GUI_KEY
   });
-  assert.ok(!args.includes('-k'), "'-k' must not be in the client argv");
-  assert.ok(!args.includes('--key'), "'--key' must not be in the client argv");
+
   for (const arg of args) {
     assert.ok(!arg.includes(GUI_KEY),
       `the key value must never leak into argv (saw it in ${JSON.stringify(arg)})`);
+    // Catches the joined forms a token scan alone would miss:
+    // `--key=<secret>` and `-k<secret>`.
+    assert.ok(!arg.startsWith('--key') && !arg.startsWith('-k'),
+      `no key flag may appear in argv (saw ${JSON.stringify(arg)})`);
   }
 });
 

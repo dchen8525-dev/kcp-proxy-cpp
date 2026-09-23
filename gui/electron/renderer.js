@@ -129,7 +129,11 @@ function setupIPCHandlers() {
   });
 }
 
-// Save settings (auto-save: called on every field change, stays silent)
+// Save settings (auto-save: called on every field change, stays silent).
+// Never rejects. It is wired directly to the fields' 'change' event, where a
+// rejection would surface as an unhandled rejection with nothing for the user
+// to act on; callers that await it (startProxy/testConnection) must not be
+// aborted by a failed write either.
 async function saveSettings() {
   const newConfig = {
     serverHost: elements.serverHost.value.trim(),
@@ -139,8 +143,15 @@ async function saveSettings() {
     autoReconnect: elements.autoReconnect.checked
   };
 
-  await window.electronAPI.saveConfig(newConfig);
+  // Adopt the form values first: they are what the next launch validates, and
+  // persisting them is best-effort, so a failed write must not leave `config`
+  // describing the previous values.
   config = newConfig;
+  try {
+    await window.electronAPI.saveConfig(newConfig);
+  } catch (err) {
+    console.error('saveConfig failed:', err);
+  }
 }
 
 // Test connection
@@ -177,8 +188,10 @@ async function testConnection() {
 async function startProxy() {
   await saveSettings();
 
-  // Single validation pass (same rules as the main process)
-  const validationError = window.utils.validateLaunchConfig({
+  // Single validation pass, run in the main process against the same utils.js
+  // the launch itself uses (the preload cannot require local files under the
+  // sandbox, and a second copy of these rules would be free to drift).
+  const validationError = await window.electronAPI.validateConfig({
     serverHost: config.serverHost,
     serverPort: config.serverPort,
     localPort: config.localPort,
@@ -224,13 +237,19 @@ function updateStatus(running) {
     elements.statusDot.classList.remove('running');
     elements.statusText.textContent = '未运行';
     elements.trafficIndicator.hidden = true;
+    // Reset the counters, not just hide them: the client only emits a TRAFFIC
+    // line when the numbers change, so a restart would otherwise re-show the
+    // PREVIOUS run's totals and leave them there until new traffic arrives.
+    elements.trafficUp.textContent = '↑ 0 B';
+    elements.trafficDown.textContent = '↓ 0 B';
   }
 }
 
-// Update traffic display
+// Update traffic display. The main process already humanized the counters
+// (utils.js lives there), so these arrive as display strings.
 function updateTraffic({ tx, rx }) {
-  elements.trafficUp.textContent = `↑ ${window.utils.formatBytes(tx)}`;
-  elements.trafficDown.textContent = `↓ ${window.utils.formatBytes(rx)}`;
+  elements.trafficUp.textContent = `↑ ${tx}`;
+  elements.trafficDown.textContent = `↓ ${rx}`;
 }
 
 // Append log entry

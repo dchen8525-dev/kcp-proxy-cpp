@@ -5,7 +5,7 @@ const fs = require('fs');
 const dns = require('dns');
 const net = require('net');
 const zlib = require('zlib');
-const { generateKey: buildKey, validateLaunchConfig, buildClientArgs, buildClientEnv } = require('./utils');
+const { generateKey: buildKey, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes } = require('./utils');
 
 // Auto-updater (electron-updater) — loaded lazily to keep dev/preview simple.
 let autoUpdater = null;
@@ -140,6 +140,17 @@ let tray = null;
 // updateStatus() cannot reach the menu through the tray object.
 let trayMenu = null;
 let clientProcess = null;
+// The connection probe's short-lived client process. It is NOT the proxy child,
+// but it is still a real `kcp-proxy-client` that would outlive the app: the
+// client only exits on stop(), so closing the probe's SOCKS socket or letting
+// its handshake deadline fire does not end it. Without a module-level handle
+// the only reaper (before-quit, which looks at clientProcess) could not see it,
+// and quitting mid-probe orphaned the process for good.
+let probeProcess = null;
+// Quit-time child-reaping state: 'idle' (not started) -> 'reaping' (waiting for
+// the children to exit; further quit requests keep waiting) -> 'done' (the
+// final app.quit() from the cleanup may proceed).
+let quitCleanupState = 'idle';
 let isRunning = false;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
@@ -191,20 +202,41 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      // The preload bridges utils.js (validateLaunchConfig/formatBytes) to the
-      // renderer via require('./utils'). A sandboxed preload's polyfilled
-      // require only serves electron/events/timers/url and rejects local
-      // files, which killed the whole preload — and with it every button in
-      // the UI. Disable the sandbox so the preload keeps full Node require;
-      // the renderer itself stays isolated (contextIsolation + no
-      // nodeIntegration) and loads only local, CSP-restricted content.
-      sandbox: false
+      // The sandbox stays ON (the Electron default). It used to be disabled
+      // because the preload required './utils' for validateLaunchConfig and
+      // formatBytes, and a sandboxed preload's polyfilled require only serves
+      // electron/events/timers/url — it rejects local files, which killed the
+      // whole preload and with it every button in the UI. Neither helper needs
+      // to live in the preload: validation goes over the 'validate-config' IPC
+      // channel (same utils.js the main process launches with) and traffic
+      // counters are humanized in the main process before being sent. The
+      // preload is now dependency-free.
+      sandbox: true
     },
     icon: path.join(__dirname, 'assets/icon.png'),
     show: false
   });
 
   mainWindow.loadFile('index.html');
+
+  // The window only ever shows index.html, but the preload bridge runs for
+  // EVERY document loaded in this webContents — so a navigation to any other
+  // origin would hand that origin getConfig() (which returns the key suffix),
+  // saveConfig and startProxy/stopProxy. Nothing in the renderer can navigate
+  // today (no links, no window.open, all text via textContent), which is
+  // exactly why these guards belong here rather than on the renderer's good
+  // behaviour. Deny both navigation and popups; anything that should open
+  // externally goes through the OS browser, not this window.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (url !== mainWindow.webContents.getURL()) {
+      event.preventDefault();
+      console.warn('blocked navigation to', url);
+    }
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    console.warn('blocked popup to', url);
+    return { action: 'deny' };
+  });
 
   // Show the window when ready. A launch carrying --hidden starts minimized
   // to the tray; that flag is only ever passed by a legacy "开机自启"
@@ -747,9 +779,11 @@ function handleClientLine(line) {
   // Traffic stats (emitted every 2s) are for the counter, not the log panel.
   const trafficMatch = text.match(/TRAFFIC tx=(\d+) rx=(\d+)/);
   if (trafficMatch) {
+    // Humanized here, in the process that already owns utils.js, so the renderer
+    // needs no copy of the formatter (see the sandbox note in createWindow).
     mainWindow?.webContents.send('traffic-update', {
-      tx: parseInt(trafficMatch[1], 10),
-      rx: parseInt(trafficMatch[2], 10)
+      tx: formatBytes(parseInt(trafficMatch[1], 10)),
+      rx: formatBytes(parseInt(trafficMatch[2], 10))
     });
     return;
   }
@@ -772,6 +806,14 @@ function handleClientLine(line) {
 
 // IPC handlers
 ipcMain.handle('get-config', () => store.store);
+
+// Pre-flight config validation for the renderer. It lives here rather than in
+// the preload so utils.js stays the single source of truth for the key/port
+// rules that must match the server (startProxy validates with the same call).
+// Duplicating them into the preload would let the two drift, and the copy the
+// user sees is the one that would be wrong.
+ipcMain.handle('validate-config', (event, config) =>
+  validateLaunchConfig(config || {}));
 
 // The only keys the renderer may persist (see renderer.js saveSettings). A
 // whitelist costs nothing now and stops an unknown or hostile key from being
@@ -832,6 +874,7 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
       try {
         if (proc && proc.exitCode === null) proc.kill();
       } catch { /* best effort */ }
+      if (probeProcess === proc) probeProcess = null;
       resolve(result);
     };
 
@@ -843,6 +886,9 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
         stdio: ['ignore', 'ignore', 'pipe'],
         env: buildClientEnv(generateKey())
       });
+      // Publish the handle BEFORE anything can await, so before-quit can always
+      // find and reap this child.
+      probeProcess = proc;
     } catch (err) {
       finish({ ok: false, message: `启动测试进程失败: ${err.message}` });
       return;
@@ -930,17 +976,14 @@ ipcMain.handle('test-connection', async (event, host, port) => {
 // one test-connection can run concurrently.
 async function runConnectivityTest(host, port) {
   const h = (host || store.get('serverHost') || '').trim();
-  const p = parseInt(port || store.get('serverPort'), 10);
-
-  if (!h || !p) {
-    return { ok: false, message: '请填写服务器地址和端口' };
-  }
+  // The RAW value the user asked to test, not parseInt() of it: the launch path
+  // validates the string through isValidPort, so coercing here let "8388x" test
+  // green while 启动代理 then refused the very same config.
+  const rawPort = port || store.get('serverPort');
 
   const validationError = validateLaunchConfig({
     serverHost: h,
-    serverPort: p, // validate the port the user actually asked to test —
-                   // previously this read the saved value, so an unsaved
-                   // port change was validated against the stale port.
+    serverPort: rawPort,
     localPort: store.get('localPort'),
     keyMode: 'daily',
     keySuffix: store.get('keySuffix')
@@ -948,6 +991,7 @@ async function runConnectivityTest(host, port) {
   if (validationError) {
     return { ok: false, message: validationError };
   }
+  const p = parseInt(rawPort, 10);
 
   // 1) DNS / literal-IP check gives an immediate, precise failure reason.
   let address;
@@ -995,9 +1039,13 @@ ipcMain.on('window-close', () => {
 });
 
 // ── App lifecycle ──
-// Set Windows AppUserModelID so notifications/taskbar group correctly
+// Set Windows AppUserModelID so notifications/taskbar group correctly. This
+// MUST match electron-builder's `appId` (electron-builder stamps the NSIS
+// shortcut's AppUserModelID from it): when the two disagree, Windows treats the
+// running process and the shortcut as different apps, so the tray balloons lose
+// the app name/icon and taskbar pinning creates a second entry.
 if (process.platform === 'win32') {
-  app.setAppUserModelId('com.kcp.proxy');
+  app.setAppUserModelId('com.kcp-proxy.gui');
 }
 
 // ── Auto-updater lifecycle (only in packaged app) ──
@@ -1146,19 +1194,40 @@ app.on('before-quit', (event) => {
     reconnectTimer = null;
   }
 
-  // Wait for the proxy child to actually exit before quitting. Otherwise the
-  // kill is fire-and-forget and the client can linger holding the local SOCKS
-  // port. preventDefault + a bounded grace keeps quit responsive even if the
-  // child never exits on its own. Null out clientProcess first so the second
-  // app.quit() (which re-fires before-quit) can never re-enter this path.
-  const proc = clientProcess;
-  if (proc) {
+  // Wait for every child we spawned to actually exit before quitting. Otherwise
+  // the kill is fire-and-forget and a client can linger holding the local SOCKS
+  // port -- or, for a connection probe that is still in flight, linger forever
+  // (nothing else holds its handle). preventDefault + a bounded grace keeps quit
+  // responsive even if a child never exits on its own.
+  //
+  // Re-entry is guarded by a state machine rather than by "clientProcess is
+  // null". Nulling the handle first (the previous approach) made a SECOND quit
+  // request during the grace window see nothing left to reap and exit
+  // immediately, leaving the child running. Here a second request keeps waiting,
+  // and the app.quit() issued from the cleanup's finally is the one that passes.
+  if (quitCleanupState === 'reaping') {
     event.preventDefault();
-    clientProcess = null;
-    terminateClientProcess(proc).finally(() => {
-      app.quit();
-    });
+    return;
   }
+  if (quitCleanupState === 'done') {
+    return;
+  }
+  const proc = clientProcess;
+  const probe = probeProcess;
+  if (!proc && !probe) {
+    return;
+  }
+  quitCleanupState = 'reaping';
+  event.preventDefault();
+  clientProcess = null;
+  probeProcess = null;
+  Promise.all([
+    terminateClientProcess(proc),
+    terminateClientProcess(probe, 1000)
+  ]).finally(() => {
+    quitCleanupState = 'done';
+    app.quit();
+  });
 });
 
 // Prevent multiple instances
