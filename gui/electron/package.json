@@ -1,6 +1,6 @@
 {
   "name": "kcp-proxy-gui",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "KCP Proxy Client GUI",
   "main": "main.js",
   "repository": {
