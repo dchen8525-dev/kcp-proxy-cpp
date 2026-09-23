@@ -1010,6 +1010,7 @@ def phase_big_response_target_close(server_exe, client_exe, log_dir):
         require_pair_ready(server, client, socks_port)
         time.sleep(0.5)
         base_drained = count_in(server.log_path, "close_connection from target_drained")
+        base_draining = count_in(server.log_path, "draining queued data to client")
 
         app = socks5_connect("127.0.0.1", socks_port, "127.0.0.1", target_port, 20)
         try:
@@ -1032,8 +1033,18 @@ def phase_big_response_target_close(server_exe, client_exe, log_dir):
         # The teardown must have gone through the drained path, which only fires
         # once wait_send() == 0 -- i.e. after the client acknowledged the whole
         # tail -- rather than from a close on the FIN.
-        srv_log = log_text(server.log_path)
-        if "draining queued data to client" not in srv_log:
+        #
+        # Polled, never read once: the server writes these lines on its own
+        # schedule, so a single point-in-time log_text() races the write. The
+        # assertion below has always polled for exactly that reason; this one
+        # used to be the phase's one unguarded read, which is what made it flaky.
+        # handle_target_closed() logs the line at most once per session (it is
+        # guarded by is_target_closed() / mark_target_closed()), so base + 1 is
+        # exact rather than a lower bound.
+        draining = wait_for_count(server.log_path,
+                                  "draining queued data to client",
+                                  base_draining + 1, 20)
+        if draining <= base_draining:
             raise AssertionError(
                 "server did not keep the session alive to drain the response "
                 "after the target closed")
@@ -1050,9 +1061,13 @@ def phase_big_response_target_close(server_exe, client_exe, log_dir):
         # deterministic proof that a non-empty buffer *withholds* the teardown is
         # the unit test test_session_drained_deferred_while_send_buffer_nonempty;
         # this phase pins the outcome: no byte is lost and the close was drained.
+        # Re-read now that both waits above have confirmed the lines are there.
+        srv_log = log_text(server.log_path)
         marker = "draining queued data to client (wait_send="
         backlog = -1
-        idx = srv_log.find(marker)
+        # rfind, not find: this reads a diagnostic off the newest occurrence, so
+        # a line left in the log by an earlier run cannot be reported instead.
+        idx = srv_log.rfind(marker)
         if idx != -1:
             idx += len(marker)
             backlog = int(srv_log[idx:srv_log.find(")", idx)])
