@@ -4,6 +4,7 @@
 #include <asio.hpp>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,13 +124,40 @@ int main(int argc, char* argv[]) {
 
         cli::setup_signal_handler(io, [server]() { server->stop(); });
 
+        // An exception escaping an io_context handler is fatal -- the server is
+        // left in an unknown state -- but it must not be allowed to unwind
+        // straight out of here. Doing so would destroy `io_threads` while its
+        // threads are still joinable, and ~thread on a joinable thread calls
+        // std::terminate, so the "Fatal error:" diagnostic below could never
+        // print. The same is true of an exception escaping a *worker* thread's
+        // function, which terminates immediately. So: catch it in every thread,
+        // stop the io_context so the others return, and rethrow only after the
+        // join, where the stack is safe to unwind.
         std::vector<std::thread> io_threads;
         io_threads.reserve(threads);
+        std::exception_ptr handler_error;
+        std::mutex handler_error_mutex;
+        auto run_io = [&io, &handler_error, &handler_error_mutex]() {
+            try {
+                io.run();
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(handler_error_mutex);
+                    if (!handler_error) {
+                        handler_error = std::current_exception();
+                    }
+                }
+                io.stop();
+            }
+        };
         for (unsigned int t = 1; t < threads; ++t) {
-            io_threads.emplace_back([&io]() { io.run(); });
+            io_threads.emplace_back(run_io);
         }
-        io.run();
+        run_io();
         for (auto& t : io_threads) t.join();
+        if (handler_error) {
+            std::rethrow_exception(handler_error);
+        }
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;
         return 1;
