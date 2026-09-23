@@ -22,6 +22,22 @@ ENV_FILE="$ENV_DIR/server.env"
 SERVICE_NAME="kcp-proxy-server.service"
 SERVICE_USER="kcpproxy"
 
+# ---------- kernel UDP buffer ceiling (server side) ----------
+# The server asks for 4 MiB UDP socket buffers (UDP_SO_RCVBUF_BYTES /
+# UDP_SO_SNDBUF_BYTES in src/kcp_proxy/config.hpp), but the kernel silently
+# clamps those requests to net.core.rmem_max / net.core.wmem_max -- 208 KiB on a
+# stock Debian host. setsockopt() still reports success, so the shortfall is
+# invisible until a burst overflows the (much smaller) buffer, the kernel drops
+# datagrams, and KCP misreads the drops as network loss and retransmits whole
+# windows. install-service.sh raises the ceiling to these values, but only when
+# the host's current value is lower: an operator who deliberately tuned rmem_max
+# above this must never have it lowered by an install.
+# Keep in sync with UDP_SO_RCVBUF_BYTES / UDP_SO_SNDBUF_BYTES in config.hpp --
+# tests/smoke/smoke_test.py asserts the two agree.
+SYSCTL_CONF="/etc/sysctl.d/99-kcp-proxy.conf"
+UDP_RMEM_MAX=4194304
+UDP_WMEM_MAX=4194304
+
 # ---------- key generation: UTC+8 YYYYMMDD + suffix ----------
 # Suffix must be >= 8 chars so total key length >= 16 (min required by kcp-proxy).
 key_date() {

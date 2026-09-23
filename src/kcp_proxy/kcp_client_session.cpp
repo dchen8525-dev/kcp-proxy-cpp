@@ -1,6 +1,7 @@
 #include "kcp_proxy/kcp_client_session.hpp"
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
+#include "kcp_proxy/socket_buffer.hpp"
 #include "kcp_proxy/time_util.hpp"
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -13,6 +14,7 @@
 #endif
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 namespace kcp_proxy {
@@ -103,6 +105,44 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
         if (opt_ec) {
             LOG_WARNING("kcp_client", "failed to set SO_SNDBUF: " + opt_ec.message());
         }
+
+        // Read back what the kernel actually granted. setsockopt() reports
+        // success even when the kernel clamps the request to net.core.rmem_max /
+        // wmem_max, so this comparison -- not the error code -- is the only thing
+        // that detects a clamp, and a clamp here silently reintroduces the burst
+        // drops the set_option calls above exist to prevent.
+        //
+        // Once per process: the client creates one UDP socket per local TCP
+        // connection, so logging this per session would spam an unbounded number
+        // of identical lines about a value that cannot change while the process
+        // runs. Windows has no rmem_max/wmem_max to raise, so this is visibility
+        // only -- never an automatic repair.
+        static std::once_flag buffer_report_once;
+        std::call_once(buffer_report_once, [this]() {
+            std::error_code read_ec;
+            asio::socket_base::receive_buffer_size eff_rcv;
+            asio::socket_base::send_buffer_size eff_snd;
+            udp_socket_->get_option(eff_rcv, read_ec);
+            const bool rcv_ok = !read_ec;
+            const std::string rcv_str = read_ec ? "?" : std::to_string(eff_rcv.value());
+            udp_socket_->get_option(eff_snd, read_ec);
+            const bool snd_ok = !read_ec;
+            const std::string snd_str = read_ec ? "?" : std::to_string(eff_snd.value());
+            LOG_INFO("kcp_client", "UDP socket buffers so_rcvbuf=" + rcv_str +
+                     " so_sndbuf=" + snd_str);
+            if (rcv_ok) {
+                const std::string clamp = describe_buffer_clamp(
+                    "so_rcvbuf", "net.core.rmem_max", UDP_SO_RCVBUF_BYTES,
+                    eff_rcv.value());
+                if (!clamp.empty()) LOG_WARNING("kcp_client", clamp);
+            }
+            if (snd_ok) {
+                const std::string clamp = describe_buffer_clamp(
+                    "so_sndbuf", "net.core.wmem_max", UDP_SO_SNDBUF_BYTES,
+                    eff_snd.value());
+                if (!clamp.empty()) LOG_WARNING("kcp_client", clamp);
+            }
+        });
 
         running_.store(true);
         connected_.store(false);

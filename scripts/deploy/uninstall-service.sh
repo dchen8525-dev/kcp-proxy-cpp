@@ -18,6 +18,7 @@ else
     ENV_DIR="/etc/kcp-proxy"
     SERVICE_NAME="kcp-proxy-server.service"
     SERVICE_USER="kcpproxy"
+    SYSCTL_CONF="/etc/sysctl.d/99-kcp-proxy.conf"
 fi
 
 PURGE=0
@@ -82,7 +83,30 @@ if id "$SERVICE_USER" &>/dev/null; then
     userdel "$SERVICE_USER" 2>/dev/null || true
 fi
 
+# Remove the kernel UDP buffer ceiling drop-in. Unconditional (not gated on
+# --purge): it exists only to serve the service, and leaving a sysctl drop-in
+# behind after an uninstall would silently cap rmem_max for the whole host.
+#
+# The drop-in is not rolled back to the host's pre-install value -- the
+# installer never recorded it, and inventing one now risks writing a *lower*
+# ceiling than the host wants. So the notice below is deliberate: the live
+# rmem_max stays raised until the next reboot, and the operator is told.
+SYSCTL_REMOVED=0
+if [ -f "$SYSCTL_CONF" ]; then
+    rm -f "$SYSCTL_CONF"
+    SYSCTL_REMOVED=1
+    # Deliberately no `sysctl` call here: deleting a drop-in does not lower a
+    # value that is already live (sysctl only ever *sets* what the files say),
+    # so running it would be theatre. The notice below is the honest report.
+fi
+
 systemctl daemon-reload
 
 echo
 echo "kcp-proxy-server uninstalled (configuration $([ "$PURGE" -eq 1 ] && echo removed || echo preserved))."
+if [ "$SYSCTL_REMOVED" -eq 1 ]; then
+    echo
+    echo "Note: removed $SYSCTL_CONF. The kernel keeps the raised UDP buffer"
+    echo "      ceiling until the next reboot (the pre-install value was not"
+    echo "      recorded, so it is not restored automatically)."
+fi

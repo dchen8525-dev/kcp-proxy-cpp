@@ -8,6 +8,7 @@
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/server.hpp"
 #include "kcp_proxy/socks5.hpp"
+#include "kcp_proxy/socket_buffer.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
 #include <asio.hpp>
 #include <cassert>
@@ -556,6 +557,48 @@ void test_kcp_config_line() {
     has("sndWnd=" + std::to_string(KCP_SNDWND));
     has("rcvWnd=" + std::to_string(KCP_RCVWND));
     has("timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s");
+}
+
+void test_socket_buffer_clamp_detection() {
+    // The clamp this detects is invisible at the call site: setsockopt() returns
+    // success while the kernel silently caps the request at net.core.rmem_max /
+    // wmem_max, so the only signal is the value getsockopt() reports back. If
+    // this predicate ever stops firing on a shortfall, the server and client
+    // both go quiet about a lost buffer -- exactly the failure mode that cost a
+    // production incident (4 MiB requested, 208 KiB granted, burst datagrams
+    // dropped and misread by KCP as network loss).
+
+    // A shortfall must produce a message naming the option, both sizes, and the
+    // sysctl that caused it -- the numbers are what make the line actionable.
+    const std::string clamped = describe_buffer_clamp(
+        "so_rcvbuf", "net.core.rmem_max", 4 * 1024 * 1024, 212992);
+    expect_true(!clamped.empty(), "a clamped buffer must be reported");
+    expect_true(clamped.find("so_rcvbuf") != std::string::npos,
+                "clamp message must name the socket option");
+    expect_true(clamped.find("4194304") != std::string::npos,
+                "clamp message must carry the requested size");
+    expect_true(clamped.find("212992") != std::string::npos,
+                "clamp message must carry the effective size");
+    expect_true(clamped.find("net.core.rmem_max") != std::string::npos,
+                "clamp message must name the sysctl to raise");
+
+    // Equal is not clamped: that is the ordinary Windows / already-tuned case
+    // and must stay silent, or every startup on a healthy host logs a warning.
+    expect_true(describe_buffer_clamp("so_sndbuf", "net.core.wmem_max",
+                                      4 * 1024 * 1024, 4 * 1024 * 1024).empty(),
+                "an exactly-honored request must not be reported");
+
+    // Linux reports a buffer it doubled, so a value above the request is the
+    // normal success path there too -- and it must not be reported as a clamp.
+    expect_true(describe_buffer_clamp("so_rcvbuf", "net.core.rmem_max",
+                                      4 * 1024 * 1024, 8 * 1024 * 1024).empty(),
+                "a buffer larger than requested must not be reported");
+
+    // One byte short still counts: the predicate is the exact condition under
+    // which there is nothing to say, not an approximate "close enough".
+    expect_true(!describe_buffer_clamp("so_rcvbuf", "net.core.rmem_max",
+                                       212992, 212991).empty(),
+                "any shortfall, however small, must be reported");
 }
 
 void test_kcp_wrapper_applies_constants() {
@@ -1575,6 +1618,7 @@ int main() {
         test_allowlist_matching();
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
+        test_socket_buffer_clamp_detection();
         test_kcp_wrapper_applies_constants();
         test_kcp_wrapper_oversized_message_is_not_truncated();
         test_server_session_routing_and_auth();

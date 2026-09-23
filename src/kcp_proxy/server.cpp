@@ -3,6 +3,7 @@
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/config.hpp"
 #include "kcp_proxy/logger.hpp"
+#include "kcp_proxy/socket_buffer.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
 #include <asio/read.hpp>
 #include <asio/write.hpp>
@@ -46,7 +47,12 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
       // completion on it -- see send_to_client() and do_receive().
       udp_socket_(asio::make_strand(io_.get_executor())),
       cleanup_timer_(io_),
-      receive_backoff_timer_(io_),
+      // On the socket's strand, not the raw io_context: its handler is the one
+      // place outside the receive path that touches receive_backoff_armed_ and
+      // the slots' parked flags, and both are strand-confined by design. Bound
+      // here rather than relying on bind_executor at the call site so the timer
+      // and its handler agree on the executor by construction.
+      receive_backoff_timer_(udp_socket_.get_executor()),
       update_tick_timer_(io_) {}
 
 KCPServer::~KCPServer() {
@@ -109,11 +115,28 @@ void KCPServer::start() {
     asio::socket_base::receive_buffer_size eff_rcv;
     asio::socket_base::send_buffer_size eff_snd;
     udp_socket_.get_option(eff_rcv, opt_ec);
-    std::string eff_rcv_str = opt_ec ? "?" : std::to_string(eff_rcv.value());
+    const bool rcv_read_ok = !opt_ec;
+    const std::string eff_rcv_str = opt_ec ? "?" : std::to_string(eff_rcv.value());
     udp_socket_.get_option(eff_snd, opt_ec);
-    std::string eff_snd_str = opt_ec ? "?" : std::to_string(eff_snd.value());
+    const bool snd_read_ok = !opt_ec;
+    const std::string eff_snd_str = opt_ec ? "?" : std::to_string(eff_snd.value());
     LOG_INFO("server", "UDP socket buffers so_rcvbuf=" + eff_rcv_str +
              " so_sndbuf=" + eff_snd_str);
+
+    // The values above are the whole point of the set_option calls, so a silent
+    // clamp is a silent loss of the protection. setsockopt() reports success
+    // either way, which is why this comparison -- not the error code -- is what
+    // actually detects it.
+    if (rcv_read_ok) {
+        const std::string clamp = describe_buffer_clamp(
+            "so_rcvbuf", "net.core.rmem_max", UDP_SO_RCVBUF_BYTES, eff_rcv.value());
+        if (!clamp.empty()) LOG_WARNING("server", clamp);
+    }
+    if (snd_read_ok) {
+        const std::string clamp = describe_buffer_clamp(
+            "so_sndbuf", "net.core.wmem_max", UDP_SO_SNDBUF_BYTES, eff_snd.value());
+        if (!clamp.empty()) LOG_WARNING("server", clamp);
+    }
 
 #if defined(_WIN32)
     // Root-cause fix for the ICMP port-unreachable error path: on Windows an
@@ -151,6 +174,7 @@ void KCPServer::start() {
     LOG_INFO("server", "listening on " + host_ + ":" + std::to_string(port_));
     LOG_INFO("server", "diagnostics udp_bind=" + host_ +
              " udp_port=" + std::to_string(port_) +
+             " udp_recv_slots=" + std::to_string(UDP_RECV_SLOTS) +
              " crypto=AES-128-GCM/HKDF-SHA256" +
              " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
              " log_level=" + log_level_name());
@@ -192,23 +216,64 @@ void KCPServer::stop() {
 
 void KCPServer::do_receive() {
     if (!running_) return;
+    for (size_t i = 0; i < UDP_RECV_SLOTS; ++i) {
+        arm_receive_slot(i);
+    }
+}
 
-    // Initiate through the socket's strand so a re-arm from the receive-error
-    // backoff timer (which runs on the io_context, not the strand) can never
-    // overlap a send that is being initiated from a session strand.
+void KCPServer::arm_receive_slot(size_t index) {
+    // Initiate through the socket's strand. Callers are already on it (every
+    // receive completion is bound to it, and so is the backoff timer), so this
+    // runs inline in the normal path; the dispatch is what makes start()'s
+    // initial arming safe, since start() is called from off the strand.
     auto self = shared_from_this();
-    asio::dispatch(udp_socket_.get_executor(), [this, self]() {
+    asio::dispatch(udp_socket_.get_executor(), [this, self, index]() {
         if (!running_) return;
-        recv_endpoint_ = asio::ip::udp::endpoint();
+        RecvSlot& slot = recv_slots_[index];
+        slot.parked = false;
+        slot.endpoint = asio::ip::udp::endpoint();
         udp_socket_.async_receive_from(
-            asio::buffer(udp_recv_buf_), recv_endpoint_,
-            [this, self](const std::error_code& ec, size_t bytes) {
-                handle_receive(ec, bytes);
-            });
+            asio::buffer(slot.buf), slot.endpoint,
+            // Bound explicitly to the socket's strand: the default completion
+            // executor already routes here, but this handler is one of
+            // UDP_RECV_SLOTS in flight at once, and the plain (non-atomic)
+            // state it touches -- auth_attempts_window_, the LogThrottles, the
+            // backoff flag -- is only safe if that is guaranteed rather than
+            // inferred.
+            asio::bind_executor(
+                udp_socket_.get_executor(),
+                [this, self, index](const std::error_code& ec, size_t bytes) {
+                    handle_receive(index, ec, bytes);
+                }));
     });
 }
 
-void KCPServer::handle_receive(const std::error_code& ec, size_t bytes_transferred) {
+void KCPServer::park_receive_slot(size_t index) {
+    recv_slots_[index].parked = true;
+    // Unknown errors are the one path that can complete immediately and
+    // repeatedly with no external pacing at all: an unbounded re-arm here is a
+    // busy spin plus an ERROR log line per iteration. Park the slot and re-arm
+    // it through a short shared backoff instead, which bounds the loop to
+    // ~100 attempts/s while a transient condition (or an operator) resolves it.
+    // One timer for all slots: N slots failing at once must not raise the retry
+    // rate to N times that.
+    if (recv_backoff_armed_) return;
+    recv_backoff_armed_ = true;
+    auto self = shared_from_this();
+    receive_backoff_timer_.expires_after(std::chrono::milliseconds(10));
+    receive_backoff_timer_.async_wait(asio::bind_executor(
+        udp_socket_.get_executor(),
+        [this, self](const std::error_code& timer_ec) {
+            recv_backoff_armed_ = false;
+            if (timer_ec || !running_) return;
+            for (size_t i = 0; i < UDP_RECV_SLOTS; ++i) {
+                if (recv_slots_[i].parked) arm_receive_slot(i);
+            }
+        }));
+}
+
+void KCPServer::handle_receive(size_t index, const std::error_code& ec,
+                               size_t bytes_transferred) {
     if (ec) {
         if (running_ && ec != asio::error::operation_aborted) {
             // UDP sockets surface ICMP Port Unreachable as an error on the next
@@ -221,45 +286,34 @@ void KCPServer::handle_receive(const std::error_code& ec, size_t bytes_transferr
             if (ec == asio::error::connection_refused ||
                 ec == asio::error::connection_reset) {
                 LOG_DEBUG("server", "UDP ICMP port unreachable received (ignored)");
-                do_receive();
+                arm_receive_slot(index);
             } else {
                 LOG_ERROR("server", "UDP receive error: " + ec.message());
-                // Unknown errors are the one path that can complete
-                // immediately and repeatedly with no external pacing at all:
-                // an unbounded re-arm here is a busy spin plus an ERROR log
-                // line per iteration. Re-arm through a short backoff instead,
-                // which bounds the loop to ~100 attempts/s while a transient
-                // condition (or an operator) resolves it.
-                auto self = shared_from_this();
-                receive_backoff_timer_.expires_after(
-                    std::chrono::milliseconds(10));
-                receive_backoff_timer_.async_wait(
-                    [this, self](const std::error_code& timer_ec) {
-                        if (!timer_ec) do_receive();
-                    });
+                park_receive_slot(index);
             }
         }
         return;
     }
     if (bytes_transferred == 0) {
-        do_receive();
+        arm_receive_slot(index);
         return;
     }
 
     // stop() may have run while this receive was in flight: its session maps
     // are already swapped out, so routing now would insert an orphaned session
-    // that is never ticked or swept.
+    // that is never ticked or swept. Every slot checks this independently --
+    // one handler returning here says nothing about the others still in flight.
     if (!running_) return;
 
-    auto endpoint = recv_endpoint_;
-    byte_view data(udp_recv_buf_.data(), bytes_transferred);
+    const auto endpoint = recv_slots_[index].endpoint;
+    byte_view data(recv_slots_[index].buf.data(), bytes_transferred);
 
     LOG_DEBUG("server", "UDP recv " + std::to_string(bytes_transferred) +
               " bytes from " + endpoint.address().to_string() + ":" +
               std::to_string(endpoint.port()));
 
     route_datagram(endpoint, data);
-    do_receive();
+    arm_receive_slot(index);
 }
 
 std::shared_ptr<KCPSession> KCPServer::route_datagram(

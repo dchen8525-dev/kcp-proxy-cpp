@@ -63,6 +63,13 @@ ENV_FILE = f"{ENV_DIR}/server.env"
 SERVICE_NAME = "kcp-proxy-server.service"
 SERVICE_USER = "kcpproxy"
 PKG_NAME = "kcp-proxy-server"
+# Kernel UDP buffer ceiling, written only when the host's current value is lower
+# (never lowered). Mirrors SYSCTL_CONF / UDP_RMEM_MAX / UDP_WMEM_MAX in
+# scripts/runtime/common.sh and UDP_SO_RCVBUF_BYTES in src/kcp_proxy/config.hpp;
+# tests/smoke/smoke_test.py asserts the three agree.
+SYSCTL_CONF = "/etc/sysctl.d/99-kcp-proxy.conf"
+UDP_RMEM_MAX = 4194304
+UDP_WMEM_MAX = 4194304
 
 MODE_EXEC = 0o755
 MODE_FILE = 0o644
@@ -314,6 +321,44 @@ case "$1" in
             systemctl daemon-reload || true
         fi
 
+        # Kernel UDP buffer ceiling. The server asks for 4 MiB UDP socket
+        # buffers; the kernel silently clamps them to net.core.rmem_max /
+        # wmem_max without reporting an error, so the ceiling has to be raised
+        # BEFORE the restart below -- doing it afterwards would leave the
+        # running process holding the clamped buffer until the next restart.
+        #
+        # Only ever raise. A host already at or above the required values is
+        # left completely untouched, and a key that is already high enough is
+        # omitted from the drop-in rather than written back down. sysctl is not
+        # guaranteed on a minimal Debian host and a failure here is not fatal:
+        # the server logs a WARNING naming the clamped value instead.
+        #
+        # Not a shipped payload file: dpkg deletes a package's own files on
+        # remove, so the conditional logic lives here and postrm removes it.
+        if command -v sysctl >/dev/null 2>&1; then
+            cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+            cur_wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+            case "$cur_rmem" in ''|*[!0-9]*) cur_rmem=0 ;; esac
+            case "$cur_wmem" in ''|*[!0-9]*) cur_wmem=0 ;; esac
+            if [ "$cur_rmem" -lt {UDP_RMEM_MAX} ] || [ "$cur_wmem" -lt {UDP_WMEM_MAX} ]; then
+                {{
+                    echo "# Written by the kcp-proxy-server package postinst."
+                    echo "# The server asks for 4 MiB UDP socket buffers; without"
+                    echo "# this ceiling the kernel silently clamps them to the"
+                    echo "# defaults, then drops datagrams under burst -- which KCP"
+                    echo "# misreads as network loss and answers with retransmits."
+                    echo "# Only keys that were below the required value are listed."
+                    if [ "$cur_rmem" -lt {UDP_RMEM_MAX} ]; then echo "net.core.rmem_max={UDP_RMEM_MAX}"; fi
+                    if [ "$cur_wmem" -lt {UDP_WMEM_MAX} ]; then echo "net.core.wmem_max={UDP_WMEM_MAX}"; fi
+                }} > {SYSCTL_CONF}
+                chmod 644 {SYSCTL_CONF}
+                # Apply just this file: 'sysctl --system' would also re-read
+                # every other drop-in, turning someone else's broken file into
+                # our failure.
+                sysctl -p {SYSCTL_CONF} >/dev/null 2>&1 || true
+            fi
+        fi
+
         systemctl daemon-reload
         systemctl enable "$SERVICE_NAME" >/dev/null
         systemctl restart "$SERVICE_NAME"
@@ -349,6 +394,8 @@ case "$1" in
         # remove the only kept-back unit file; dpkg removes the rest
         rm -f "/etc/systemd/system/$SERVICE_NAME"
         rm -f /etc/systemd/system/kcp-proxy-server-key-refresh.service /etc/systemd/system/kcp-proxy-server-key-refresh.timer
+        # the sysctl drop-in is written by postinst, so dpkg does not track it
+        rm -f {SYSCTL_CONF}
         systemctl daemon-reload >/dev/null 2>&1 || true
         if id "$SERVICE_USER" >/dev/null 2>&1; then
             userdel "$SERVICE_USER" 2>/dev/null || true

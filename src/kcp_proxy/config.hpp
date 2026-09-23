@@ -70,6 +70,18 @@ constexpr size_t UDP_RECV_BUF_SIZE = 4096;
 constexpr size_t FWD_BUF_SIZE = 16384;
 constexpr size_t SOCKS5_REPLY_BUF_SIZE = 512;
 
+// Number of async_receive_from operations the server keeps outstanding on its
+// single shared UDP socket. With exactly one outstanding, the kernel drain rate
+// is coupled to the handler's duration: the next recvmsg is only issued after
+// route_datagram() (two string allocations + a shared_lock lookup + a vector
+// copy + a strand dispatch) has returned, so a simultaneous burst from many
+// sessions can outrun the drain and overflow the socket buffer. With N
+// outstanding, the reactor performs up to N recvmsg calls per readiness event
+// and only then runs the handlers, decoupling the drain from handler cost.
+// Costs UDP_RECV_SLOTS * UDP_RECV_BUF_SIZE bytes of resident buffers (64 KB at
+// the default), which is negligible next to the buffers it protects.
+constexpr size_t UDP_RECV_SLOTS = 16;
+
 // UDP socket kernel buffer sizes (SO_RCVBUF / SO_SNDBUF). The OS defaults are
 // typically far too small for KCP over a lossy WAN link: when the kernel buffer
 // overflows, the OS silently drops UDP datagrams, which KCP then mistakes for

@@ -59,16 +59,20 @@ private:
     void wipe_key();
 
     asio::ip::udp::socket udp_socket_;
-    asio::ip::udp::endpoint recv_endpoint_;
 
     std::unordered_map<std::string, std::shared_ptr<KCPSession>> sessions_;
     std::unordered_map<std::string, ClientConnection> connections_;
 
     asio::steady_timer cleanup_timer_;
-    // Backoff timer for the UDP receive error path: unknown receive errors
-    // re-arm do_receive() through this 10ms delay so a persistently failing
-    // socket cannot spin the io_context (bounded to ~100 retries/s).
+    // Backoff timer for the UDP receive error path: an unknown receive error
+    // parks its slot and arms this one shared 10ms timer, so a persistently
+    // failing socket cannot spin the io_context (bounded to ~100 retries/s).
+    // Shared, not per-slot: N slots failing together must not multiply the
+    // retry rate by N. When it fires it re-arms every parked slot.
     asio::steady_timer receive_backoff_timer_;
+    // True while receive_backoff_timer_ is armed. Strand-confined (only the
+    // receive path touches it), so a plain bool is safe.
+    bool recv_backoff_armed_ = false;
     // Single shared KCP update timer. Drives ikcp_update/flush for EVERY
     // session on a fixed 10ms cadence, replacing one steady_timer per
     // session. With N sessions the old design churned N timer-heap entries
@@ -91,11 +95,12 @@ private:
     // Global throttle on new-session authentication attempts (unknown sources
     // only ever pay a full AEAD decrypt here). Bounds CPU burn from garbage
     // UDP floods. Non-atomic, and safe because the UDP receive path is
-    // serialized: exactly one async_receive_from is outstanding at a time and
-    // the next is armed only as the last statement of the completion handler,
-    // so two handlers never overlap here even with -T > 1. (The receive path is
-    // NOT single-threaded -- the -T flag spreads it over N io_context threads --
-    // so this invariant, not thread count, is what makes the plain fields safe.)
+    // serialized: udp_socket_ is constructed on its own strand and every
+    // receive completion handler is explicitly bound to that strand, so two
+    // handlers never overlap here even with -T > 1 and even with many receives
+    // outstanding. (The receive path is NOT single-threaded -- the -T flag
+    // spreads it over N io_context threads -- so this invariant, not thread
+    // count, is what makes the plain fields safe.)
     uint32_t auth_attempts_window_ = 0;
     std::chrono::steady_clock::time_point auth_window_start_{};
 
@@ -118,11 +123,32 @@ private:
     // True iff (host, port) matches an entry in allowed_targets_.
     bool is_target_allowed(const std::string& host, uint16_t port) const;
 
-    // Fixed-size UDP receive buffer (avoids heap allocation per datagram).
-    alignas(64) std::array<uint8_t, UDP_RECV_BUF_SIZE> udp_recv_buf_{};
+    // One outstanding async_receive_from, owning its buffer and source
+    // endpoint. UDP_RECV_SLOTS of these are kept armed at once so draining the
+    // kernel buffer is not serialized behind route_datagram() -- see the
+    // UDP_RECV_SLOTS comment in config.hpp. Fixed-size buffers owned by the
+    // slot, so a receive still costs no heap allocation. alignas(64) keeps a
+    // slot's buffer off its neighbours' cache lines: the reactor writes slot i
+    // while the handler for slot j is still reading j's.
+    struct RecvSlot {
+        alignas(64) std::array<uint8_t, UDP_RECV_BUF_SIZE> buf{};
+        asio::ip::udp::endpoint endpoint;
+        // Set while this slot is parked on the shared backoff timer after an
+        // unknown receive error; cleared when it is re-armed.
+        bool parked = false;
+    };
+    std::array<RecvSlot, UDP_RECV_SLOTS> recv_slots_{};
 
+    // Arm a receive on every slot. Called once, from start().
     void do_receive();
-    void handle_receive(const std::error_code& ec, size_t bytes_transferred);
+    // Arm (or re-arm) the receive on one slot. Runs on the socket's strand.
+    void arm_receive_slot(size_t index);
+    // Completion for the receive armed on `index`.
+    void handle_receive(size_t index, const std::error_code& ec,
+                        size_t bytes_transferred);
+    // Park `index` after an unknown receive error and start the shared backoff
+    // timer if it is not already running. The timer re-arms every parked slot.
+    void park_receive_slot(size_t index);
 
     std::shared_ptr<KCPSession> get_or_create_session(
         const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,

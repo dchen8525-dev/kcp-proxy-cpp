@@ -160,6 +160,32 @@ sudo systemctl status kcp-proxy-server
 - 日志文件：`/var/log/kcp-proxy/server.log`（stdout+stderr 追加写入；超过 10 MiB 时在下次重启时轮转为 `.1`，仅保留一代。可在 `server.env` 中修改 `LOG_FILE` 路径，置空则只输出到 journald）
 - 日志查看：`journalctl -u kcp-proxy-server -f`（启动横幅等 systemd 输出），或 `tail -f /var/log/kcp-proxy/server.log`
 - 默认密钥：Beijing Date (YYYYMMDD) + suffix
+- 内核 UDP 缓冲上限：`/etc/sysctl.d/99-kcp-proxy.conf`（见下）
+
+#### 内核 UDP 缓冲上限（重要）
+
+服务端启动时会向内核申请 4 MiB 的 UDP 收发缓冲，但内核会把它**静默**钳制到
+`net.core.rmem_max` / `net.core.wmem_max`（Debian 默认仅 208 KiB），且 `setsockopt`
+照样返回成功。缓冲变小后，突发流量会溢出并被内核丢包，而 KCP 会把丢包误判为网络
+拥塞、进而整窗重传——表现为连接卡住、最终 `ERR_CONNECTION_CLOSED`。
+
+因此安装脚本（deb 的 postinst 与 `install-service.sh`）会在**启动服务之前**写入
+`/etc/sysctl.d/99-kcp-proxy.conf`，把上限提高到 4 MiB：
+
+- **只升不降**：若主机当前值已经 ≥ 4 MiB，则完全不动（连文件都不写），
+  已经调高的 `rmem_max` 绝不会被安装脚本改小。
+- 缺少 `sysctl` 的最小化 Debian 主机上会跳过并打印警告，安装不会失败。
+- **卸载不会回滚**：`uninstall-service.sh` 会删除该 drop-in，但删除配置文件
+  **不会**把已经生效的值降回来，重启前 `rmem_max` 仍保持调高状态。
+
+启动日志会打印实际生效值，被钳制时会额外输出一条 WARNING：
+
+```
+UDP socket buffers so_rcvbuf=4194304 so_sndbuf=4194304
+UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=212992 ...
+```
+
+排查突发丢包见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
 #### 方法2：从源码部署
 

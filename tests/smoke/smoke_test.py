@@ -254,6 +254,96 @@ def test_service_scripts():
 # --------------------------------------------------------------------------- #
 # pins and versions that must agree across files
 # --------------------------------------------------------------------------- #
+def test_udp_buffer_ceiling_agrees():
+    # The server asks the kernel for 4 MiB UDP socket buffers (config.hpp), but
+    # the kernel silently clamps that request to net.core.rmem_max / wmem_max
+    # without reporting an error. That was the 2026-09-23 incident: 4 MiB
+    # requested, 208 KiB granted, burst datagrams dropped by the kernel and
+    # misread by KCP as network loss. Raising the ceiling is the deploy scripts'
+    # job, and the number has to agree in every place that names it or the fix
+    # is cosmetic. Same drift-guard idea as test_vcpkg_pins_agree.
+    config = read("src/kcp_proxy/config.hpp")
+    common = read("scripts/runtime/common.sh")
+
+    def literal_int(source: str, pattern: str, label: str) -> int:
+        match = re.search(pattern, source, re.MULTILINE)
+        require(match is not None, f"{label} not found")
+        expr = match.group(1).strip()
+        # Only ever a literal arithmetic expression from our own source; refuse
+        # anything else rather than eval() it.
+        require(re.fullmatch(r"[0-9][0-9 *+()]*", expr) is not None,
+                f"{label} must be a plain integer expression, got {expr!r}")
+        return int(eval(expr, {"__builtins__": {}}, {}))  # noqa: S307 - digits and operators only
+
+    rcv = literal_int(config, r"constexpr int UDP_SO_RCVBUF_BYTES\s*=\s*([0-9 *+()]+);",
+                      "config.hpp UDP_SO_RCVBUF_BYTES")
+    snd = literal_int(config, r"constexpr int UDP_SO_SNDBUF_BYTES\s*=\s*([0-9 *+()]+);",
+                      "config.hpp UDP_SO_SNDBUF_BYTES")
+    rmem = literal_int(common, r"^UDP_RMEM_MAX=([0-9]+)$", "common.sh UDP_RMEM_MAX")
+    wmem = literal_int(common, r"^UDP_WMEM_MAX=([0-9]+)$", "common.sh UDP_WMEM_MAX")
+
+    require(rmem == rcv,
+            f"common.sh UDP_RMEM_MAX={rmem} must equal config.hpp "
+            f"UDP_SO_RCVBUF_BYTES={rcv} (the ceiling must match what the server asks for)")
+    require(wmem == snd,
+            f"common.sh UDP_WMEM_MAX={wmem} must equal config.hpp "
+            f"UDP_SO_SNDBUF_BYTES={snd} (the ceiling must match what the server asks for)")
+
+    match = re.search(r'^SYSCTL_CONF="([^"]+)"', common, re.MULTILINE)
+    require(match is not None, 'common.sh must define SYSCTL_CONF="<path>"')
+    conf = match.group(1)
+    require(conf.startswith("/etc/sysctl.d/") and conf.endswith(".conf"),
+            f"SYSCTL_CONF must be a /etc/sysctl.d/*.conf drop-in, got {conf}")
+
+    install = read("scripts/deploy/install-service.sh")
+    uninstall = read("scripts/deploy/uninstall-service.sh")
+    package = read("scripts/package/package.py")
+
+    # package.py does not source common.sh, so it carries its own copy of the
+    # path and the constants -- and they have to be the same ones.
+    for name, text in (("install-service.sh", install),
+                       ("uninstall-service.sh", uninstall),
+                       ("package.py", package)):
+        require(conf in text or "{SYSCTL_CONF}" in text,
+                f"{name} must reference the sysctl drop-in {conf}")
+    for const, want in (("UDP_RMEM_MAX", rmem), ("UDP_WMEM_MAX", wmem)):
+        m = re.search(rf"^{const} = ([0-9]+)$", package, re.MULTILINE)
+        require(m is not None, f"package.py must define {const}")
+        require(int(m.group(1)) == want,
+                f"package.py {const}={m.group(1)} must equal common.sh's {want}")
+
+    # Only-raise, never-lower. Both writers must gate each key on the host's
+    # current value being lower: an unconditional write would cap a host an
+    # operator had deliberately tuned above 4 MiB, which is worse than leaving
+    # it alone.
+    for name, text in (("install-service.sh", install), ("package.py", package)):
+        for key in ("rmem", "wmem"):
+            require(re.search(rf'\[ "\$cur_{key}" -lt ', text) is not None,
+                    f"{name} must only raise {key}_max when the host value is lower")
+
+    # The ceiling has to be in place BEFORE the service starts: the server reads
+    # the clamp once, at startup, so applying it afterwards leaves the running
+    # process holding the small buffer until someone restarts it by hand.
+    require(install.index("\napply_udp_buffer_ceiling\n")
+            < install.index('systemctl restart "$SERVICE_NAME"'),
+            "install-service.sh must apply the ceiling before restarting the service")
+    require(package.index("sysctl -n net.core.rmem_max")
+            < package.index('systemctl restart "$SERVICE_NAME"'),
+            "the deb postinst must apply the ceiling before restarting the service")
+
+    # Both removal paths must clean it up: the drop-in is written by the
+    # installer, so dpkg does not track it and would otherwise leave a sysctl
+    # file capping rmem_max for the whole host after an uninstall.
+    require('rm -f "$SYSCTL_CONF"' in uninstall,
+            "uninstall-service.sh must remove the sysctl drop-in")
+    require("rm -f {SYSCTL_CONF}" in package,
+            "the deb postrm must remove the sysctl drop-in")
+    # Removing a drop-in does not lower a value that is already live, so the
+    # uninstaller has to say so instead of implying a clean rollback.
+    require("until the next reboot" in uninstall,
+            "uninstall-service.sh must warn that the raised ceiling survives until reboot")
+
+
 def test_vcpkg_pins_agree():
     build = read("build.sh")
     match = re.search(r'VCPKG_COMMIT="([0-9a-f]{40})"', build)
@@ -371,6 +461,7 @@ TESTS = [
     test_gui_maps_darwin_to_the_macos_bin_dir,
     test_deploy_dry_run,
     test_service_scripts,
+    test_udp_buffer_ceiling_agrees,
     test_vcpkg_pins_agree,
     test_versions_agree,
     test_suffix_validation_agrees,

@@ -28,6 +28,63 @@ should only be returned after all resolved endpoints fail or the connect timeout
 
 Use `-L DEBUG` to inspect endpoint-level diagnostics when adding deeper logging.
 
+## Connections Stall or Close Under Load (`ERR_CONNECTION_CLOSED`)
+
+Symptom: browsing through the proxy works when idle, but opening a page with many parallel connections
+(Chrome opens ~40) makes several of them hang and then fail with `ERR_CONNECTION_CLOSED`. Per-session
+server logs show a suspiciously uniform, very small `rx_pkt=` — often the same number for every stalled
+session.
+
+That uniformity is the tell. It means only the first few datagrams of each session were ever drained
+from the socket, and the rest were dropped by the kernel before the server saw them.
+
+Cause: the server requests 4 MiB UDP socket buffers, but the kernel silently clamps the request to
+`net.core.rmem_max` / `net.core.wmem_max` (208 KiB on a stock Debian host) and `setsockopt` still
+reports success. The smaller buffer overflows during a simultaneous burst from many sessions in KCP's
+fastest mode (`nc=1`, 10 ms interval, no congestion control), the kernel drops datagrams, and KCP
+misreads those drops as network loss and retransmits whole windows.
+
+Check:
+
+1. The startup log prints the effective sizes. A clamp also emits its own WARNING:
+
+   ```
+   UDP socket buffers so_rcvbuf=212992 so_sndbuf=212992
+   UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=212992 ...
+   ```
+
+   `so_rcvbuf` should read 4194304 (or higher — Linux reports a doubled value).
+
+2. Compare the kernel's UDP drop counters against its total input. `InErrors == RcvbufErrors` with
+   `InCsumErrors=0` means buffer overflow, not corruption or a bad link:
+
+   ```bash
+   # The Udp: line in /proc/net/snmp is a header row followed by a value row.
+   # Map the header to column indices instead of hardcoding them: kernels append
+   # columns over time (IgnoredMulti, InCsumErrors), so fixed indices silently
+   # report the wrong counter.
+   awk '/^Udp:/ { if (h++) { for (i = 2; i <= NF; i++) printf "%s=%s ", hdr[i], $i; print ""; exit }
+                   for (i = 2; i <= NF; i++) hdr[i] = $i }' /proc/net/snmp
+   ```
+
+   Sample it before and after a burst: a nonzero delta on `RcvbufErrors` is the confirmation.
+
+3. Confirm the ceiling is actually raised: `sysctl net.core.rmem_max net.core.wmem_max`.
+
+Fix: raise the ceiling on the server and restart the service. Both installers do this automatically
+(`/etc/sysctl.d/99-kcp-proxy.conf`, written only when the host's value is lower — see the README's
+deployment section). To do it by hand:
+
+```bash
+printf 'net.core.rmem_max=4194304\nnet.core.wmem_max=4194304\n' | sudo tee /etc/sysctl.d/99-kcp-proxy.conf
+sudo sysctl -p /etc/sysctl.d/99-kcp-proxy.conf
+sudo systemctl restart kcp-proxy-server   # the server reads the clamp at startup
+```
+
+A kernel drop is not the only way to lose a burst, but it is the one that is invisible from inside the
+process — which is why the server compares the requested and effective sizes instead of trusting
+`setsockopt` to have failed loudly.
+
 ## Log Volume
 
 `INFO` is intended for lifecycle events: server/client start, session creation/close, SOCKS5 target,

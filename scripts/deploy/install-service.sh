@@ -40,6 +40,9 @@ else
     ENV_FILE="$ENV_DIR/server.env"
     SERVICE_NAME="kcp-proxy-server.service"
     SERVICE_USER="kcpproxy"
+    SYSCTL_CONF="/etc/sysctl.d/99-kcp-proxy.conf"
+    UDP_RMEM_MAX=4194304
+    UDP_WMEM_MAX=4194304
 fi
 
 # Serialize concurrent installs when flock is available.
@@ -231,6 +234,79 @@ ReadWritePaths=-$LOG_DIR
 WantedBy=multi-user.target
 EOF
 
+# ---------- kernel UDP buffer ceiling (must precede the restart) ----------
+# The server requests 4 MiB socket buffers when it starts, and the kernel clamps
+# them to net.core.rmem_max / net.core.wmem_max without reporting an error. The
+# ceiling therefore has to be raised BEFORE the service starts: raising it
+# afterwards would leave the running process holding the clamped buffer until
+# the next restart.
+#
+# Only ever raise. A host already at or above the required values is left
+# completely untouched -- no file is written at all -- so an operator's own
+# sysctl tuning is never overwritten, and a key that is already high enough is
+# omitted from the drop-in rather than written back down to our value.
+#
+# sysctl is not guaranteed to exist on a minimal Debian host, and a failure here
+# is not fatal: the service still runs, just with smaller buffers and a WARNING
+# in its log naming the clamped value (see describe_buffer_clamp in the server).
+apply_udp_buffer_ceiling() {
+    if ! command -v sysctl >/dev/null 2>&1; then
+        echo "Warning: sysctl not found; leaving the kernel UDP buffer ceiling alone."
+        echo "         The server will log a WARNING if the kernel clamps its buffers."
+        return 0
+    fi
+
+    cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    cur_wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+    # A missing/odd value must not turn into an arithmetic error under set -e.
+    case "$cur_rmem" in ''|*[!0-9]*) cur_rmem=0 ;; esac
+    case "$cur_wmem" in ''|*[!0-9]*) cur_wmem=0 ;; esac
+
+    if [ "$cur_rmem" -ge "$UDP_RMEM_MAX" ] && [ "$cur_wmem" -ge "$UDP_WMEM_MAX" ]; then
+        echo "UDP buffer ceiling already sufficient (rmem_max=$cur_rmem wmem_max=$cur_wmem); not touching it."
+        return 0
+    fi
+
+    # Report only the keys actually being raised. A single "rmem_max 8388608 ->
+    # 4194304" line would be a lie: an already-sufficient key is never lowered,
+    # it is simply left out of the drop-in.
+    raise_msg=""
+    if [ "$cur_rmem" -lt "$UDP_RMEM_MAX" ]; then
+        raise_msg="rmem_max $cur_rmem -> $UDP_RMEM_MAX"
+    fi
+    if [ "$cur_wmem" -lt "$UDP_WMEM_MAX" ]; then
+        if [ -n "$raise_msg" ]; then raise_msg="$raise_msg, "; fi
+        raise_msg="${raise_msg}wmem_max $cur_wmem -> $UDP_WMEM_MAX"
+    fi
+    echo "Raising UDP buffer ceiling: $raise_msg"
+    mkdir -p "$(dirname "$SYSCTL_CONF")"
+    {
+        echo "# Written by kcp-proxy install-service.sh. See CLAUDE.md (Deployment)."
+        echo "# The kcp-proxy server asks for 4 MiB UDP socket buffers. Without this"
+        echo "# ceiling the kernel silently clamps them to the defaults (208 KiB on"
+        echo "# Debian), then drops datagrams under burst -- which KCP misreads as"
+        echo "# network loss and answers with whole-window retransmission."
+        echo "# Only the keys that were below the required value are listed, so a"
+        echo "# host already tuned higher keeps its own setting."
+        # Written as if-blocks, not `[ ... ] && echo`: the latter returns 1 when
+        # the test is false, and under `set -e` a false trailing test would
+        # abort the whole install whenever only one of the two keys needed raising.
+        if [ "$cur_rmem" -lt "$UDP_RMEM_MAX" ]; then echo "net.core.rmem_max=$UDP_RMEM_MAX"; fi
+        if [ "$cur_wmem" -lt "$UDP_WMEM_MAX" ]; then echo "net.core.wmem_max=$UDP_WMEM_MAX"; fi
+    } > "$SYSCTL_CONF"
+    chmod 644 "$SYSCTL_CONF"
+
+    # Apply just this file: 'sysctl --system' would also re-read every other
+    # drop-in on the host, turning someone else's broken file into our failure.
+    if sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1; then
+        echo "  now: rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo '?') wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo '?')"
+    else
+        echo "Warning: could not apply $SYSCTL_CONF." >&2
+        echo "         The server will log a WARNING naming the clamped buffer size." >&2
+    fi
+}
+apply_udp_buffer_ceiling
+
 # ---------- enable & (re)start ----------
 systemctl daemon-reload
 echo "Enabling and starting $SERVICE_NAME ..."
@@ -292,6 +368,8 @@ echo "  Status:  systemctl status $SERVICE_NAME"
 echo "  Logs:    journalctl -u $SERVICE_NAME -f"
 echo "  Logfile: $LOG_FILE (rotates to .1 past 10 MiB; empty LOG_FILE in"
 echo "           $ENV_FILE = journald only)"
+echo "  Sysctl:  $SYSCTL_CONF (kernel UDP buffer ceiling; written only when the"
+echo "           host's rmem_max/wmem_max was lower, removed on uninstall)"
 echo "  Stop:    systemctl stop $SERVICE_NAME"
 echo "  Restart: systemctl restart $SERVICE_NAME"
 echo

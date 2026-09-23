@@ -28,9 +28,10 @@ enum class LogLevel { Debug, Info, Warning, Error };
 //         LOG_WARNING("server", "..." + fmt::format(" ({} suppressed)", suppressed));
 //     }
 //
-// Not thread-safe: callers must serialize it (the server's UDP receive path is
-// serialized by construction -- exactly one async_receive_from is outstanding
-// at a time, and the next is only armed as the last statement of the handler).
+// Not thread-safe: callers must serialize it. The server's UDP receive path is
+// serialized by construction -- the socket is built on its own strand, and every
+// receive completion handler is explicitly bound to that strand, so handlers run
+// one at a time no matter how many receives are outstanding.
 class LogThrottle {
 public:
     explicit LogThrottle(std::chrono::milliseconds interval = std::chrono::seconds(1))
