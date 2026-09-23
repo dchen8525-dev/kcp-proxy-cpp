@@ -86,6 +86,124 @@ class EchoServer:
             pass
 
 
+class OneShotTarget:
+    """Accepts connections, sends a fixed payload, then hangs up.
+
+    Models a target that answers and closes -- HTTP/1.0 without
+    Content-Length, a one-shot daemon, a shell command that exits. This is the
+    case where the server side of the tunnel reaches EOF while the local app is
+    still reading, so the app can only finish when the server's half-close
+    reaches it.
+    """
+
+    def __init__(self, port, payload):
+        self.port = port
+        self.payload = payload
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(8)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop:
+            try:
+                self.sock.settimeout(0.5)
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.sendall(self.payload)
+        except OSError:
+            pass
+        finally:
+            # close() is what actually emits the FIN the server observes as
+            # its target-EOF; nothing was read, so the receive queue is empty
+            # and the close is clean.
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class EofWatcher:
+    """Accepts one connection, reads until EOF, and records when it arrived.
+
+    The mirror image of OneShotTarget: it answers the question "did the local
+    app's half-close actually reach the target, and how long did it take?".
+    """
+
+    def __init__(self, port, ack=b""):
+        self.port = port
+        self.ack = ack
+        self.received = bytearray()
+        self.eof_event = threading.Event()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(8)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop:
+            try:
+                self.sock.settimeout(0.5)
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                self.received += data
+        except OSError:
+            pass
+        self.eof_event.set()
+        try:
+            if self.ack:
+                conn.sendall(self.ack)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def recv_exact(sock, n, timeout):
     """Read exactly n bytes or raise."""
     sock.settimeout(timeout)
@@ -132,6 +250,24 @@ def socks5_connect(socks_host, socks_port, target_host, target_port, timeout):
     else:
         raise RuntimeError("bad SOCKS5 reply ATYP=0x%02x" % atyp)
     return s
+
+
+def wait_for_eof(sock, timeout):
+    """Read until EOF; return how many seconds that took.
+
+    Raises rather than returning on timeout so a caller can never mistake
+    "still blocked" for "closed promptly".
+    """
+    sock.settimeout(timeout)
+    start = time.time()
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            raise AssertionError("no EOF within %.1fs" % timeout)
+        if not chunk:
+            return time.time() - start
+        raise AssertionError("expected EOF, got %d unexpected bytes" % len(chunk))
 
 
 def wait_for_port(host, port, timeout):
@@ -181,10 +317,15 @@ def augment_dll_path(exe_path):
 
 
 def start_pair(server_exe, client_exe, udp_port, socks_port, allow_target=None):
-    """Start a server+client pair on loopback; return the two Popen handles."""
+    """Start a server+client pair on loopback; return the two Popen handles.
+
+    `allow_target` is one "HOST:PORT" string or a list of them (the server's
+    --allow-target is repeatable).
+    """
     server_cmd = [server_exe, "-H", "127.0.0.1", "-p", str(udp_port), "-k", KEY, "-L", "WARNING"]
     if allow_target:
-        server_cmd += ["--allow-target", allow_target]
+        for target in ([allow_target] if isinstance(allow_target, str) else allow_target):
+            server_cmd += ["--allow-target", target]
     server_proc = subprocess.Popen(
         server_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     client_proc = subprocess.Popen(
@@ -249,6 +390,7 @@ def main():
     echo.start()
 
     procs = []
+    extra_servers = []
     try:
         # --- Phase 1: allowlisted local target -> data survives the tunnel ---
         udp1 = free_port()
@@ -288,6 +430,59 @@ def main():
                 "SSRF guard did NOT refuse loopback target without --allow-target")
         print("  [ok] default SSRF guard refuses loopback target (no allowlist)")
 
+        # --- Phase 3: half-close (FIN) reaches the far end promptly ----------
+        # Both directions used to end only when the peer's KCP_TIMEOUT_SEC idle
+        # sweep fired, so an app whose target hung up sat blocked for up to a
+        # minute (and a target waiting on the app's half-close for up to three,
+        # via the client's half-close grace). These cases assert the half-close
+        # arrives in seconds; the budget is well under KCP_TIMEOUT_SEC, so both
+        # fail on the old behavior and pass on the FIN path.
+        fin_budget = 10.0
+
+        oneshot_port = free_port()
+        oneshot = OneShotTarget(oneshot_port, b"one-shot answer\n")
+        oneshot.start()
+        watcher_port = free_port()
+        watcher = EofWatcher(watcher_port, ack=b"ack-after-half-close\n")
+        watcher.start()
+        extra_servers = [oneshot, watcher]
+
+        udp3 = free_port()
+        socks3 = free_port()
+        sp3, cp3 = start_pair(
+            args.server, args.client, udp3, socks3,
+            ["127.0.0.1:%d" % oneshot_port, "127.0.0.1:%d" % watcher_port])
+        procs += [sp3, cp3]
+        wait_pair_ready(sp3, cp3, socks3)
+
+        # 3a: target -> client. The target answers and hangs up; the local app
+        # must be told, instead of blocking until the client's idle sweep.
+        with socks5_connect("127.0.0.1", socks3, "127.0.0.1", oneshot_port, 20) as s:
+            got = recv_exact(s, len(oneshot.payload), 20)
+            if got != oneshot.payload:
+                raise AssertionError("one-shot target payload mismatch: %r" % got)
+            waited = wait_for_eof(s, fin_budget)
+        print("  [ok] target hang-up surfaced to the local app as EOF in %.2fs" % waited)
+
+        # 3b: client -> target. The local app half-closes after its request; the
+        # target must see EOF (not wait for the tunnel to time out), and the
+        # response it sends back afterwards must still arrive.
+        half_close_payload = b"request-body\n"
+        with socks5_connect("127.0.0.1", socks3, "127.0.0.1", watcher_port, 20) as s:
+            s.sendall(half_close_payload)
+            s.shutdown(socket.SHUT_WR)
+            if not watcher.eof_event.wait(fin_budget):
+                raise AssertionError(
+                    "target did not see the local app's half-close within %.1fs" % fin_budget)
+            got = recv_exact(s, len(watcher.ack), 20)
+            if got != watcher.ack:
+                raise AssertionError("post-half-close response mismatch: %r" % got)
+            wait_for_eof(s, fin_budget)
+        if bytes(watcher.received) != half_close_payload:
+            raise AssertionError("target received %r, expected %r"
+                                 % (bytes(watcher.received), half_close_payload))
+        print("  [ok] local half-close reached the target promptly; response survived")
+
         print("E2E TUNNEL TEST PASSED")
         return 0
     except Exception as exc:  # noqa: BLE001 - surface any failure as a test failure
@@ -310,6 +505,8 @@ def main():
                 proc.wait(timeout=5)
             except Exception:
                 pass
+        for server in extra_servers:
+            server.stop()
         echo.stop()
 
 

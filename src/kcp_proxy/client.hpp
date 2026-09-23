@@ -52,6 +52,11 @@ private:
         // Set once the local app's read side reported EOF: the tunnel is in
         // drain-only mode. Until then the grace never applies.
         std::atomic<bool> app_eof{false};
+        // Set once the server reported its own half-close (KCP_PROXY_FIN_V1).
+        // The two flags together mean both directions are finished, so the
+        // tunnel can be torn down at once instead of waiting for the grace (or
+        // for the session's idle sweep) to notice.
+        std::atomic<bool> peer_fin{false};
         // steady_clock us of the last payload received from the target,
         // recorded as soon as it is consumed from KCP (so a slow write to the
         // app cannot look like a stalled target). Keepalives never touch this:

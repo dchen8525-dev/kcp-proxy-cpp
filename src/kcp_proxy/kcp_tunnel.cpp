@@ -46,6 +46,23 @@ void KcpTunnel::mark_handshake_done() {
     handshake_done_.store(true);
 }
 
+void KcpTunnel::send_fin() {
+    if (!fin_enabled_.load()) return;
+    if (!is_active()) return;
+    // At most one FIN per tunnel: the caller may reach here from more than one
+    // teardown path (e.g. a target read EOF and a later write error).
+    if (fin_sent_.exchange(true)) return;
+    auto body = build_control_payload(KCP_CONTROL_FIN);
+    const size_t len = body.size();
+    if (kcp_.send(byte_view(body.data(), len)) < 0) {
+        LOG_WARNING(log_module_, log_msg("FIN send failed"));
+        return;
+    }
+    kcp_.update(now_kcp_ms());
+    kcp_.flush();
+    LOG_INFO(log_module_, log_msg("FIN sent (half-close)"));
+}
+
 std::string KcpTunnel::stats_summary() const {
     const auto& m = metrics_;
     return log_msg(fmt::format(
@@ -181,6 +198,19 @@ void KcpTunnel::try_fulfill_read() {
         return;
     }
 
+    // The peer half-closed. Like the keepalive this is a control message and not
+    // stream data, but unlike it the pending read must complete: the caller's
+    // forwarding loop is the only thing that can act on "no more data will
+    // come", and complete-with-eof is the signal it already understands. KCP is
+    // ordered, so everything the peer queued before the FIN has been handed to
+    // the caller already -- nothing is lost by stopping there.
+    if (is_peer_fin(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
+        LOG_INFO(log_module_, log_msg("peer FIN received (half-close)"));
+        peer_fin_received_.store(true);
+        complete_pending_read(asio::error::eof);
+        return;
+    }
+
     // async_read_some delivers one whole KCP message. The message was already
     // consumed into kcp_recv_buf_ above, so if it does not fit the caller's
     // buffer there is no way to hand back the tail. Report the error instead of
@@ -248,25 +278,38 @@ void KcpTunnel::maybe_send_keepalive() {
     }
 }
 
-// Keepalive body = magic || session_salt. Requires the salt (shared with the
-// peer); a tunnel that has not learned it (e.g. server before the first packet)
-// has an empty payload so nothing is forwarded as if it were a keepalive.
-std::vector<uint8_t> KcpTunnel::build_keepalive_payload() const {
+// Control-message body = magic || session_salt. Requires the salt (shared with
+// the peer); a tunnel that has not learned it (e.g. server before the first
+// packet) has an empty payload so nothing is forwarded as if it were a control
+// message.
+std::vector<uint8_t> KcpTunnel::build_control_payload(const char* magic) const {
     std::vector<uint8_t> body;
-    const std::string_view magic = KCP_CONTROL_KEEPALIVE;
-    body.insert(body.end(), magic.begin(), magic.end());
+    const std::string_view m = magic;
+    body.insert(body.end(), m.begin(), m.end());
     const byte_view salt = crypto_->session_salt();
     body.insert(body.end(), salt.begin(), salt.end());
     return body;
 }
 
-bool KcpTunnel::is_keepalive(const uint8_t* data, size_t size) const {
+std::vector<uint8_t> KcpTunnel::build_keepalive_payload() const {
+    return build_control_payload(KCP_CONTROL_KEEPALIVE);
+}
+
+bool KcpTunnel::is_control(const uint8_t* data, size_t size, const char* magic) const {
     const byte_view salt = crypto_->session_salt();
-    const size_t magic_len = std::strlen(KCP_CONTROL_KEEPALIVE);
+    const size_t magic_len = std::strlen(magic);
     if (size != magic_len + salt.size()) return false;
-    if (std::memcmp(data, KCP_CONTROL_KEEPALIVE, magic_len) != 0) return false;
+    if (std::memcmp(data, magic, magic_len) != 0) return false;
     if (salt.size() > 0 && std::memcmp(data + magic_len, salt.data(), salt.size()) != 0) return false;
     return true;
+}
+
+bool KcpTunnel::is_keepalive(const uint8_t* data, size_t size) const {
+    return is_control(data, size, KCP_CONTROL_KEEPALIVE);
+}
+
+bool KcpTunnel::is_peer_fin(const uint8_t* data, size_t size) const {
+    return is_control(data, size, KCP_CONTROL_FIN);
 }
 
 } // namespace kcp_proxy

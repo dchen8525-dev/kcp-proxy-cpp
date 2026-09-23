@@ -820,10 +820,44 @@ void KCPProxyClient::forward_kcp_to_client(
     LOG_DEBUG("client", "forward_kcp_to_client: starting async_read_some");
     session->async_read_some(asio::buffer(*buf),
         [this, client_socket, session, buf, guard](const std::error_code& ec, size_t bytes) mutable {
+            if (ec == asio::error::eof) {
+                // The server half-closed (FIN): it will send no more target
+                // data. Everything it queued before the FIN was already handed
+                // to this loop (KCP is ordered), so stopping now loses nothing
+                // -- and the local app learns immediately instead of after the
+                // session's 60s idle sweep.
+                LOG_INFO("client", "KCP session half-closed by server (FIN)");
+                if (guard) {
+                    guard->peer_fin.store(true);
+                    std::error_code timer_ec;
+                    guard->deadline.cancel(timer_ec);
+                    if (guard->app_eof.load()) {
+                        // Both directions are finished: the app stopped sending
+                        // earlier (arm_half_close_grace) and so has the server.
+                        // Nothing is left to drain, so tear down now.
+                        std::error_code ignored;
+                        client_socket->close(ignored);
+                        session->close();
+                        return;
+                    }
+                }
+                // Half-close towards the app rather than close(): the app must
+                // still be able to read whatever is already in its receive
+                // buffer, and closing a socket with unread data turns into an
+                // RST that can discard it. The socket is closed for real when
+                // the app finishes and its own read reports EOF.
+                std::error_code ignored;
+                client_socket->shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
+                // Stay armed. The session is still alive -- the server only
+                // half-closed -- so a later teardown (its idle sweep, or the app
+                // closing its own end) must still be able to reach the
+                // close-everything path below. Returning here instead would
+                // leave the local socket open with nothing left to close it.
+                forward_kcp_to_client(client_socket, session, buf, guard);
+                return;
+            }
             if (ec || bytes == 0) {
-                if (ec == asio::error::eof) {
-                    LOG_INFO("client", "KCP session closed (EOF)");
-                } else if (ec == asio::error::operation_aborted) {
+                if (ec == asio::error::operation_aborted) {
                     LOG_DEBUG("client", "KCP read cancelled");
                 } else if (ec) {
                     LOG_ERROR("client", "KCP read error: " + ec.message());
@@ -898,6 +932,26 @@ void KCPProxyClient::arm_half_close_grace(
 
     guard->app_eof.store(true);
     guard->last_progress_us.store(now_us());
+
+    if (guard->peer_fin.load()) {
+        // The server already half-closed, so there is no response left to wait
+        // for and the grace would only delay the teardown. (The reverse order
+        // -- FIN arriving after the app closed -- is handled in the read
+        // completion above.) The FIN we would send here has nothing left to
+        // reach, so skip it too.
+        LOG_DEBUG("client", "app closed after server FIN, tearing tunnel down");
+        std::error_code ignored;
+        client_socket->close(ignored);
+        session->close();
+        return;
+    }
+
+    // Tell the server this direction is finished, so it can shut down the write
+    // side of the target socket instead of leaving the target blocked on a
+    // connection that will never deliver another byte. No-op unless the server
+    // negotiated V2 (see KCP_CONTROL_FIN). Runs on the session strand: this is
+    // called from the forwarding loop's read completion.
+    session->send_fin();
 
     // Arm once. on_half_close_check() re-arms itself while the target keeps
     // making progress, so the per-write hot path never touches the timer heap.

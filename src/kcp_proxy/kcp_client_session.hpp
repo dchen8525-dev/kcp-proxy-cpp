@@ -49,6 +49,12 @@ private:
     asio::ip::udp::endpoint server_addr_;
     std::optional<asio::ip::udp::socket> udp_socket_;
     asio::steady_timer connect_timer_;
+    // Backoff for the UDP receive error path, mirroring the server's
+    // receive_backoff_timer_: unknown receive errors re-arm do_udp_receive()
+    // through this short delay so a persistently failing socket cannot spin the
+    // io_context (bounded to ~100 retries/s). ICMP port-unreachable does NOT
+    // use it -- that is an expected condition and re-arms immediately.
+    asio::steady_timer receive_backoff_timer_;
     // NOTE: no per-session update timer. KCP updates are driven by
     // KCPProxyClient's single shared 10ms tick (do_update_tick), collapsing
     // N per-session timer-heap entries into one timer. on_update_tick()

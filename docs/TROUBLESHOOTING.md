@@ -5,6 +5,10 @@
 The client now waits for an authenticated `HELLO_ACK` from the server for every KCP session. If the server
 is down, UDP is blocked, or the key is wrong, the session fails instead of being marked connected.
 
+The client sends `KCP_PROXY_HELLO_V2` and accepts either `KCP_PROXY_HELLO_ACK_V2` (half-close enabled) or
+the older `KCP_PROXY_HELLO_ACK_V1` (half-close disabled, everything else unchanged), so it still works
+against a server that predates V2. A server that answers anything else fails the handshake outright.
+
 Check:
 
 - Server is listening on the expected UDP host and port.

@@ -142,6 +142,31 @@ constexpr uint8_t SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED = 0x08;
 
 inline constexpr char KCP_CONTROL_HELLO[] = "KCP_PROXY_HELLO_V1";
 inline constexpr char KCP_CONTROL_HELLO_ACK[] = "KCP_PROXY_HELLO_ACK_V1";
+// Second-generation handshake: the same exchange, plus the peer advertising
+// that it understands KCP_CONTROL_FIN. A V1 peer (an older client, or the
+// SOCKS5 compatibility path where no HELLO is sent at all) never receives a
+// FIN, because it would forward the unknown control message into the tunnel as
+// stream data. Both strings are compared whole, so they are distinct first
+// payloads rather than a versioned prefix.
+inline constexpr char KCP_CONTROL_HELLO_V2[] = "KCP_PROXY_HELLO_V2";
+inline constexpr char KCP_CONTROL_HELLO_ACK_V2[] = "KCP_PROXY_HELLO_ACK_V2";
+// Half-close, i.e. "I will send no more stream data in my direction". Sent as
+// its own KCP message with this session's 16-byte salt appended, exactly like
+// the keepalive, so only the peer sharing this session's salt can produce one
+// and no genuine payload can collide with it. Distinct magic length from the
+// keepalive (16 vs 21 bytes) means neither sentinel can be mistaken for the
+// other. Unlike the keepalive it is only ever sent once per direction, and only
+// after the V2 handshake negotiated support (KcpTunnel::send_fin).
+//
+// KCP delivers messages in order, so a FIN always arrives after every byte the
+// sender queued before it: the receiver can stop reading from KCP as soon as it
+// sees one, without risking a truncated stream.
+//
+// NOTE: Android CPP_REMOTE must recognize `magic || session_salt` and half-close
+// its own socket instead of forwarding it, otherwise it will inject garbage into
+// the tunnel. Until it does, it must keep sending KCP_PROXY_HELLO_V1 so this
+// side never emits a FIN towards it.
+inline constexpr char KCP_CONTROL_FIN[] = "KCP_PROXY_FIN_V1";
 // Application-layer keepalive magic. Sent as its own KCP message when a tunnel
 // has been idle for KCP_KEEPALIVE_SEC, with this session's 16-byte salt
 // appended (see KcpTunnel::build_keepalive_payload). The receiver drops an

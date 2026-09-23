@@ -92,9 +92,18 @@ Captured from a real run. The lifecycle stays at `INFO`; packet-level detail is
 
 Note the handshake line: `CPP_REMOTE` sends the SOCKS5 CONNECT as its first
 payload, so the server takes the compatibility path above. The C++ **client**
-sends `KCP_PROXY_HELLO_V1` first and therefore logs
-`<peer-ip>:<port>: KCP handshake confirmed` instead — do not expect that line
-from an Android session, and do not treat its absence as a failure.
+sends `KCP_PROXY_HELLO_V2` first and therefore logs
+`<peer-ip>:<port>: KCP handshake confirmed (V2, half-close enabled)` instead —
+do not expect that line from an Android session, and do not treat its absence
+as a failure.
+
+Because the compatibility path performs no capability exchange, half-close is
+disabled for it: the server never sends a `KCP_PROXY_FIN_V1` to a peer that
+arrived that way, so today's `CPP_REMOTE` cannot receive one. Once it implements
+`KCP_PROXY_HELLO_V2` it must also recognize `KCP_PROXY_FIN_V1 || session_salt`
+and half-close its socket instead of forwarding those bytes into the tunnel —
+see PROTOCOL.md. Until then it should keep sending `KCP_PROXY_HELLO_V1` if it
+ever sends a HELLO at all.
 
 On disconnect (FIN/RST, error, or the 60s idle sweep):
 

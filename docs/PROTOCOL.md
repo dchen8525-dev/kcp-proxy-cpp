@@ -8,16 +8,21 @@ connection for the SOCKS5 CONNECT target.
 
 ## KCP Handshake
 
-CPP clients may send `KCP_PROXY_HELLO_V1` inside encrypted KCP data before SOCKS5 data. The server replies
-with `KCP_PROXY_HELLO_ACK_V1`. The C++ client reports the KCP session as connected only after this
+CPP clients may send `KCP_PROXY_HELLO_V2` inside encrypted KCP data before SOCKS5 data. The server replies
+with `KCP_PROXY_HELLO_ACK_V2`. The C++ client reports the KCP session as connected only after this
 authenticated reply arrives.
 
-As a compatibility mode, the server also accepts a first payload that is directly a SOCKS5 CONNECT request
-(no HELLO required). The server accepts either first payload:
+`KCP_PROXY_HELLO_V2`/`_ACK_V2` are the same exchange as V1 plus half-close support (see below); the ACK
+always mirrors the request, so a V1 client is answered with `KCP_PROXY_HELLO_ACK_V1` and is never told
+about a capability the server would not use towards it.
 
-- `KCP_PROXY_HELLO_V1`: send `KCP_PROXY_HELLO_ACK_V1`, then wait for SOCKS5.
+As a compatibility mode, the server also accepts a first payload that is directly a SOCKS5 CONNECT request
+(no HELLO required). The server accepts any of these first payloads:
+
+- `KCP_PROXY_HELLO_V2`: send `KCP_PROXY_HELLO_ACK_V2`, enable half-close both ways, then wait for SOCKS5.
+- `KCP_PROXY_HELLO_V1`: send `KCP_PROXY_HELLO_ACK_V1`, then wait for SOCKS5. Half-close stays disabled.
 - SOCKS5 CONNECT bytes: treat the first valid encrypted KCP/SOCKS5 packet as the compatibility handshake
-  and continue to TCP connect.
+  and continue to TCP connect. Half-close stays disabled (there was no capability exchange).
 
 C++ client handshake timeout is `3s`. Wrong key, missing server, or blocked UDP produces handshake
 failure/timeout instead of a fake connected state.
@@ -43,9 +48,14 @@ failure/timeout instead of a fake connected state.
   - `session_salt` is the per-session random salt described above (cleartext, not
     secret). It is present on **every** datagram, not just the first.
 - Nonce layout: 8-byte big-endian packet counter, 1-byte direction, 3 zero bytes.
-  The counter's **starting value is derived from the salt** (first 6 bytes,
-  big-endian), so the nonce sequence is unique per session even if two sessions
-  were ever forced to share a key.
+  The counter's **starting value is derived from the salt** (first 6 bytes, big-endian).
+  Note this does *not* make the nonce sequence unique across sessions that share a salt: the
+  key is `HKDF(PSK, APP_SALT || salt)` and the start counter is a pure function of that same
+  salt, so two sessions with an identical salt share both the key and the IV sequence. Salt
+  uniqueness is what provides nonce uniqueness, and the only thing enforcing it is the
+  server's duplicate-salt rejection — which covers *live* sessions only. A peer that reuses a
+  salt sequentially is undetectable here and would be a catastrophic keystream reuse, so a
+  fresh random salt per session is mandatory, not an optimization.
 - Direction byte: client `0x01`, server `0x02`.
 - Maximum counter: `2^48 - 1`; encryption throws after that and the session must be recreated.
 - Minimum CLI key length: 16 characters.
@@ -60,7 +70,7 @@ encrypted UDP packet before allocating KCP session state, but it uses the same p
 object that will own the session. That means the first accepted packet seeds the replay window before its
 decrypted bytes are injected into KCP; replaying that packet to the live session is rejected. There is
 intentionally no global replay window across all clients because a client may create a fresh UDP socket
-per connection, starting its counter at 0.
+per connection, starting its counter at the salt-derived value (see the nonce layout above).
 
 **Per-session key isolation (interop-critical).** Every session derives a *unique* AEAD key from
 `PSK || session_salt`. The server learns `session_salt` from the first packet and then verifies, with a
@@ -90,6 +100,37 @@ is ever silently dropped.
 
 **Android CPP_REMOTE must build and drop the same `magic || session_salt`** heartbeat; otherwise it
 would be forwarded into the tunnel as garbage data.
+
+## Half-close (FIN)
+
+`KCP_PROXY_KEEPALIVE_V1` only ever says "still here", so before this the two ends of a tunnel had no way
+to say "no more data in my direction" — a session ended only when the peer's `KCP_TIMEOUT_SEC` (60s)
+idle sweep fired. A local app whose target hung up therefore stayed blocked for up to a minute, and a
+target waiting on the app's half-close for up to three (the client's half-close grace, then the server's
+sweep).
+
+`KCP_PROXY_FIN_V1` closes that gap. It is sent as its own KCP message, payload `magic || session_salt`,
+scoped by the per-session salt exactly like the keepalive — so only the peer sharing this session's salt
+can produce one, and no genuine payload can collide with it. The two magics differ in length (16 vs 21
+bytes), so neither sentinel can be mistaken for the other.
+
+- **Who sends it.** The server, when its target connection reaches EOF or a target write fails (queued
+  after every byte the target produced, so KCP ordering delivers it last). The client, when the local app
+  stops sending (its read side reports EOF), which is what lets the target see the half-close.
+- **When.** At most once per direction, and only after the V2 handshake negotiated support. A V1 peer —
+  an older client, or Android CPP_REMOTE before it implements FIN — is never sent one, because it would
+  forward the unrecognized control message into the tunnel as stream data.
+- **What the receiver does.** It stops reading from KCP for that direction and half-closes the
+  corresponding TCP socket with `shutdown(SHUT_WR)` rather than `close()`: the local application must
+  still be able to drain whatever is already in its receive buffer, and closing a socket with unread data
+  turns into an RST that can discard it. The other direction keeps flowing, so a response in flight is
+  never truncated.
+- The sender's FIN is flushed before the session is torn down, so the existing drain (`wait_send() == 0`)
+  covers it: the session outlives the FIN until the peer has ACKed it.
+
+**Android CPP_REMOTE must recognize `magic || session_salt` and half-close its own socket** instead of
+forwarding it, otherwise it will inject garbage into the tunnel. Until it does, it must keep sending
+`KCP_PROXY_HELLO_V1` so this side never emits a FIN towards it.
 
 ## SOCKS5
 

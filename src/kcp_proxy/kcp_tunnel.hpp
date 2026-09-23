@@ -85,6 +85,19 @@ public:
     bool is_handshake_done() const { return handshake_done_.load(); }
     virtual void mark_handshake_done();
 
+    // ------------------------- half-close (FIN) -----------------------------
+    // Whether the peer negotiated FIN support (KCP_PROXY_HELLO_V2 / _ACK_V2).
+    // Until it is set, send_fin() is a no-op: a peer that did not advertise
+    // support would forward the control message into the tunnel as data.
+    bool fin_enabled() const { return fin_enabled_.load(); }
+    void enable_fin() { fin_enabled_.store(true); }
+    // Tell the peer that this side will send no more stream data, and flush it.
+    // Idempotent (at most one FIN per tunnel) and a no-op on a tunnel that has
+    // not negotiated support or is no longer active. Must run on the strand.
+    void send_fin();
+    // True if the peer's FIN was consumed from KCP (see try_fulfill_read).
+    bool peer_fin_received() const { return peer_fin_received_.load(); }
+
     // Micros since the last packet that authenticated successfully.
     int64_t activity_age_us() const;
 
@@ -121,13 +134,18 @@ protected:
     // Inject the application-layer keepalive if the cadence is due. Called from
     // the tick, after the handshake is done.
     void maybe_send_keepalive();
+    // Control-message body = magic || session_salt (see is_control).
+    std::vector<uint8_t> build_control_payload(const char* magic) const;
     // Keepalive body = magic || session_salt (see is_keepalive).
     std::vector<uint8_t> build_keepalive_payload() const;
-    // True if `data[0..size)` is this session's keepalive: the fixed magic
-    // string immediately followed by this session's salt. Scoping the sentinel
-    // with the per-session salt means a genuine payload can never collide with
-    // it -- only a peer that shares this session's salt can produce a match.
+    // True if `data[0..size)` is `magic` immediately followed by this session's
+    // salt. Scoping the sentinel with the per-session salt means a genuine
+    // payload can never collide with it -- only a peer that shares this
+    // session's salt can produce a match.
+    bool is_control(const uint8_t* data, size_t size, const char* magic) const;
     bool is_keepalive(const uint8_t* data, size_t size) const;
+    // True if `data[0..size)` is this session's FIN (see is_control).
+    bool is_peer_fin(const uint8_t* data, size_t size) const;
     void touch_activity();
 
     // "tag: text" when a tag is set (server sessions), just "text" otherwise.
@@ -150,6 +168,13 @@ protected:
 
     SessionMetrics metrics_;
     std::atomic<bool> handshake_done_{false};
+    // FIN negotiation state: enabled by the V2 handshake, sent at most once.
+    std::atomic<bool> fin_enabled_{false};
+    std::atomic<bool> fin_sent_{false};
+    // Set when the peer's FIN has been consumed from KCP. Sticky for the life of
+    // the tunnel: once the peer has half-closed it can never un-half-close, and
+    // both the forwarding loops and the teardown paths need to consult it.
+    std::atomic<bool> peer_fin_received_{false};
 
     std::atomic<int64_t> last_activity_us_{0};  // steady_clock micros
     // Throttle for the periodic (DEBUG) UDP stats line, to avoid per-tick spam.

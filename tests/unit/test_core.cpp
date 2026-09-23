@@ -705,6 +705,67 @@ void test_server_session_routing_and_auth() {
                 "a valid packet must be dropped once the per-second auth budget is spent");
 }
 
+void test_server_unauth_packet_cannot_evict_live_session() {
+    // Regression: get_or_create_session used to answer "is this a reconnect?"
+    // with salt_matches(), i.e. from unauthenticated cleartext, and to act on it
+    // BEFORE the auth decrypt. So any datagram from a live endpoint whose first
+    // 16 bytes differed from the session salt -- one byte total is enough --
+    // stopped the session, erased it and closed its upstream TCP socket, and
+    // was then itself dropped as unauthenticated. One spoofed packet per
+    // teardown, and it sat upstream of the auth rate limiter, so it was not
+    // even throttled.
+    asio::io_context io;
+    const std::string key = "remote_test_key_123456";
+    auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+
+    const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41001);
+    const std::vector<uint8_t> connect_req = {0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80};
+    const byte_view req_view(connect_req.data(), connect_req.size());
+
+    const auto salt = Crypto::generate_session_salt();
+    Crypto client(key, NONCE_DIR_CLIENT, salt, false);
+    auto first = client.encrypt(req_view);
+    auto live = server->route_datagram(ep, byte_view(first.data(), first.size()));
+    expect_true(live != nullptr, "a valid first packet must create a session");
+
+    const auto prev_level = current_log_level();
+    set_log_level(LogLevel::Error);
+
+    // (1) A sub-salt-length datagram: salt_matches() is false by construction,
+    // and no decrypt can ever succeed on it.
+    const std::vector<uint8_t> tiny{0x00};
+    expect_true(server->route_datagram(ep, byte_view(tiny.data(), tiny.size())) == nullptr,
+                "a sub-salt-length datagram must be rejected");
+
+    // (2) A full-length forged datagram whose salt prefix is wrong.
+    const std::vector<uint8_t> forged(64, 0x5A);
+    expect_true(server->route_datagram(ep, byte_view(forged.data(), forged.size())) == nullptr,
+                "a forged-salt datagram must be rejected");
+
+    set_log_level(prev_level);
+
+    // The live session must have survived both: the next genuine packet, still
+    // carrying the ORIGINAL salt, has to land on the very same session object.
+    auto again = client.encrypt(req_view);
+    expect_true(server->route_datagram(ep, byte_view(again.data(), again.size())) == live,
+                "an unauthenticated datagram must not evict the live session");
+
+    // ...while a genuine reconnect -- a NEW salt that actually authenticates --
+    // must still replace it. That is the behaviour the deferred eviction exists
+    // to preserve, so pin it too.
+    const auto salt2 = Crypto::generate_session_salt();
+    Crypto reconnected(key, NONCE_DIR_CLIENT, salt2, false);
+    auto re_first = reconnected.encrypt(req_view);
+    auto replaced = server->route_datagram(ep, byte_view(re_first.data(), re_first.size()));
+    expect_true(replaced != nullptr, "an authenticated reconnect must create a session");
+    expect_true(replaced != live, "an authenticated reconnect must replace the old session");
+
+    // And the replacement is genuinely usable: its own next packet reuses it.
+    auto re_second = reconnected.encrypt(req_view);
+    expect_true(server->route_datagram(ep, byte_view(re_second.data(), re_second.size())) == replaced,
+                "the reconnected session must serve subsequent packets");
+}
+
 void test_session_oversized_kcp_message_fails_read() {
     // try_fulfill_read() has two distinct reject paths, neither of which was
     // covered: a KCP message larger than FWD_BUF_SIZE (a protocol violation --
@@ -907,6 +968,203 @@ void test_session_drained_deferred_while_send_buffer_nonempty() {
                 "session must stay alive until its send buffer drains");
 
     session->stop();
+}
+
+void test_session_half_close_fin_gate_and_delivery() {
+    // The FIN (half-close) contract, in three parts.
+    //
+    // 1. GATE. A FIN is only sent to a peer that negotiated it (HELLO_V2 /
+    //    ACK_V2), and only once. A V1 peer -- an older client, or Android
+    //    CPP_REMOTE before it implements FIN -- would forward the control
+    //    message into the tunnel as stream data, so the gate is a wire
+    //    compatibility guarantee, not an optimization. Once-only matters
+    //    because both teardown paths that call it (a target read EOF and a
+    //    later write error) can run.
+    // 2. DELIVERY. A received FIN completes the parked read with eof and latches
+    //    peer_fin_received(), which is what lets the forwarding loops stop
+    //    reading instead of waiting out KCP_TIMEOUT_SEC. Before this, a local
+    //    app whose target had hung up stayed blocked for up to a minute, and a
+    //    target waiting on the app's half-close for up to three.
+    // 3. SCOPING. A FIN is salt-scoped exactly like the keepalive, so one
+    //    carrying a foreign salt is ordinary stream data: it must be delivered,
+    //    never silently swallowed.
+    asio::io_context io;
+    const std::string key = "remote_test_key_123456";
+    const auto salt = Crypto::generate_session_salt();
+    const auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+
+    // The session decrypts as the server (it learns the salt from the peer's
+    // first datagram); the peer encrypts as the client with the same salt, so
+    // both derive matching per-direction keys.
+    const auto fin_payload_with = [](const std::vector<uint8_t>& scope_salt) {
+        std::vector<uint8_t> payload(KCP_CONTROL_FIN,
+                                     KCP_CONTROL_FIN + std::strlen(KCP_CONTROL_FIN));
+        payload.insert(payload.end(), scope_salt.begin(), scope_salt.end());
+        return payload;
+    };
+
+    // ---- 1. the gate: who may be sent a FIN, and how often ------------------
+    {
+        auto server_crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, byte_view{}, true);
+        Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
+        auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto,
+                                                    "fin-gate");
+        std::vector<std::vector<uint8_t>> emitted;
+        session->set_send_callback([&](std::vector<uint8_t> wire) {
+            emitted.push_back(std::move(wire));
+        });
+        session->start();
+        io.restart();
+        io.poll();
+
+        // The FIN payload is scoped with the peer's salt, so the peer has to
+        // speak first -- exactly as the server learns it in production.
+        KcpWrapper peer(KCP_CONV);
+        peer.set_output_callback([&](byte_view plain) {
+            auto wire = peer_crypto.encrypt(plain);
+            session->receive_data(byte_view(wire.data(), wire.size()));
+        });
+        std::vector<uint8_t> seed(8, 0x42);
+        expect_true(peer.send(byte_view(seed.data(), seed.size())) >= 0, "peer seed send");
+        uint32_t now = 0;
+        // ikcp_flush() is a no-op until ikcp_update() has run once, so every
+        // pump below advances the peer's clock before flushing.
+        for (int i = 0; i < 60 && server_crypto->session_salt().empty(); ++i) {
+            now += KCP_INTERVAL_MS;
+            peer.update(now);
+            peer.flush();
+            io.restart();
+            io.poll();
+        }
+        expect_true(server_crypto->session_salt().size() == salt.size(),
+                    "the session must learn the peer's salt from its first datagram");
+
+        // Not negotiated: a V1 peer must never see one.
+        emitted.clear();
+        session->send_fin();
+        io.restart();
+        io.poll();
+        expect_true(emitted.empty(), "send_fin must be a no-op until FIN is negotiated");
+
+        // Negotiated: exactly one FIN, however many times it is requested.
+        session->enable_fin();
+        session->send_fin();
+        session->send_fin();
+        io.restart();
+        io.poll();
+
+        const auto expected = fin_payload_with(salt);
+        size_t fin_segments = 0;
+        for (const auto& enc : emitted) {
+            std::vector<uint8_t> plain;
+            try {
+                plain = peer_crypto.decrypt(byte_view(enc.data(), enc.size()));
+            } catch (const std::exception&) {
+                continue;
+            }
+            if (plain.size() >= expected.size() &&
+                std::memcmp(plain.data() + (plain.size() - expected.size()),
+                            expected.data(), expected.size()) == 0) {
+                ++fin_segments;
+            }
+        }
+        expect_true(fin_segments == 1,
+                    "an enabled session must emit exactly one FIN, scoped with its salt");
+        session->stop();
+    }
+
+    // ---- 2. delivery: a FIN completes the parked read with eof --------------
+    {
+        auto server_crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, byte_view{}, true);
+        Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
+        auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto, "fin-rx");
+        session->set_send_callback([](std::vector<uint8_t>) {});
+        session->start();
+        io.restart();
+        io.poll();
+
+        KcpWrapper peer(KCP_CONV);
+        peer.set_output_callback([&](byte_view plain) {
+            auto wire = peer_crypto.encrypt(plain);
+            session->receive_data(byte_view(wire.data(), wire.size()));
+        });
+
+        std::array<uint8_t, FWD_BUF_SIZE> buf{};
+        bool completed = false;
+        std::error_code read_ec;
+        session->async_read_some(asio::buffer(buf), [&](std::error_code ec, size_t) {
+            completed = true;
+            read_ec = ec;
+        });
+        io.restart();
+        io.poll();
+
+        const auto payload = fin_payload_with(salt);
+        expect_true(peer.send(byte_view(payload.data(), payload.size())) >= 0, "peer FIN send");
+        uint32_t now = 0;
+        for (int i = 0; i < 60 && !completed; ++i) {
+            now += KCP_INTERVAL_MS;
+            peer.update(now);
+            peer.flush();
+            io.restart();
+            io.poll();
+        }
+        expect_true(completed, "a FIN must complete the parked read instead of hanging it");
+        expect_true(read_ec == asio::error::eof,
+                    "a FIN must complete the read with eof, the signal the forwarding loops act on");
+        expect_true(session->peer_fin_received(), "a FIN must latch peer_fin_received()");
+        session->stop();
+    }
+
+    // ---- 3. scoping: a foreign salt is stream data, not a FIN ---------------
+    {
+        auto server_crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, byte_view{}, true);
+        Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
+        auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto,
+                                                    "fin-foreign");
+        session->set_send_callback([](std::vector<uint8_t>) {});
+        session->start();
+        io.restart();
+        io.poll();
+
+        KcpWrapper peer(KCP_CONV);
+        peer.set_output_callback([&](byte_view plain) {
+            auto wire = peer_crypto.encrypt(plain);
+            session->receive_data(byte_view(wire.data(), wire.size()));
+        });
+
+        std::array<uint8_t, FWD_BUF_SIZE> buf{};
+        bool completed = false;
+        std::error_code read_ec;
+        size_t read_bytes = 0;
+        session->async_read_some(asio::buffer(buf), [&](std::error_code ec, size_t bytes) {
+            completed = true;
+            read_ec = ec;
+            read_bytes = bytes;
+        });
+        io.restart();
+        io.poll();
+
+        // Same magic, different salt: only a peer holding THIS session's salt
+        // may half-close it.
+        const auto foreign = fin_payload_with(Crypto::generate_session_salt());
+        expect_true(peer.send(byte_view(foreign.data(), foreign.size())) >= 0, "peer foreign send");
+        uint32_t now = 0;
+        for (int i = 0; i < 60 && !completed; ++i) {
+            now += KCP_INTERVAL_MS;
+            peer.update(now);
+            peer.flush();
+            io.restart();
+            io.poll();
+        }
+        expect_true(completed, "a foreign-salt FIN must be delivered as data, not dropped");
+        expect_true(!read_ec, "a foreign-salt FIN must not be reported as eof");
+        expect_true(read_bytes == foreign.size(),
+                    "a foreign-salt FIN must arrive as ordinary stream bytes");
+        expect_true(!session->peer_fin_received(),
+                    "a foreign-salt FIN must not latch the half-close flag");
+        session->stop();
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -1320,10 +1578,12 @@ int main() {
         test_kcp_wrapper_applies_constants();
         test_kcp_wrapper_oversized_message_is_not_truncated();
         test_server_session_routing_and_auth();
+        test_server_unauth_packet_cannot_evict_live_session();
         test_session_oversized_kcp_message_fails_read();
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();
         test_session_drained_deferred_while_send_buffer_nonempty();
+        test_session_half_close_fin_gate_and_delivery();
         test_client_session_close_before_connect_is_safe_and_idempotent();
         test_client_session_close_mid_handshake_makes_it_inert();
         test_client_session_close_releases_parked_handler();

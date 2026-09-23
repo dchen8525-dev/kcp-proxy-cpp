@@ -305,9 +305,16 @@ kcp-proxy-client -s <服务端地址> -k <密钥> [-p 8388] [-H 127.0.0.1] [-l 1
 ## 协议与加密
 
 每个本地 TCP 连接会创建一个独立 KCP/UDP 会话。C++ 客户端会先在 KCP 内发送认证加密的
-`KCP_PROXY_HELLO_V1`，服务端返回 `KCP_PROXY_HELLO_ACK_V1` 后客户端才把该会话标记为 connected。
-作为兼容模式，服务端也接受首个有效加密 KCP payload 直接是 SOCKS5 CONNECT 请求（不要求 HELLO）。
+`KCP_PROXY_HELLO_V2`，服务端返回 `KCP_PROXY_HELLO_ACK_V2` 后客户端才把该会话标记为 connected
+（V2 相比 V1 只多了半关闭支持，见下）。作为兼容模式，服务端也接受首个有效加密 KCP payload 直接是
+SOCKS5 CONNECT 请求（不要求 HELLO），并继续接受 `KCP_PROXY_HELLO_V1` 的旧客户端。
 超时、错密钥、服务端未运行或 UDP 被阻断都会导致连接失败。
+
+隧道两端各自用 `KCP_PROXY_FIN_V1`（payload 为 `magic || session_salt`，与心跳同样的会话盐作用域）
+通知对端"我这个方向不再发送数据"：服务端在目标连接 EOF 时发送，客户端在本地应用停止发送时发送。
+接收方随即停止在该方向读取 KCP，并对相应 TCP socket 执行 `shutdown(SHUT_WR)`（而非 `close()`，
+以免丢弃应用尚未读走的数据）。没有它时，隧道只能靠 60s 空闲扫描收尾——目标已挂断的本地应用会白等
+最长一分钟。该消息只在 V2 握手协商成功后发送，V1 对端永远不会收到。
 
 密钥字符串不会直接 SHA-256 截断。实现使用 HKDF-SHA256 派生 AES-128-GCM 密钥：
 

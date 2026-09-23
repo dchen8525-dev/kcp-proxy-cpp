@@ -567,7 +567,12 @@ void KCPServer::handle_protocol_handshake(std::shared_ptr<KCPSession> session) {
                 return;
             }
             const std::string msg(reinterpret_cast<const char*>(buf->data()), bytes);
-            if (msg != KCP_CONTROL_HELLO) {
+            // V2 is the same exchange plus FIN (half-close) support. A V1 peer,
+            // and the SOCKS5 compatibility path below, never get a FIN: see
+            // KCP_CONTROL_FIN. Note the ACK mirrors the request, so a V1 client
+            // is not told about a capability this server would use anyway.
+            const bool hello_v2 = (msg == KCP_CONTROL_HELLO_V2);
+            if (msg != KCP_CONTROL_HELLO && !hello_v2) {
                 session->mark_protocol_handshake_done();
                 std::vector<uint8_t> initial(buf->begin(), buf->begin() + static_cast<std::ptrdiff_t>(bytes));
                 LOG_INFO("server", session->session_id() +
@@ -576,9 +581,12 @@ void KCPServer::handle_protocol_handshake(std::shared_ptr<KCPSession> session) {
                 return;
             }
             session->mark_protocol_handshake_done();
-            session->send_data(byte_view(reinterpret_cast<const uint8_t*>(KCP_CONTROL_HELLO_ACK),
-                                         std::strlen(KCP_CONTROL_HELLO_ACK)));
-            LOG_INFO("server", session->session_id() + ": KCP handshake confirmed");
+            if (hello_v2) session->enable_fin();
+            const char* ack = hello_v2 ? KCP_CONTROL_HELLO_ACK_V2 : KCP_CONTROL_HELLO_ACK;
+            session->send_data(byte_view(reinterpret_cast<const uint8_t*>(ack),
+                                         std::strlen(ack)));
+            LOG_INFO("server", session->session_id() + ": KCP handshake confirmed" +
+                     (hello_v2 ? " (V2, half-close enabled)" : ""));
         });
 }
 
@@ -1058,6 +1066,16 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
         session->set_forward_read_pending(false);
         return;
     }
+    // The client half-closed: it will send no more data for the target, and the
+    // write side of the target socket has already been shut down (see the eof
+    // branch in the read handler below). Without this the loop would be re-armed
+    // by every later packet and write into a socket that can no longer accept
+    // it, which errors out and tears the session down before the target's
+    // remaining response has been drained to the client.
+    if (session->peer_fin_received()) {
+        session->set_forward_read_pending(false);
+        return;
+    }
 
     // Claim the kcp->tcp loop. try_set_forward_read_pending returns the OLD
     // value: false means we own it and may register a read, true means a loop
@@ -1108,6 +1126,21 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
     session->async_read_some(asio::buffer(*buf),
         [this, sid, session, buf, tcp_sock, self]
         (const std::error_code& ec, size_t bytes) mutable {
+            if (ec == asio::error::eof) {
+                // The client half-closed (FIN): it will send no more data for
+                // the target. Pass that on rather than tearing the session down
+                // -- the target->client direction may still have a whole
+                // response to deliver, and closing here would truncate it.
+                // shutdown_send (not close) so the target sees a clean FIN and
+                // can still write its answer back.
+                LOG_INFO("server", sid + ": client FIN received, closing target write side");
+                session->set_forward_read_pending(false);
+                if (tcp_sock && tcp_sock->is_open()) {
+                    std::error_code shutdown_ec;
+                    tcp_sock->shutdown(asio::ip::tcp::socket::shutdown_send, shutdown_ec);
+                }
+                return;
+            }
             if (ec || bytes == 0) {
                 if (ec && ec != asio::error::operation_aborted &&
                     ec != asio::error::already_started) {
@@ -1175,6 +1208,14 @@ void KCPServer::handle_target_closed(std::shared_ptr<KCPSession> session,
                  ": target connection closed, draining queued data to client (wait_send=" +
                  std::to_string(session->wait_send()) + ")");
         session->mark_target_closed();
+        // The target will produce no more data, so half-close towards the
+        // client now. Queued after everything the target already sent (KCP is
+        // ordered), so the client can stop reading the moment it arrives
+        // instead of waiting out its KCP_TIMEOUT_SEC idle sweep. It is also
+        // queued before the drain completes below, so wait_send() keeps the
+        // session alive until the FIN itself has been ACKed -- no separate
+        // linger phase is needed. No-op unless the peer negotiated V2.
+        session->send_fin();
     }
     if (tcp_socket && tcp_socket->is_open()) {
         std::error_code ignored;

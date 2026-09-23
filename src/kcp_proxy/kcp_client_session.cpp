@@ -2,6 +2,15 @@
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/time_util.hpp"
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <mswsock.h>
+// Present in mswsock.h on modern SDKs; defined here so MinGW and older
+// toolchains still compile the SIO_UDP_CONNRESET call (same shim as server.cpp).
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#endif
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -14,7 +23,8 @@ KCPClientSession::KCPClientSession(asio::io_context& io,
                                    uint32_t conv)
     : KcpTunnel(io, conv, std::move(crypto), "kcp_client", ""),
       server_addr_(std::move(server_addr)),
-      connect_timer_(strand()) {
+      connect_timer_(strand()),
+      receive_backoff_timer_(strand()) {
     last_rx_us_.store(now_us());
     LOG_DEBUG("kcp_client", "created conv=" + std::to_string(conv) +
               " server=" + server_addr_.address().to_string() + ":" +
@@ -58,6 +68,27 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
             throw std::runtime_error("UDP connect failed: " + connect_ec.message());
         }
 
+#if defined(_WIN32)
+        // This socket is connect()ed, so Windows delivers WSAECONNRESET on the
+        // next receive after every send to a dead peer port -- the client is
+        // MORE exposed to this than the server, whose socket is unconnected.
+        // Turn the reporting off at the source, exactly as the server does; the
+        // tolerant handler in do_udp_receive stays as the cross-platform safety
+        // net. Without this, a server that is down or restarting turns every
+        // HELLO retransmit and keepalive into an ERROR log line plus an
+        // unthrottled re-arm.
+        {
+            BOOLEAN disable_connreset = FALSE;
+            DWORD bytes_returned = 0;
+            const int wsa_rc = ::WSAIoctl(
+                udp_socket_->native_handle(), SIO_UDP_CONNRESET,
+                &disable_connreset, sizeof(disable_connreset),
+                nullptr, 0, &bytes_returned, nullptr, nullptr);
+            LOG_DEBUG("kcp_client", std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") +
+                      std::to_string(wsa_rc) + ")");
+        }
+#endif
+
         // Raise the kernel UDP send/receive buffers. Oversized kernel buffers
         // prevent the OS from silently dropping datagrams during bursts (which
         // KCP would otherwise misread as network loss and retransmit a window).
@@ -98,17 +129,23 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
                     return;
                 }
                 const std::string msg(reinterpret_cast<const char*>(ack_buf->data()), bytes);
-                if (msg != KCP_CONTROL_HELLO_ACK) {
+                const bool ack_v2 = (msg == KCP_CONTROL_HELLO_ACK_V2);
+                if (!ack_v2 && msg != KCP_CONTROL_HELLO_ACK) {
                     LOG_ERROR("kcp_client", "KCP handshake failed: unexpected response");
                     on_close();
                     if (h) h(false);
                     return;
                 }
+                // Only a V2 ACK means the server understands FIN; sending one to
+                // a V1 server would inject a control message into the tunnel as
+                // stream data. See KCP_CONTROL_FIN.
+                if (ack_v2) enable_fin();
                 connected_.store(true);
                 touch_activity();
                 LOG_INFO("kcp_client", "KCP handshake confirmed with " +
                          server_addr_.address().to_string() + ":" +
-                         std::to_string(server_addr_.port()));
+                         std::to_string(server_addr_.port()) +
+                         (ack_v2 ? " (V2, half-close enabled)" : ""));
                 if (h) h(true);
             });
 
@@ -152,8 +189,12 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
 }
 
 void KCPClientSession::send_connect_hello() {
-    const auto* msg = reinterpret_cast<const uint8_t*>(KCP_CONTROL_HELLO);
-    const size_t len = std::strlen(KCP_CONTROL_HELLO);
+    // V2 asks the server for FIN (half-close) support; it answers with the
+    // matching ACK and this session enables FIN only if it does (see the
+    // handshake reply handler). A V1 server still answers V1 and everything
+    // works as before, just without half-close.
+    const auto* msg = reinterpret_cast<const uint8_t*>(KCP_CONTROL_HELLO_V2);
+    const size_t len = std::strlen(KCP_CONTROL_HELLO_V2);
     int send_ret = kcp_.send(byte_view(msg, len));
     if (send_ret < 0) {
         LOG_ERROR("kcp_client", "KCP handshake send failed, ret=" + std::to_string(send_ret));
@@ -198,6 +239,10 @@ void KCPClientSession::on_close() {
 
     std::error_code ignored;
     connect_timer_.cancel(ignored);
+    // Cancel the receive backoff too: a pending wait would otherwise hold a
+    // strong ref to this session until it fired, and its handler would re-arm
+    // do_udp_receive() on a closed session.
+    receive_backoff_timer_.cancel(ignored);
 
     if (udp_socket_ && udp_socket_->is_open()) {
         udp_socket_->close(ignored);
@@ -259,8 +304,35 @@ void KCPClientSession::do_udp_receive() {
                 if (ec) {
                     if (ec != asio::error::operation_aborted &&
                         running_.load()) {
-                        LOG_ERROR("kcp_client", "UDP receive error: " + ec.message());
-                        do_udp_receive();
+                        // UDP sockets surface ICMP Port Unreachable as an error
+                        // on the next receive: connection_refused on Linux/BSD,
+                        // connection_reset (WSAECONNRESET) on Windows. This is
+                        // the NORMAL signal that the server is down or
+                        // restarting, not a fault, so it stays at DEBUG and
+                        // re-arms immediately. (Windows reporting is disabled at
+                        // the source in on_connect; this covers Linux and any
+                        // other error the socket still surfaces.) The server
+                        // classifies these identically -- the client used to log
+                        // them at ERROR with no pacing at all.
+                        if (ec == asio::error::connection_refused ||
+                            ec == asio::error::connection_reset) {
+                            LOG_DEBUG("kcp_client", "UDP ICMP port unreachable received (ignored)");
+                            do_udp_receive();
+                        } else {
+                            LOG_ERROR("kcp_client", "UDP receive error: " + ec.message());
+                            // Unknown errors can complete immediately and
+                            // repeatedly with no external pacing, so an
+                            // unbounded re-arm here is a busy spin plus an ERROR
+                            // line per iteration. Re-arm through a short backoff
+                            // instead, bounding the loop to ~100 attempts/s.
+                            auto self2 = shared_from_this();
+                            receive_backoff_timer_.expires_after(
+                                std::chrono::milliseconds(10));
+                            receive_backoff_timer_.async_wait(
+                                [this, self2](const std::error_code& timer_ec) {
+                                    if (!timer_ec) do_udp_receive();
+                                });
+                        }
                     }
                     return;
                 }
