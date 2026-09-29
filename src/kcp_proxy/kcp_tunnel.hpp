@@ -23,6 +23,10 @@ struct SessionMetrics {
     std::atomic<uint64_t> bytes_received{0};
     std::atomic<uint64_t> encrypt_errors{0};
     std::atomic<uint64_t> decrypt_errors{0};
+    // ikcp_send() refusals in on_send (send window full). Kept separate from
+    // encrypt_errors so an "encryption failure" alert is never a KCP-layer
+    // backpressure event in disguise.
+    std::atomic<uint64_t> send_errors{0};
 
     // UDP datagram level (used for peer-to-peer loss localization): every
     // encrypted datagram handed to the peer counts as one TX, every datagram

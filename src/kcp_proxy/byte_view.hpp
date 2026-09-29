@@ -21,7 +21,9 @@ struct byte_view {
     constexpr bool empty() const { return size_ == 0; }
     const uint8_t& operator[](size_t i) const { assert(i < size_); return data_[i]; }
     constexpr const uint8_t* begin() const { return data_; }
-    constexpr const uint8_t* end() const { return data_ + size_; }
+    // Guard the default-constructed case: data_ + size_ on a null pointer is
+    // UB even when size_ == 0 (harmless on mainstream compilers, but UB).
+    constexpr const uint8_t* end() const { return data_ ? data_ + size_ : nullptr; }
 };
 
 } // namespace kcp_proxy

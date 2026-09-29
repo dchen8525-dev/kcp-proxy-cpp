@@ -49,8 +49,18 @@ int main(int argc, char* argv[]) {
         } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
             log_level = cli::get_arg(argc, argv, i);
         } else if (arg == "--half-close-grace" && i + 1 < argc) {
+            // Digits-only gate before stoi: stoi ignores trailing junk
+            // ("120s" -> 120), which would silently start the proxy with a
+            // grace different from what was typed. (Same rule as the port and
+            // --threads arguments.)
+            const std::string value = cli::get_arg(argc, argv, i);
+            if (value.empty() ||
+                value.find_first_not_of("0123456789") != std::string::npos) {
+                std::cerr << "Error: --half-close-grace expects a non-negative number of seconds" << std::endl;
+                return 1;
+            }
             try {
-                half_close_grace_sec = std::stoi(cli::get_arg(argc, argv, i));
+                half_close_grace_sec = std::stoi(value);
             } catch (const std::exception&) {
                 std::cerr << "Error: --half-close-grace expects a number of seconds" << std::endl;
                 return 1;

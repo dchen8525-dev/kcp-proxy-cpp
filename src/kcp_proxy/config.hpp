@@ -88,6 +88,26 @@ constexpr int KCP_HANDSHAKE_TIMEOUT_SEC = 3;
 // Client-side SOCKS5 handshake timeout (greeting + request).
 constexpr int SOCKS5_HANDSHAKE_TIMEOUT_SEC = 30;
 
+// Anti-replay beyond a session's lifetime. The server's Crypto bypasses the
+// replay window for a brand-new session's first packet (it seeds the window),
+// so without memory of past sessions an attacker could replay a recorded first
+// datagram after the original session died and have the server act on the
+// replayed SOCKS5 CONNECT. The server therefore keeps the salt of every
+// session it accepts for this long and refuses to create a session for a salt
+// it has seen before. The TTL comfortably exceeds the maximum time a session
+// can linger after its last activity (KCP_TIMEOUT_SEC + the 30s sweep
+// cadence); legitimate clients generate a fresh random salt per session, so
+// they never collide with their own tombstones. Note the table is in-memory:
+// a server restart resets it (a restart within the same key window reopens
+// the window; the date-derived key change closes it at the next rotation).
+constexpr int SALT_TOMBSTONE_TTL_SEC = 600;
+// Bound on the tombstone table. Only genuinely authenticated sessions insert
+// (one entry per session), so the table grows with real churn, not attacker
+// traffic; this is generous headroom over any plausible session rate. At the
+// cap, session creation is refused (fail-closed) rather than evicting early
+// and re-opening the replay window the table exists to close.
+constexpr size_t MAX_SALT_TOMBSTONES = 4 * MAX_CONCURRENT_SESSIONS;
+
 // Buffer sizes
 constexpr size_t UDP_RECV_BUF_SIZE = 4096;
 constexpr size_t FWD_BUF_SIZE = 16384;
@@ -189,7 +209,7 @@ inline constexpr char KCP_CONTROL_HELLO_ACK_V2[] = "KCP_PROXY_HELLO_ACK_V2";
 // its own KCP message with this session's 16-byte salt appended, exactly like
 // the keepalive, so only the peer sharing this session's salt can produce one
 // and no genuine payload can collide with it. Distinct magic length from the
-// keepalive (16 vs 21 bytes) means neither sentinel can be mistaken for the
+// keepalive (16 vs 22 bytes) means neither sentinel can be mistaken for the
 // other. Unlike the keepalive it is only ever sent once per direction, and only
 // after the V2 handshake negotiated support (KcpTunnel::send_fin).
 //

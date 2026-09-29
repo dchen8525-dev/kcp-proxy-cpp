@@ -116,7 +116,9 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
     }
     touch_activity();
     metrics_.packets_received.fetch_add(1, std::memory_order_relaxed);
-    metrics_.bytes_received.fetch_add(encrypted.size(), std::memory_order_relaxed);
+    // Plaintext bytes, matching bytes_sent (KCP payload in on_send) -- the
+    // encrypted datagram size is already tracked separately as udp_rx_bytes.
+    metrics_.bytes_received.fetch_add(decrypt_buf_.size(), std::memory_order_relaxed);
     LOG_DEBUG("kcp_session", fmt::format("{}: decrypt OK {} -> {} bytes, peek_before={}",
               session_id_, encrypted.size(), decrypt_buf_.size(), kcp_.peek_size()));
     int input_ret = kcp_.input(byte_view(decrypt_buf_.data(), decrypt_buf_.size()));

@@ -46,14 +46,15 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
       // the socket's executor to a strand serializes every initiation and every
       // completion on it -- see send_to_client() and do_receive().
       udp_socket_(asio::make_strand(io_.get_executor())),
-      cleanup_timer_(io_),
+      tick_strand_(asio::make_strand(io_.get_executor())),
+      cleanup_timer_(tick_strand_),
       // On the socket's strand, not the raw io_context: its handler is the one
       // place outside the receive path that touches receive_backoff_armed_ and
       // the slots' parked flags, and both are strand-confined by design. Bound
       // here rather than relying on bind_executor at the call site so the timer
       // and its handler agree on the executor by construction.
       receive_backoff_timer_(udp_socket_.get_executor()),
-      update_tick_timer_(io_) {}
+      update_tick_timer_(tick_strand_) {}
 
 KCPServer::~KCPServer() {
     stop();
@@ -184,14 +185,38 @@ void KCPServer::start() {
 }
 
 void KCPServer::stop() {
-    if (!running_) return;
-    running_ = false;
+    if (!running_.exchange(false)) return;
+    // Set BEFORE swapping the maps: get_or_create_session checks this under
+    // the sessions_mutex_ write lock, so ordering it ahead of the swap makes
+    // "reject new sessions" atomic with "drain the existing ones".
+    stopped_.store(true);
 
-    std::error_code ignored;
-    udp_socket_.close(ignored);
-    cleanup_timer_.cancel(ignored);
-    update_tick_timer_.cancel(ignored);
-    receive_backoff_timer_.cancel(ignored);
+    // Tear the asio objects down on their own executors, not from this thread:
+    // with -T > 1 the caller (the signal handler, on the main io thread) runs
+    // concurrently with handlers executing on other io threads, and asio's
+    // contract forbids concurrent member calls on a shared object. If the
+    // caller stops the io_context right after (as main does), the queued
+    // teardown never runs and the objects are destroyed with the io_context
+    // instead -- equivalent.
+    //
+    // Guarded by weak_from_this() rather than a strong capture: stop() is also
+    // reached from ~KCPServer, where shared_from_this() would throw
+    // bad_weak_ptr, and weak_from_this() is safe there (lock() yields null
+    // once the last strong ref is gone). A strong capture would also keep the
+    // server alive past its own destructor's intent.
+    std::weak_ptr<KCPServer> weak_self = weak_from_this();
+    asio::dispatch(tick_strand_, [this, weak_self]() {
+        if (!weak_self.lock()) return; // server already destroyed
+        std::error_code ignored;
+        cleanup_timer_.cancel(ignored);
+        update_tick_timer_.cancel(ignored);
+    });
+    asio::dispatch(udp_socket_.get_executor(), [this, weak_self]() {
+        if (!weak_self.lock()) return;
+        std::error_code ignored;
+        udp_socket_.close(ignored);
+        receive_backoff_timer_.cancel(ignored);
+    });
 
     std::unordered_map<std::string, std::shared_ptr<KCPSession>> drained_sessions;
     std::unordered_map<std::string, ClientConnection> drained_conns;
@@ -204,9 +229,14 @@ void KCPServer::stop() {
         session->stop();
     }
     for (auto& [sid, conn] : drained_conns) {
-        if (conn.tcp_socket && conn.tcp_socket->is_open()) {
-            conn.tcp_socket->close(ignored);
-        }
+        // The socket lives on its session's strand; close it there rather
+        // than racing its in-flight async_read_some from this thread.
+        auto sock = std::move(conn.tcp_socket);
+        if (!sock) continue;
+        asio::dispatch(sock->get_executor(), [sock]() mutable {
+            std::error_code ignored;
+            sock->close(ignored);
+        });
     }
 
     LOG_INFO("server", "stopped");
@@ -356,11 +386,19 @@ void KCPServer::drop_replaced_target_locked(const std::string& sid) {
     if (conn_it == connections_.end()) {
         return;
     }
-    if (conn_it->second.tcp_socket && conn_it->second.tcp_socket->is_open()) {
-        std::error_code close_ec;
-        conn_it->second.tcp_socket->close(close_ec);
-    }
+    auto sock = std::move(conn_it->second.tcp_socket);
     connections_.erase(conn_it);
+    if (sock) {
+        // The socket lives on its session's strand; close it there. A direct
+        // close() here would be a cross-thread member call racing the forward
+        // loop's in-flight async_read_some on the same object (-T > 1).
+        // Queuing the close still aborts those pending operations, just from
+        // the strand that owns them.
+        asio::dispatch(sock->get_executor(), [sock]() mutable {
+            std::error_code close_ec;
+            sock->close(close_ec);
+        });
+    }
 }
 
 std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
@@ -516,6 +554,12 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     size_t total_sessions = 0;
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
+        // stop() sets stopped_ and swaps the session maps out under this same
+        // write lock, so checking it here is atomic with that swap: without it
+        // a packet in flight during shutdown would insert a session that is
+        // never ticked or swept. (stopped_, not running_: running_ is also
+        // false before start(), and tests drive route_datagram without it.)
+        if (stopped_.load()) return nullptr;
         // Re-check under lock: another packet from this endpoint may have
         // beaten us here in a different I/O thread.
         auto it = sessions_.find(sid);
@@ -559,6 +603,39 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                     sid, other_sid));
                 return nullptr;
             }
+        }
+        // Cross-session replay guard: the live-session check above cannot see
+        // a session that already died, but a replayed first datagram of a dead
+        // session would still pass AEAD (same salt -> same derived key) and the
+        // first-packet replay-window bypass would accept it -- including its
+        // SOCKS5 CONNECT, which we would then execute for the attacker. Refuse
+        // any salt accepted within the tombstone TTL. The check and the insert
+        // are under this same write lock, so two concurrent first datagrams
+        // sharing a salt cannot both win. Legitimate clients always generate a
+        // fresh random salt per session, so they never hit their own
+        // tombstones; the salt is already known-good here (the packet
+        // decrypted successfully).
+        {
+            const byte_view salt = session_crypto->session_salt();
+            const std::string salt_key(reinterpret_cast<const char*>(salt.data()),
+                                       salt.size());
+            const auto now = std::chrono::steady_clock::now();
+            const auto tomb = salt_tombstones_.find(salt_key);
+            if (tomb != salt_tombstones_.end() && tomb->second > now) {
+                LOG_WARNING("server", "replayed session salt rejected from " + sid);
+                return nullptr;
+            }
+            if (salt_tombstones_.size() >= MAX_SALT_TOMBSTONES) {
+                // Fail closed: evicting early would re-open the replay window.
+                // Only authenticated sessions insert, so reaching the cap means
+                // implausible churn -- log it loudly.
+                LOG_WARNING("server", fmt::format(
+                    "salt tombstone table full ({}), dropping packet from {}",
+                    MAX_SALT_TOMBSTONES, sid));
+                return nullptr;
+            }
+            salt_tombstones_.emplace(std::move(salt_key),
+                                     now + std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC));
         }
         session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid);
         // Set the send callback BEFORE publishing the session into sessions_.
@@ -670,6 +747,15 @@ void KCPServer::handle_protocol_handshake(std::shared_ptr<KCPSession> session) {
                                          std::strlen(ack)));
             LOG_INFO("server", session->session_id() + ": KCP handshake confirmed" +
                      (hello_v2 ? " (V2, half-close enabled)" : ""));
+            // A pipelining peer may have queued its SOCKS5 request in the same
+            // KCP batch as the HELLO (it did not wait for the ACK). Such a
+            // message has no other trigger: handle_kcp_data is driven only by
+            // inbound datagrams, and the next one from a peer now waiting on
+            // our reply is up to one keepalive interval (~30s) away -- every
+            // such connection would stall. Re-drive the dispatcher now; it
+            // no-ops on an empty queue. (We are on the session strand: this
+            // handler completed through complete_pending_read.)
+            handle_kcp_data(session, {});
         });
 }
 
@@ -805,9 +891,16 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
     LOG_INFO("server", session->session_id() +
              ": connecting to " + request.host + ":" + std::to_string(request.port));
 
-    auto tcp_socket = std::make_shared<asio::ip::tcp::socket>(io_);
-    auto resolver = std::make_shared<asio::ip::tcp::resolver>(io_);
-    auto deadline = std::make_shared<asio::steady_timer>(io_);
+    // Built on the SESSION strand, not the raw io_context: with -T > 1 the
+    // deadline handler's resolver->cancel()/tcp_socket->close() would
+    // otherwise run on a different io thread than the in-flight
+    // async_resolve/async_connect, and asio's contract forbids concurrent
+    // member calls on a shared object. On the strand every handler in this
+    // function (timeout, resolve, connect, initial write) is serialized with
+    // each other and with the session's forward loops, which also bind to it.
+    auto tcp_socket = std::make_shared<asio::ip::tcp::socket>(session->strand());
+    auto resolver = std::make_shared<asio::ip::tcp::resolver>(session->strand());
+    auto deadline = std::make_shared<asio::steady_timer>(session->strand());
     auto fired = std::make_shared<std::atomic<bool>>(false);
     auto initial_payload_buf = std::make_shared<std::vector<uint8_t>>(std::move(initial_payload));
 
@@ -980,18 +1073,12 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         //
                         // Strand discipline: drained_cb_ is a plain std::function
                         // that on_update_tick reads and moves ON the session
-                        // strand. This connect completion handler runs on the raw
-                        // io_context executor (tcp_socket/resolver were built on
-                        // io_, not the strand), so writing drained_cb_ here would
-                        // race with a concurrent tick. Dispatch the write onto the
-                        // strand to serialize it. The outer lambda holds a strong
-                        // session ref only until the dispatch runs; the drained
-                        // callback itself keeps the weak_ptr to avoid the cycle.
-                        asio::dispatch(session->strand(),
-                            [this, sid, session, w = std::weak_ptr<KCPSession>(session)]() {
-                                session->set_drained_callback([this, sid, w]() {
-                                    if (auto s = w.lock()) close_connection(sid, "target_drained", s);
-                                });
+                        // strand. This connect completion handler runs on that
+                        // same strand (tcp_socket was built on it), so a plain
+                        // store here is serialized with the tick.
+                        session->set_drained_callback(
+                            [this, sid, w = std::weak_ptr<KCPSession>(session)]() {
+                                if (auto s = w.lock()) close_connection(sid, "target_drained", s);
                             });
                         forward_tcp_to_kcp(sid, session, tcp_socket);
                         // Eagerly arm the kcp->tcp direction so data that queued
@@ -1356,9 +1443,18 @@ void KCPServer::close_connection(const std::string& session_id, const char* call
         }
     }
 
-    if (sock_to_close && sock_to_close->is_open()) {
-        std::error_code ignored;
-        sock_to_close->close(ignored);
+    if (sock_to_close) {
+        // The socket is owned by its session's strand (see
+        // handle_connect_command); close it there so this never races the
+        // forward loop's in-flight async_read_some. Every caller already runs
+        // on that strand, so this executes inline in the normal path; the
+        // dispatch only matters for the defensive session==nullptr path.
+        asio::dispatch(sock_to_close->get_executor(), [sock_to_close]() mutable {
+            if (sock_to_close->is_open()) {
+                std::error_code ignored;
+                sock_to_close->close(ignored);
+            }
+        });
     }
     if (session_to_stop) {
         session_to_stop->stop();
@@ -1448,6 +1544,15 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
             sessions_.erase(sid);
             connections_.erase(sid);
         }
+        // Sweep expired salt tombstones (see get_or_create_session).
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = salt_tombstones_.begin(); it != salt_tombstones_.end();) {
+            if (it->second <= now) {
+                it = salt_tombstones_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         // Report the post-sweep count so "sessions=N" is the live figure, not
         // the count captured before dead sessions were erased.
         active_sessions = sessions_.size();
@@ -1458,10 +1563,15 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
         session->stop();
     }
     for (auto& sock : sockets_to_close) {
-        if (sock && sock->is_open()) {
+        if (!sock) continue;
+        // The socket lives on its session's strand (handle_connect_command
+        // builds it there); close it there. A direct close() from this timer
+        // thread would race the forward loop's in-flight async_read_some on
+        // the same object when the io_context runs with -T > 1.
+        asio::dispatch(sock->get_executor(), [sock]() mutable {
             std::error_code ignored;
             sock->close(ignored);
-        }
+        });
     }
 
     LOG_INFO("server", fmt::format("metrics sweep: sessions={} pkts_sent={} pkts_recv={} bytes_sent={} bytes_recv={}",

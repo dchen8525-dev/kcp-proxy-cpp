@@ -9,6 +9,7 @@
 #include <asio.hpp>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <shared_mutex>
@@ -63,6 +64,14 @@ private:
     std::unordered_map<std::string, std::shared_ptr<KCPSession>> sessions_;
     std::unordered_map<std::string, ClientConnection> connections_;
 
+    // Owns cleanup_timer_ and update_tick_timer_. stop() cancels them from
+    // whatever thread the signal handler ran on; with -T > 1 a tick or sweep
+    // handler may be executing concurrently on another io thread, and asio's
+    // contract forbids concurrent member calls on a shared object. Routing the
+    // timers through this strand lets stop() dispatch the cancel onto the same
+    // executor the handlers run on, serializing teardown with them.
+    // Declared (and initialized) BEFORE the timers that use it.
+    asio::strand<asio::io_context::executor_type> tick_strand_;
     asio::steady_timer cleanup_timer_;
     // Backoff timer for the UDP receive error path: an unknown receive error
     // parks its slot and arms this one shared 10ms timer, so a persistently
@@ -87,6 +96,13 @@ private:
     // lock() success yields a temporary strong ref valid for this tick only.
     std::vector<std::weak_ptr<KCPSession>> tick_snapshot_;
     std::atomic<bool> running_{false};
+    // Set by stop() before it swaps the session maps out. Checked under the
+    // sessions_mutex_ write lock in get_or_create_session, so a datagram in
+    // flight during shutdown cannot insert a session into the post-stop map
+    // (it would never be ticked or swept). Separate from running_ because
+    // running_ is also false before start(), and tests drive route_datagram
+    // without start().
+    std::atomic<bool> stopped_{false};
     // Read-mostly session table: UDP packet routing does map lookups far more
     // often than it mutates them, so a shared_mutex lets concurrent readers
     // proceed in parallel while writers stay exclusive.
@@ -113,6 +129,15 @@ private:
     // Cleared with the global window; bounded by MAX_TRACKED_AUTH_ADDRS.
     // Same strand-confinement invariant as the counters above.
     std::unordered_map<asio::ip::address, uint32_t> auth_failures_by_addr_;
+
+    // Cross-session replay guard: the salt of every session accepted within
+    // the last SALT_TOMBSTONE_TTL_SEC, mapped to its expiry. Consulted and
+    // inserted under the sessions_mutex_ write lock in get_or_create_session
+    // (atomically with session creation); expired entries are swept by
+    // do_cleanup. See SALT_TOMBSTONE_TTL_SEC in config.hpp for why a dead
+    // session's salt must stay rejected.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        salt_tombstones_;
 
     // Throttles for the per-datagram rejection diagnostics. The auth counters
     // above cap the *work* a flood can force, but these lines each fire once per
@@ -169,9 +194,11 @@ private:
     // socket: the forward_tcp_to_kcp loop holds its own shared_ptr to it, and
     // once the entry is gone close_connection can no longer find it, so the
     // target connection would stay open until the remote end closed it.
-    // Closing here also aborts the old session's pending reads/writes on that
-    // socket, so a mid-connect old session can never re-insert connections_[sid]
-    // after the new session took over the endpoint.
+    // The close is dispatched onto the socket's own strand (the socket is a
+    // shared object; a direct close() here would race the loop's in-flight
+    // async_read_some under -T > 1) and still aborts the old session's pending
+    // reads/writes, so a mid-connect old session can never re-insert
+    // connections_[sid] after the new session took over the endpoint.
     void drop_replaced_target_locked(const std::string& sid);
     void handle_kcp_data(std::shared_ptr<KCPSession> session,
                          const asio::ip::udp::endpoint& sender);

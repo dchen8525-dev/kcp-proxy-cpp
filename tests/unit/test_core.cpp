@@ -868,6 +868,47 @@ void test_server_unauth_packet_cannot_evict_live_session() {
                 "the reconnected session must serve subsequent packets");
 }
 
+void test_server_rejects_replayed_salt_after_session_death() {
+    // A recorded first datagram replayed after its session has died must be
+    // rejected. Without the salt tombstone the server's first-packet
+    // replay-window bypass would decrypt it (same salt -> same derived key)
+    // and create a brand-new session, re-executing the SOCKS5 CONNECT the
+    // recording contains -- the live-session duplicate-salt check cannot see
+    // a session that is already gone.
+    asio::io_context io;
+    const std::string key = "replay_guard_test_key_123";
+    auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+
+    const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41001);
+    const std::vector<uint8_t> connect_req = {0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80};
+    const byte_view req_view(connect_req.data(), connect_req.size());
+
+    const auto salt = Crypto::generate_session_salt();
+    Crypto client(key, NONCE_DIR_CLIENT, salt, false);
+    auto first = client.encrypt(req_view);  // the datagram an attacker records
+
+    auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
+    expect_true(session != nullptr, "the first packet must create a session");
+
+    // Kill it, then drain the io_context so stop() actually clears RUNNING
+    // (stop() dispatches onto the session strand).
+    session->stop();
+    io.poll();
+    expect_true(!session->is_running(), "the session must be stopped before the replay");
+
+    // Replay the recorded datagram verbatim, from the same source endpoint
+    // (the realistic case: the attacker reuses the recorded source port).
+    expect_true(server->route_datagram(ep, byte_view(first.data(), first.size())) == nullptr,
+                "a replayed first datagram of a dead session must be rejected");
+
+    // The tombstone must not break normal operation: a genuine reconnect with
+    // a FRESH salt is still accepted (real clients generate one per session).
+    Crypto reconnected(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto fresh = reconnected.encrypt(req_view);
+    expect_true(server->route_datagram(ep, byte_view(fresh.data(), fresh.size())) != nullptr,
+                "a fresh-salt session must still be accepted after a tombstone");
+}
+
 void test_session_oversized_kcp_message_fails_read() {
     // try_fulfill_read() has two distinct reject paths, neither of which was
     // covered: a KCP message larger than FWD_BUF_SIZE (a protocol violation --
@@ -1682,6 +1723,7 @@ int main() {
         test_kcp_wrapper_oversized_message_is_not_truncated();
         test_server_session_routing_and_auth();
         test_server_unauth_packet_cannot_evict_live_session();
+        test_server_rejects_replayed_salt_after_session_death();
         test_session_oversized_kcp_message_fails_read();
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();

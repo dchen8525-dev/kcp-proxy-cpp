@@ -245,17 +245,21 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     // set_keepalive(), so the counter drops exactly when the session object
     // is destroyed — no matter which teardown path ran (handshake failure,
     // EOF, error, idle timeout).
-    if (active_sessions_.fetch_add(1, std::memory_order_relaxed) >=
+    if (active_sessions_->fetch_add(1, std::memory_order_relaxed) >=
         MAX_CLIENT_SESSIONS) {
-        active_sessions_.fetch_sub(1, std::memory_order_relaxed);
+        active_sessions_->fetch_sub(1, std::memory_order_relaxed);
         LOG_WARNING("client", "connection limit reached (" +
                     std::to_string(MAX_CLIENT_SESSIONS) + "), refusing connection");
         std::error_code ignored;
         client->close(ignored);
         return;
     }
+    // The ticket's deleter holds shared ownership of the counter itself, not a
+    // pointer into the client object, so the decrement stays safe even if the
+    // session is destroyed after the client (io_context teardown order is
+    // unspecified).
     auto session_ticket = std::shared_ptr<void>(
-        &active_sessions_, [](std::atomic<size_t>* counter) {
+        nullptr, [counter = active_sessions_](void*) {
             counter->fetch_sub(1, std::memory_order_relaxed);
         });
 
@@ -452,6 +456,15 @@ void KCPProxyClient::read_socks5_request(
 
             if (version != SOCKS5_VERSION) {
                 LOG_ERROR("client", "bad version: " + std::to_string(version));
+                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                return;
+            }
+            // RFC 1928: RSV must be 0x00. The server-side parser
+            // (parse_socks5_request) enforces this too; a non-zero RSV from a
+            // local app is a malformed request, not an extension we understand.
+            if ((*header)[2] != 0x00) {
+                LOG_ERROR("client", "bad RSV in SOCKS5 request: " +
+                          std::to_string((*header)[2]));
                 abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                 return;
             }
@@ -835,9 +848,15 @@ void KCPProxyClient::forward_kcp_to_client(
     }
     if (!buf) buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
 
+    // Hold a self reference through the whole read->write->re-arm chain (every
+    // other async chain in this class does the same): the client object owns
+    // the metrics this handler updates (rx_bytes_), so the chain must keep it
+    // alive rather than trusting the caller to outlive the tunnel.
+    auto self = shared_from_this();
+
     LOG_DEBUG("client", "forward_kcp_to_client: starting async_read_some");
     session->async_read_some(asio::buffer(*buf),
-        [this, client_socket, session, buf, guard](const std::error_code& ec, size_t bytes) mutable {
+        [this, self, client_socket, session, buf, guard](const std::error_code& ec, size_t bytes) mutable {
             if (ec == asio::error::eof) {
                 // The server half-closed (FIN): it will send no more target
                 // data. Everything it queued before the FIN was already handed
@@ -910,7 +929,7 @@ void KCPProxyClient::forward_kcp_to_client(
             asio::async_write(*client_socket,
                 asio::buffer(buf->data(), bytes),
                 asio::bind_executor(session->strand(),
-                [this, client_socket, session, buf, guard](const std::error_code& ec2, size_t written) mutable {
+                [this, self, client_socket, session, buf, guard](const std::error_code& ec2, size_t written) mutable {
                     if (ec2) {
                         LOG_ERROR("client", "write to client error: " + ec2.message());
                         // Mirror the read-error path above: close BOTH sides.
@@ -973,9 +992,12 @@ void KCPProxyClient::arm_half_close_grace(
 
     // Arm once. on_half_close_check() re-arms itself while the target keeps
     // making progress, so the per-write hot path never touches the timer heap.
+    // The handler chain captures self like every other async chain in this
+    // class: it dereferences members (half_close_grace_sec_) on each firing.
+    auto self = shared_from_this();
     guard->deadline.expires_after(std::chrono::seconds(half_close_grace_sec_));
     guard->deadline.async_wait(
-        [this, guard, client_socket, session](const std::error_code& ec) {
+        [this, self, guard, client_socket, session](const std::error_code& ec) {
             if (ec) return; // cancelled: the tunnel already finished
             on_half_close_check(guard, client_socket, session);
         });
@@ -997,8 +1019,9 @@ void KCPProxyClient::on_half_close_check(
         // before the tunnel was actually quiet. Wait out the remainder rather
         // than cut a still-progressing response short.
         guard->deadline.expires_after(std::chrono::microseconds(grace_us - quiet_us));
+        auto self = shared_from_this();
         guard->deadline.async_wait(
-            [this, guard, client_socket, session](const std::error_code& ec) {
+            [this, self, guard, client_socket, session](const std::error_code& ec) {
                 if (ec) return;
                 on_half_close_check(guard, client_socket, session);
             });

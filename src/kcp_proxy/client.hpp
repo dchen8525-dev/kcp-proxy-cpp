@@ -85,7 +85,13 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> start_failed_{false};
     // Live SOCKS5 connections, enforced against MAX_CLIENT_SESSIONS.
-    std::atomic<size_t> active_sessions_{0};
+    // Heap-allocated with shared ownership: the session-cap ticket's deleter
+    // decrements it, and a session can be destroyed during io_context teardown
+    // AFTER the client object is gone (destruction order of queued handlers is
+    // unspecified) -- a deleter writing to a member of the dead client would
+    // be a use-after-free.
+    std::shared_ptr<std::atomic<size_t>> active_sessions_ =
+        std::make_shared<std::atomic<size_t>>(0);
 
     // Last (tx,rx) pair handed to the GUI. The 2s traffic heartbeat only emits
     // an INFO line when these change; an idle tunnel drops to DEBUG instead of

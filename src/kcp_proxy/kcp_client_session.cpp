@@ -237,9 +237,13 @@ void KCPClientSession::send_connect_hello() {
     const size_t len = std::strlen(KCP_CONTROL_HELLO_V2);
     int send_ret = kcp_.send(byte_view(msg, len));
     if (send_ret < 0) {
-        LOG_ERROR("kcp_client", "KCP handshake send failed, ret=" + std::to_string(send_ret));
-        on_close();
-        return;
+        // Throw rather than on_close()+return: only on_connect's catch block
+        // delivers the failure to the connect completion handler. Returning
+        // silently here would leave the SOCKS5 handshake hanging until its
+        // 30s deadline, because on_close() disarms every path (ACK read,
+        // connect timer) that could complete it.
+        throw std::runtime_error("KCP handshake send failed, ret=" +
+                                 std::to_string(send_ret));
     }
     kcp_.update(now_kcp_ms());
     kcp_.flush();
@@ -411,7 +415,9 @@ void KCPClientSession::on_receive(byte_view packet) {
     // advance it, so a dead/stale server cannot keep the tunnel alive.
     last_rx_us_.store(now_us());
     metrics_.packets_received.fetch_add(1, std::memory_order_relaxed);
-    metrics_.bytes_received.fetch_add(packet.size(), std::memory_order_relaxed);
+    // Plaintext bytes, matching bytes_sent (KCP payload in on_send) -- the
+    // encrypted datagram size is already tracked separately as udp_rx_bytes.
+    metrics_.bytes_received.fetch_add(decrypt_buf_.size(), std::memory_order_relaxed);
     LOG_DEBUG("kcp_client", "UDP recv " + std::to_string(packet.size()) +
               " encrypted -> " + std::to_string(decrypt_buf_.size()) + " decrypted");
     int input_ret = kcp_.input(byte_view(decrypt_buf_.data(), decrypt_buf_.size()));

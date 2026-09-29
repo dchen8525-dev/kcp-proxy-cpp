@@ -67,14 +67,15 @@ std::string KcpTunnel::stats_summary() const {
     const auto& m = metrics_;
     return log_msg(fmt::format(
         "stats tx_pkt={} tx_bytes={} rx_pkt={} rx_bytes={} "
-        "replay_dropped={} decrypt_err={} encrypt_err={}",
+        "replay_dropped={} decrypt_err={} encrypt_err={} send_err={}",
         m.udp_tx_packets.load(std::memory_order_relaxed),
         m.udp_tx_bytes.load(std::memory_order_relaxed),
         m.udp_rx_packets.load(std::memory_order_relaxed),
         m.udp_rx_bytes.load(std::memory_order_relaxed),
         m.replay_dropped.load(std::memory_order_relaxed),
         m.decrypt_errors.load(std::memory_order_relaxed),
-        m.encrypt_errors.load(std::memory_order_relaxed)));
+        m.encrypt_errors.load(std::memory_order_relaxed),
+        m.send_errors.load(std::memory_order_relaxed)));
 }
 
 void KcpTunnel::send_data(byte_view data) {
@@ -97,7 +98,9 @@ void KcpTunnel::on_send(byte_view data) {
     LOG_DEBUG(log_module_, log_msg("on_send " + std::to_string(data.size()) + " bytes"));
     int send_ret = kcp_.send(data);
     if (send_ret < 0) {
-        metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
+        // A KCP-layer refusal (send window full), not a crypto failure -- it
+        // gets its own counter so encrypt_errors stays a pure AEAD signal.
+        metrics_.send_errors.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(log_module_, log_msg("ikcp_send failed, ret=" + std::to_string(send_ret) +
                   ", closing session"));
         shut_down();
@@ -124,7 +127,12 @@ void KcpTunnel::on_async_read_some(asio::mutable_buffer buffer,
         // after close is a race the caller handles, not a fault.
         LOG_DEBUG(log_module_, log_msg("async_read_some while not running -> aborted"));
         auto h = std::move(handler);
-        asio::post(io_, [h = std::move(h)]() mutable {
+        // Post to the session strand (like complete_pending_read does), never
+        // to the raw io_context: the forwarding loops treat their read
+        // completion as strand-confined, and a raw-io post would break that
+        // affinity when the io_context runs on more than one thread.
+        auto self = shared_from_this();
+        asio::post(strand_, [self, h = std::move(h)]() mutable {
             h(asio::error::operation_aborted, 0);
         });
         return;
@@ -135,7 +143,8 @@ void KcpTunnel::on_async_read_some(asio::mutable_buffer buffer,
         LOG_WARNING(log_module_, log_msg("async_read_some stacked (already_started), "
                     "old handler still pending - rejecting new one"));
         auto h = std::move(handler);
-        asio::post(io_, [h = std::move(h)]() mutable {
+        auto self = shared_from_this();
+        asio::post(strand_, [self, h = std::move(h)]() mutable {
             h(asio::error::already_started, 0);
         });
         return;
@@ -191,7 +200,7 @@ void KcpTunnel::try_fulfill_read() {
     // The sentinel is the magic string scoped by this session's salt, so a
     // genuine payload can never be mistaken for it: the full keepalive is
     // "KCP_PROXY_KEEPALIVE_V1" || session_salt (16 random bytes), and matching
-    // requires the salt exactly. A real segment carrying the bare 21-byte magic
+    // requires the salt exactly. A real segment carrying the bare 22-byte magic
     // (previously ambiguous) is forwarded normally.
     if (is_keepalive(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
         LOG_DEBUG(log_module_, log_msg("keepalive received, dropping"));

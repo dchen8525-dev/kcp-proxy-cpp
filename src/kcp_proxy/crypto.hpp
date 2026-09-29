@@ -114,7 +114,7 @@ public:
     // This session's 16-byte salt, empty until the server learns it from the
     // first datagram. Both peers share the same value. Not secret (it is
     // carried in cleartext on every wire datagram), but unique per session.
-    // Used to scope the application-layer keepalive sentinel so a real 21-byte
+    // Used to scope the application-layer keepalive sentinel so a real 22-byte
     // payload can never collide with it (see KcpTunnel::is_keepalive).
     byte_view session_salt() const { return byte_view(session_salt_.data(), session_salt_.size()); }
 

@@ -21,7 +21,23 @@ inline std::string get_arg(int argc, char* argv[], int& i) {
 
 inline bool get_port_arg(int argc, char* argv[], int& i, uint16_t& out) {
     std::string val = get_arg(argc, argv, i);
-    if (val.empty()) return false;
+    // Covers both "-p" as the last argument and an explicitly empty "-p ''":
+    // both leave the port unset, and exiting 1 with no diagnostic (the old
+    // behavior) made a mistyped invocation look like a crash.
+    if (val.empty()) {
+        std::cerr << "Error: -p/--port requires a port number\n";
+        return false;
+    }
+    // Strict decimal parse: std::stoul alone accepts leading whitespace and a
+    // "0x" prefix, and silently ignores trailing junk ("8388x" -> 8388, so the
+    // proxy would start on a port different from what the operator typed, with
+    // the log confidently reporting the wrong one). The digits-only gate makes
+    // the subsequent stoul provably junk-free; the -T/--threads and
+    // --allow-target parsers are strict for the same reason.
+    if (val.find_first_not_of("0123456789") != std::string::npos) {
+        std::cerr << "Error: invalid port '" << val << "'\n";
+        return false;
+    }
     try {
         unsigned long v = std::stoul(val);
         if (v > 65535) {
