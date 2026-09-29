@@ -83,7 +83,13 @@ WRONG_KEY = "totally_wrong_key_0000000"
 
 N_CONCURRENT = 100      # phase C: simultaneous tunnels
 N_RST = 10              # phase C: abrupt-reset connections
-FLOOD_PACKETS = 1500    # phase B: must exceed MAX_AUTH_ATTEMPTS_PER_SEC (500)
+# phase B: the flood comes from a single loopback address, so the per-address
+# FAILURE gate is what must engage; this only has to far exceed that budget.
+FLOOD_PACKETS = 1500
+# Mirror of the C++ per-source-address auth FAILURE budget (config.hpp). Kept
+# here so the assertion tracks the value it is actually testing. The gate counts
+# failed decrypts, not attempts, so a legitimate client is never throttled.
+MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20
 
 
 # --------------------------------------------------------------------------- #
@@ -443,20 +449,33 @@ def phase_garbage_flood(server_exe, client_exe, log_dir, echo_port):
                 "allocate any state" % (sessions_after - sessions_before))
         print("  [ok] garbage allocated no session on the server")
 
-        # The limiter is a global per-second budget (MAX_AUTH_ATTEMPTS_PER_SEC
-        # = 500), so it can only engage if auth attempts actually arrive at
-        # 500+/sec. Two subtleties make the log the only honest witness:
-        #   - once the throttle engages, FAIL_STAGE=DECRYPT_FAILED lines STOP
+        # The throttle is now two-level. Every flood packet shares the source
+        # address 127.0.0.1 (the 4 sender sockets differ only by ephemeral port,
+        # and the failure table is keyed by ADDRESS), so the PER-ADDRESS FAILURE
+        # gate (MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20/s) is what engages here
+        # -- the global budget (5000/s) is unreachable from one loopback source.
+        # That is exactly the point of the fix: a single-source garbage flood is
+        # dropped pre-decrypt after 20 failures, so it can neither pin the CPU on
+        # AEAD decrypts nor spend the global budget legitimate new sessions need.
+        # Counting FAILURES (not attempts) is what keeps a busy legitimate client
+        # from being throttled -- a genuine session decrypts OK on its first
+        # packet and never enters the table.
+        # Two subtleties still make the log the only honest witness:
+        #   - once the gate engages, FAIL_STAGE=DECRYPT_FAILED lines STOP
         #     (packets are dropped before decrypt), so the FAIL_STAGE rate is
         #     only ever a *lower bound* of the attempt rate;
         #   - some OSes (macOS notably) pace loopback UDP bursts to a trickle,
-        #     so a 1500-packet flood can be delivered far below the budget no
-        #     matter how fast the server is.
-        # Decision: throttle message present -> pass; absent but the observed
-        # FAIL_STAGE rate still exceeded the budget -> real bug; otherwise the
-        # budget was never approached and the throttle engaging is not required.
-        if "auth attempt rate limit reached" in srv_log:
-            print("  [ok] auth rate limiter engaged under the flood")
+        #     so a 1500-packet flood can be delivered far below any budget.
+        # Decision: failure-gate message present -> pass; absent but the observed
+        # DECRYPT_FAILED rate still exceeded the per-address failure budget ->
+        # real bug (the gate failed to cap a single source); otherwise the budget
+        # was never approached and the gate engaging is not required.
+        if "auth failure per-address rate limit reached" in srv_log:
+            print("  [ok] per-address auth failure gate engaged under the flood")
+        elif "auth attempt rate limit reached" in srv_log:
+            # Only reachable if the flood somehow spanned many source addresses;
+            # still a valid witness that a limiter engaged.
+            print("  [ok] global auth rate limiter engaged under the flood")
         else:
             attempt_times = []
             for line in srv_log.splitlines():
@@ -474,19 +493,21 @@ def phase_garbage_flood(server_exe, client_exe, log_dir, echo_port):
                 while attempt_times[hi] - attempt_times[lo] > 1.0:
                     lo += 1
                 peak_rate = max(peak_rate, hi - lo + 1)
-            if peak_rate >= 500:
+            if peak_rate > MAX_AUTH_FAILURES_PER_ADDR_PER_SEC:
                 raise AssertionError(
-                    "auth path saw %d decrypt failures/sec (budget is 500/s) "
-                    "yet the throttle never engaged: a flood could pin the "
-                    "CPU on AEAD decrypts" % peak_rate)
-            print("  [skip] throttle assertion: flood delivered at peak %d "
-                  "decrypt failures/sec, below the 500/s budget (the OS paces "
-                  "the loopback burst), so the limiter engaging is not required"
-                  % peak_rate)
+                    "a single source saw %d decrypt failures/sec (per-address "
+                    "failure budget is %d/s) yet no gate engaged: the limiter "
+                    "failed to cap a single-source flood"
+                    % (peak_rate, MAX_AUTH_FAILURES_PER_ADDR_PER_SEC))
+            print("  [skip] throttle assertion: single-source flood delivered at "
+                  "peak %d decrypt failures/sec, at/below the %d/s per-address "
+                  "failure budget (the OS paces the loopback burst), so the gate "
+                  "engaging is not required"
+                  % (peak_rate, MAX_AUTH_FAILURES_PER_ADDR_PER_SEC))
 
-        # The throttle is a global per-second budget. A legitimate handshake in
-        # the same window would be dropped, so wait for the window to roll over
-        # before proving the service is intact.
+        # A legitimate handshake from 127.0.0.1 in the same window is NOT dropped
+        # by the failure gate (it decrypts OK), but wait for the window to roll
+        # over anyway so the post-flood proof is unambiguous.
         time.sleep(1.5)
         run_case("post-flood tunnel", socks_port, echo_port,
                  os.urandom(4096), 20)

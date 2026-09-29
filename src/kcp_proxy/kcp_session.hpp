@@ -92,6 +92,11 @@ public:
     // callback (if set) is invoked once by on_update_tick when the buffer drains.
     bool is_target_closed() const { return target_closed_.load(); }
     void mark_target_closed() { target_closed_.store(true); }
+    // drained_cb_ is a plain (non-atomic) std::function that on_update_tick
+    // reads and moves on the session strand. Callers MUST set it on that strand
+    // (asio::dispatch(session->strand(), ...)); calling from a raw io_context
+    // executor -- e.g. an async_connect completion handler -- races with the
+    // concurrent tick.
     void set_drained_callback(std::function<void()> cb) { drained_cb_ = std::move(cb); }
 
     const std::string& session_id() const { return session_id_; }

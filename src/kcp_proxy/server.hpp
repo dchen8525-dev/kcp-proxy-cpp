@@ -103,6 +103,16 @@ private:
     // count, is what makes the plain fields safe.)
     uint32_t auth_attempts_window_ = 0;
     std::chrono::steady_clock::time_point auth_window_start_{};
+    // Per-source-address count of FAILED auth decrypts in the current window.
+    // Checked BEFORE paying for a decrypt: an address that keeps failing is a
+    // bad actor, so once it crosses MAX_AUTH_FAILURES_PER_ADDR_PER_SEC its
+    // packets are dropped outright. Keyed by address (not endpoint) so a host
+    // behind NAT shares one failure budget. Crucially, SUCCESSFUL auths never
+    // touch this table, so a legitimate client -- or a busy NAT opening many
+    // concurrent tunnels -- is never throttled no matter its new-session rate.
+    // Cleared with the global window; bounded by MAX_TRACKED_AUTH_ADDRS.
+    // Same strand-confinement invariant as the counters above.
+    std::unordered_map<asio::ip::address, uint32_t> auth_failures_by_addr_;
 
     // Throttles for the per-datagram rejection diagnostics. The auth counters
     // above cap the *work* a flood can force, but these lines each fire once per

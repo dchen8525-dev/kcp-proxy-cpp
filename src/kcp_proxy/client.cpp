@@ -284,10 +284,28 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     // counter/nonce values can never collide across sessions. The server
     // learns the salt from our first packet. NOTE: Android CPP_REMOTE must do
     // the same (generate + prepend salt, derive per-session key) for interop.
-    auto crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT,
-                                            Crypto::generate_session_salt());
-    auto session = std::make_shared<KCPClientSession>(
-        io_, server_endpoint_, crypto);
+    //
+    // Both generate_session_salt() (RAND_bytes) and the KCPClientSession ctor
+    // (ikcp_create) can throw. This runs inside the accept completion handler,
+    // so an escaping exception would propagate out of io.run() and kill the
+    // ENTIRE client -- every live tunnel -- over a single connection. Contain
+    // it here: log, close just this socket, and return. The session_ticket
+    // local drops the session-cap counter as the stack unwinds, and the accept
+    // loop is already re-armed by do_accept(), so the proxy keeps serving.
+    std::shared_ptr<Crypto> crypto;
+    std::shared_ptr<KCPClientSession> session;
+    try {
+        crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT,
+                                          Crypto::generate_session_salt());
+        session = std::make_shared<KCPClientSession>(
+            io_, server_endpoint_, crypto);
+    } catch (const std::exception& e) {
+        LOG_ERROR("client", std::string("session setup failed, closing connection: ") +
+                  e.what());
+        std::error_code ignored;
+        client->close(ignored);
+        return;
+    }
     // Tie the session-cap ticket to the session's lifetime (see above).
     session->set_keepalive(session_ticket);
     // Register for the shared KCP update tick. Weak ref only: the entry

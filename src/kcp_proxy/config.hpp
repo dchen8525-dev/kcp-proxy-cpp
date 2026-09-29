@@ -55,10 +55,33 @@ constexpr size_t MAX_CONCURRENT_SESSIONS = 4096;
 // and memory, amplifying any session leak. Mirrors the server-side guard.
 constexpr size_t MAX_CLIENT_SESSIONS = 512;
 // Global budget on new-session authentication attempts per second. Unknown
-// sources are only ever charged a full AEAD decrypt here, so a garbage UDP
-// flood must not be able to pin the server's CPU on decrypts. 500 legitimate
-// new sessions/sec is far beyond normal use.
-constexpr uint32_t MAX_AUTH_ATTEMPTS_PER_SEC = 500;
+// sources are only ever charged an HKDF derivation + one small AEAD decrypt
+// here (single-digit microseconds), so this cap bounds the CPU a garbage UDP
+// flood can pin. It is deliberately generous: the budget being exhausted
+// locks legitimate NEW sessions out for the rest of the window, so the value
+// must stay far above any plausible genuine connection rate (5000 sessions/s).
+// It is the ONLY defense against a flood spread across many spoofed source
+// addresses (the per-address failure gate below cannot help there, since each
+// spoofed address contributes just one attempt).
+constexpr uint32_t MAX_AUTH_ATTEMPTS_PER_SEC = 5000;
+// Per-source-address budget on FAILED authentications inside the same 1s
+// window. Counting failures -- not attempts -- is what makes this safe for
+// legitimate clients: a genuine session decrypts successfully on its very
+// first packet and so never appears in the failure table, no matter how many
+// concurrent tunnels one host (or one NAT) opens. Only an address that keeps
+// failing auth (a garbage flood, a wrong-key client, a forger) accrues counts,
+// and once it crosses this threshold its further packets are dropped BEFORE the
+// decrypt, so a single-source flood cannot pin the CPU on AEAD work nor spend
+// the global budget that legitimate new sessions need. 20/s leaves ample room
+// for the rare honest failure (a reconnect race) while capping a bad actor.
+constexpr uint32_t MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20;
+// Bound on the per-window source-address failure table. Entries are created
+// only for addresses that actually FAIL auth, and the table is cleared every
+// window, so this caps both memory and per-window insert work under a spoofed
+// flood. Once full, further new failing sources skip per-address accounting and
+// fall back to the global budget (still CPU-bounded), so a flood that fills the
+// table cannot grow it without limit.
+constexpr size_t MAX_TRACKED_AUTH_ADDRS = 8192;
 // Server connect timeout (DNS + TCP) when honoring a SOCKS5 CONNECT.
 constexpr int CONNECT_TIMEOUT_SEC = 15;
 constexpr int KCP_HANDSHAKE_TIMEOUT_SEC = 3;

@@ -688,8 +688,6 @@ void test_server_session_routing_and_auth() {
 
     const auto ep_a = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40001);
     const auto ep_b = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40002);
-    const auto ep_c = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40003);
-    const auto ep_d = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 40004);
 
     // A bare SOCKS5 CONNECT is the documented compatibility path: the first
     // valid encrypted packet does not have to be a HELLO.
@@ -723,29 +721,90 @@ void test_server_session_routing_and_auth() {
     expect_true(server->route_datagram(ep_b, byte_view(dup.data(), dup.size())) == nullptr,
                 "a duplicate session salt must be rejected");
 
-    // Rate limit. First prove the very packet we will expect to be dropped IS
-    // accepted while the budget has room, so the assertion below cannot pass for
-    // some unrelated reason.
-    Crypto client_d(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
-    auto valid_d = client_d.encrypt(req_view);
-    expect_true(server->route_datagram(ep_d, byte_view(valid_d.data(), valid_d.size())) != nullptr,
-                "a valid packet must be accepted while the auth budget has room");
-
-    Crypto client_c(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
-    auto valid_c = client_c.encrypt(req_view);
     const std::vector<uint8_t> garbage(64, 0xAB);
 
-    // The per-datagram WARNINGs this flood triggers would drown the test report;
-    // raise the level only for the loop and restore it afterwards.
-    const auto prev_level = current_log_level();
-    set_log_level(LogLevel::Error);
-    for (uint32_t i = 0; i < MAX_AUTH_ATTEMPTS_PER_SEC + 1; ++i) {
-        (void)server->route_datagram(ep_c, byte_view(garbage.data(), garbage.size()));
+    // --- Per-source-address FAILURE gate ---
+    // A single address that keeps failing auth is a bad actor: after
+    // MAX_AUTH_FAILURES_PER_ADDR_PER_SEC failed decrypts in the window its
+    // further packets are dropped BEFORE the decrypt. Use a fresh loopback
+    // address so the earlier 127.0.0.1 traffic does not interfere.
+    const auto ep_e = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.2"), 40005);
+    const auto ep_f = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.2"), 40006);
+    const auto ep_g = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.2"), 40007);
+
+    // A SUCCESS must never count against the address: prove a valid packet is
+    // accepted and does not consume the failure budget (the gate trips only on
+    // failures).
+    Crypto client_e(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto valid_e = client_e.encrypt(req_view);
+    expect_true(server->route_datagram(ep_e, byte_view(valid_e.data(), valid_e.size())) != nullptr,
+                "a valid packet must be accepted (a success never counts toward the failure gate)");
+
+    Crypto client_g(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto valid_g = client_g.encrypt(req_view);
+    {
+        // The per-datagram WARNINGs this flood triggers would drown the test
+        // report; raise the level only for the loop and restore it afterwards.
+        const auto prev_level = current_log_level();
+        set_log_level(LogLevel::Error);
+        // Drive this address's FAILURE count to the threshold with garbage
+        // (different ports, same /32, so one shared failure budget).
+        for (uint32_t i = 0; i < MAX_AUTH_FAILURES_PER_ADDR_PER_SEC; ++i) {
+            (void)server->route_datagram(ep_f, byte_view(garbage.data(), garbage.size()));
+        }
+        // Now even a VALID packet from the same address is dropped pre-decrypt.
+        const bool rejected = server->route_datagram(ep_g, byte_view(valid_g.data(), valid_g.size())) == nullptr;
+        set_log_level(prev_level);
+        expect_true(rejected,
+                    "a valid packet must be dropped once its source address's per-second FAILURE budget is spent");
     }
-    const bool rejected = server->route_datagram(ep_c, byte_view(valid_c.data(), valid_c.size())) == nullptr;
-    set_log_level(prev_level);
-    expect_true(rejected,
-                "a valid packet must be dropped once the per-second auth budget is spent");
+
+    // --- Legitimate high-rate clients must NOT be throttled ---
+    // Regression guard for the concurrency path: the gate counts FAILURES, not
+    // attempts, so one address opening many concurrent tunnels (each of which
+    // authenticates on its first packet) is never limited. Create well over the
+    // failure threshold of SUCCESSFUL sessions from a single fresh address; all
+    // must be accepted.
+    {
+        const auto busy_addr = asio::ip::make_address("127.0.0.3");
+        bool all_ok = true;
+        for (uint32_t i = 0; i < MAX_AUTH_FAILURES_PER_ADDR_PER_SEC * 3; ++i) {
+            Crypto c(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+            auto pkt = c.encrypt(req_view);
+            const auto ep = asio::ip::udp::endpoint(busy_addr, static_cast<uint16_t>(41000 + i));
+            if (server->route_datagram(ep, byte_view(pkt.data(), pkt.size())) == nullptr) {
+                all_ok = false;
+                break;
+            }
+        }
+        expect_true(all_ok,
+                    "many concurrent successful sessions from one address must not be throttled");
+    }
+
+    // --- Global auth budget ---
+    // The per-address gate cannot stop a flood spread across many DISTINCT
+    // spoofed addresses (each fails only once, staying under its failure
+    // threshold), so the global attempt budget is the backstop. Drive it with
+    // one garbage attempt from each of many distinct addresses; once it is
+    // spent, even a valid packet from a brand-new address must be dropped.
+    {
+        const auto prev_level = current_log_level();
+        set_log_level(LogLevel::Error);
+        for (uint32_t i = 0; i <= MAX_AUTH_ATTEMPTS_PER_SEC; ++i) {
+            const auto addr = asio::ip::make_address(
+                "10." + std::to_string((i >> 16) & 0xFF) + "." +
+                std::to_string((i >> 8) & 0xFF) + "." + std::to_string(i & 0xFF));
+            const auto ep = asio::ip::udp::endpoint(addr, 40008);
+            (void)server->route_datagram(ep, byte_view(garbage.data(), garbage.size()));
+        }
+        Crypto client_h(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+        auto valid_h = client_h.encrypt(req_view);
+        const auto ep_h = asio::ip::udp::endpoint(asio::ip::make_address("10.200.200.200"), 40009);
+        const bool rejected = server->route_datagram(ep_h, byte_view(valid_h.data(), valid_h.size())) == nullptr;
+        set_log_level(prev_level);
+        expect_true(rejected,
+                    "a valid packet must be dropped once the global per-second auth budget is spent");
+    }
 }
 
 void test_server_unauth_packet_cannot_evict_live_session() {

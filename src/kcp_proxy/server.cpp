@@ -431,21 +431,40 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     // Use the same replay-protected Crypto object that will be installed into
     // the session, so the first accepted packet seeds the replay window.
     //
-    // Global auth-throttle: an unknown source only ever costs us a full AEAD
-    // decrypt here, so enforce a per-second budget before doing that work.
-    // Without it, a garbage UDP flood (even from spoofed sources) could pin
-    // the CPU on decrypt attempts. The server is single-threaded, so these
-    // fields are only touched on the I/O thread.
+    // Two-level auth throttle, protecting two different things:
+    //   per-address FAILURE gate: an address that has repeatedly failed auth
+    //     this window is a bad actor (garbage flood / wrong key / forger); its
+    //     further packets are dropped BEFORE we pay for a decrypt. Counting
+    //     failures, not attempts, is what keeps this safe for real clients: a
+    //     genuine session decrypts successfully on its first packet and so never
+    //     enters the table, however many concurrent tunnels its host opens.
+    //   global attempt budget: bounds aggregate decrypt CPU no matter how many
+    //     distinct sources contribute -- the only defense against a flood spread
+    //     across many spoofed addresses (each contributing a single attempt).
+    // Established sessions take the salt fast path above and never reach this
+    // code. These fields are only touched on the socket's strand (every receive
+    // completion is bound to it), so plain values are safe.
     {
         const auto now = std::chrono::steady_clock::now();
         if (now - auth_window_start_ >= std::chrono::seconds(1)) {
             auth_attempts_window_ = 0;
             auth_window_start_ = now;
+            auth_failures_by_addr_.clear();
+        }
+        const auto fail_it = auth_failures_by_addr_.find(addr.address());
+        if (fail_it != auth_failures_by_addr_.end() &&
+            fail_it->second >= MAX_AUTH_FAILURES_PER_ADDR_PER_SEC) {
+            // Proven bad actor: drop without decrypting. Shares the throttle's
+            // log line class -- one hostile datagram, one line, no upper bound.
+            uint32_t suppressed = 0;
+            if (auth_ratelimit_log_.should_log(suppressed)) {
+                LOG_WARNING("server", "auth failure per-address rate limit reached, dropping packet from " + sid +
+                            (suppressed ? " (" + std::to_string(suppressed) +
+                                          " more suppressed this interval)" : ""));
+            }
+            return nullptr;
         }
         if (auth_attempts_window_ >= MAX_AUTH_ATTEMPTS_PER_SEC) {
-            // Throttled: this fires once per hostile datagram, so without the
-            // throttle a flood turns the limiter's own diagnostic into the
-            // cheapest way to burn the server's CPU and fill its log.
             uint32_t suppressed = 0;
             if (auth_ratelimit_log_.should_log(suppressed)) {
                 LOG_WARNING("server", "auth attempt rate limit reached, dropping packet from " + sid +
@@ -468,10 +487,20 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         decrypted = session_crypto->decrypt(encrypted_packet);
         LOG_DEBUG("server", sid + ": auth OK, decrypted " + std::to_string(decrypted.size()) + " bytes");
     } catch (const std::exception& e) {
+        // Count this failure against the source address so a repeat offender is
+        // dropped pre-decrypt next time (see the per-address gate above). Bounded
+        // table: increment an existing entry, else insert only while under the
+        // cap -- a spoofed flood that fills it just falls back to the global gate.
+        const auto fit = auth_failures_by_addr_.find(addr.address());
+        if (fit != auth_failures_by_addr_.end()) {
+            ++fit->second;
+        } else if (auth_failures_by_addr_.size() < MAX_TRACKED_AUTH_ADDRS) {
+            auth_failures_by_addr_.emplace(addr.address(), 1);
+        }
         // Throttled like the other per-datagram rejection diagnostics. The auth
         // limiter already bounds this to MAX_AUTH_ATTEMPTS_PER_SEC/s, but that is
-        // still up to 500 formatted WARNING lines per second handed to an
-        // attacker for free. The first occurrence always prints, so the
+        // still up to thousands of formatted WARNING lines per second handed to
+        // an attacker for free. The first occurrence always prints, so the
         // robustness suite still finds FAIL_STAGE=DECRYPT_FAILED in the log.
         uint32_t suppressed = 0;
         if (decrypt_fail_log_.should_log(suppressed)) {
@@ -948,10 +977,22 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         // strong capture would be a self-reference cycle. If it
                         // has expired, this session is gone and the sid (if
                         // present) belongs to a newer one -- skip the teardown.
-                        session->set_drained_callback([this, sid,
-                                                       w = std::weak_ptr<KCPSession>(session)]() {
-                            if (auto s = w.lock()) close_connection(sid, "target_drained", s);
-                        });
+                        //
+                        // Strand discipline: drained_cb_ is a plain std::function
+                        // that on_update_tick reads and moves ON the session
+                        // strand. This connect completion handler runs on the raw
+                        // io_context executor (tcp_socket/resolver were built on
+                        // io_, not the strand), so writing drained_cb_ here would
+                        // race with a concurrent tick. Dispatch the write onto the
+                        // strand to serialize it. The outer lambda holds a strong
+                        // session ref only until the dispatch runs; the drained
+                        // callback itself keeps the weak_ptr to avoid the cycle.
+                        asio::dispatch(session->strand(),
+                            [this, sid, session, w = std::weak_ptr<KCPSession>(session)]() {
+                                session->set_drained_callback([this, sid, w]() {
+                                    if (auto s = w.lock()) close_connection(sid, "target_drained", s);
+                                });
+                            });
                         forward_tcp_to_kcp(sid, session, tcp_socket);
                         // Eagerly arm the kcp->tcp direction so data that queued
                         // while the initial payload was being written is
