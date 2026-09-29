@@ -23,6 +23,37 @@ namespace {
 std::string sock_err(const std::error_code& ec) {
     return "ec=" + std::to_string(ec.value());
 }
+
+// The peer's opening two bytes, rendered so the log shows what was actually
+// sent instead of an opaque decimal. "bad SOCKS5 version: 67" left the operator
+// to decode ASCII by hand (67 == 'C') before working out that a browser was
+// pointed at this port as an HTTP proxy rather than as socks5://.
+std::string greeting_preview(uint8_t first, uint8_t second) {
+    auto shown = [](uint8_t c) {
+        return (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.';
+    };
+    auto hex = [](uint8_t c) {
+        static const char* digits = "0123456789abcdef";
+        std::string out;
+        out += digits[c >> 4];
+        out += digits[c & 0x0F];
+        return out;
+    };
+    return std::string("\"") + shown(first) + shown(second) + "\" (0x" + hex(first) + " 0x" +
+           hex(second) + ")";
+}
+
+// True when the opening bytes are the start of an HTTP method token. An HTTP
+// proxy client (a browser, or a system proxy configured with an HTTP proxy at
+// this port) opens with "CONNECT host:port HTTP/1.1" for https and
+// "GET http://..." for plain http. This listener speaks SOCKS5 only, so every
+// such request fails no matter how the application is configured afterwards.
+bool looks_like_http_request(uint8_t first, uint8_t second) {
+    auto is_upper = [](uint8_t c) {
+        return c >= 'A' && c <= 'Z';
+    };
+    return is_upper(first) && is_upper(second);
+}
 } // namespace
 
 KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host,
@@ -358,11 +389,12 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                 }
                 uint8_t ver = (*greet_buf)[0];
                 uint8_t nmethods = (*greet_buf)[1];
-                LOG_INFO("client", "SOCKS5 greeting ver=" + std::to_string(ver) +
-                          " nmethods=" + std::to_string(nmethods));
 
                 if (ver != SOCKS5_VERSION) {
-                    LOG_ERROR("client", "bad SOCKS5 version: " + std::to_string(ver));
+                    // Not a greeting at all, so do not claim it was one: report
+                    // what the peer actually opened with (see
+                    // log_non_socks5_client) and how to fix it.
+                    log_non_socks5_client(ver, nmethods);
                     auto ver_resp = std::make_shared<std::array<uint8_t, 2>>();
                     (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
@@ -372,6 +404,10 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                         });
                     return;
                 }
+
+                LOG_INFO("client", "SOCKS5 greeting ver=" + std::to_string(ver) +
+                          " nmethods=" + std::to_string(nmethods));
+
                 if (nmethods == 0) {
                     LOG_ERROR("client", "SOCKS5 greeting with no methods");
                     auto ver_resp = std::make_shared<std::array<uint8_t, 2>>();
@@ -1050,6 +1086,36 @@ void KCPProxyClient::send_socks5_error(
             // cleanup callback must run so the session is always released.
             if (on_complete) on_complete();
         });
+}
+
+void KCPProxyClient::log_non_socks5_client(uint8_t first, uint8_t second) {
+    // One line per rejected connection is one line per retry, and a browser
+    // that cannot proxy anything retries immediately: this produced hundreds of
+    // identical lines a second in the wild. The first occurrence always prints
+    // and the rest of the window are folded into the next line's count.
+    uint32_t suppressed = 0;
+    if (!greeting_reject_log_.should_log(suppressed)) return;
+
+    const std::string count = suppressed
+        ? " (" + std::to_string(suppressed) + " more suppressed this interval)"
+        : std::string();
+
+    if (looks_like_http_request(first, second)) {
+        // A wildcard bind is not dialable, and the local application reaches
+        // this listener over loopback anyway, so name loopback in the advice.
+        const std::string host = (listen_host_.empty() || listen_host_ == "0.0.0.0")
+            ? std::string("127.0.0.1")
+            : listen_host_;
+        LOG_ERROR("client", "non-SOCKS5 client opened with " +
+                  greeting_preview(first, second) +
+                  " -- that is an HTTP proxy request, but this port is SOCKS5 "
+                  "only. Point the application's proxy at socks5://" + host + ":" +
+                  std::to_string(listen_port_) + count);
+        return;
+    }
+    LOG_ERROR("client", "non-SOCKS5 client opened with " +
+              greeting_preview(first, second) +
+              " -- expected SOCKS5 version 0x05" + count);
 }
 
 void KCPProxyClient::abort_handshake(

@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "kcp_client_session.hpp"
 #include "byte_view.hpp"
+#include "logger.hpp"
 #include <asio.hpp>
 #include <atomic>
 #include <chrono>
@@ -100,6 +101,13 @@ private:
     uint64_t last_reported_tx_ = 0;
     uint64_t last_reported_rx_ = 0;
 
+    // Throttle for the "non-SOCKS5 client" diagnostic. That line fires once per
+    // rejected connection, so a browser pointed at this port as an HTTP proxy --
+    // the failure this listener actually sees in the field -- made it the
+    // loudest thing in the log (hundreds of lines a second, see LogThrottle).
+    // Only touched from the io thread.
+    LogThrottle greeting_reject_log_;
+
     // Shared KCP update tick: one 10ms timer for ALL client sessions (same
     // design as KCPServer::do_update_tick). The registry stores weak refs
     // keyed by raw pointer; expired entries are pruned during the tick, so
@@ -122,6 +130,12 @@ private:
     // context so main() can exit with a non-zero code instead of hanging.
     void fail_startup(const std::string& message);
     void handle_client_connection(asio::ip::tcp::socket client_socket);
+
+    // Report an opening that is not a SOCKS5 greeting. Its own step because the
+    // diagnosis -- naming the bytes and the HTTP-proxy cause -- is the whole
+    // point of the line, and the greeting-read lambda is too deeply nested to
+    // read it inline. Throttled; see greeting_reject_log_.
+    void log_non_socks5_client(uint8_t first, uint8_t second);
 
     // Tear down a failed SOCKS5 handshake: mark cancelled, cancel the deadline
     // timer, and close BOTH the local TCP socket and the KCP session. Every
