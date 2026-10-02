@@ -98,6 +98,9 @@ public:
     // Tell the peer that this side will send no more stream data, and flush it.
     // Idempotent (at most one FIN per tunnel) and a no-op on a tunnel that has
     // not negotiated support or is no longer active. Must run on the strand.
+    // A refusal from a momentarily full KCP send window does NOT consume the
+    // once-per-tunnel budget: the request latches and the shared tick re-drives
+    // it (see retry_pending_fin) until the segment is actually queued.
     void send_fin();
     // True if the peer's FIN was consumed from KCP (see try_fulfill_read).
     bool peer_fin_received() const { return peer_fin_received_.load(); }
@@ -152,6 +155,15 @@ protected:
     bool is_peer_fin(const uint8_t* data, size_t size) const;
     void touch_activity();
 
+    // Re-drive a FIN requested via send_fin() whose ikcp_send was refused by a
+    // full send window. Called from the shared 10ms tick; no-op unless a FIN
+    // was requested and none has been queued yet, and gated on the window
+    // having room so a drained-but-unACKed window cannot flood the tick.
+    void retry_pending_fin();
+    // The actual send/flush of the once-per-tunnel FIN, shared by send_fin()
+    // and retry_pending_fin(). Must run on the strand.
+    void do_send_fin();
+
     // "tag: text" when a tag is set (server sessions), just "text" otherwise.
     std::string log_msg(const std::string& text) const;
     const std::string& log_module() const { return log_module_; }
@@ -173,7 +185,10 @@ protected:
     SessionMetrics metrics_;
     std::atomic<bool> handshake_done_{false};
     // FIN negotiation state: enabled by the V2 handshake, sent at most once.
+    // fin_requested_ latches send_fin() calls; fin_sent_ is only set once the
+    // segment is actually queued, so a refused send stays retryable.
     std::atomic<bool> fin_enabled_{false};
+    std::atomic<bool> fin_requested_{false};
     std::atomic<bool> fin_sent_{false};
     // Set when the peer's FIN has been consumed from KCP. Sticky for the life of
     // the tunnel: once the peer has half-closed it can never un-half-close, and

@@ -49,6 +49,11 @@ public:
                                                byte_view data);
 
 private:
+    // route_datagram's body. Split out so route_datagram can wrap it in the
+    // exception containment described there without re-indenting the logic.
+    std::shared_ptr<KCPSession> route_datagram_impl(const asio::ip::udp::endpoint& addr,
+                                                    byte_view data);
+
     asio::io_context& io_;
     uint16_t port_;
     std::string host_;
@@ -150,6 +155,9 @@ private:
     LogThrottle auth_ratelimit_log_;
     LogThrottle drop_log_;
     LogThrottle decrypt_fail_log_;
+    // Throttle for route_datagram's exception containment: a persistently
+    // failing allocation would otherwise emit one ERROR line per datagram.
+    LogThrottle route_exception_log_;
 
     // Targets whitelisted via --allow-target; the SSRF guard refuses a target
     // only if it is restricted AND not in this list. Read-only after start().

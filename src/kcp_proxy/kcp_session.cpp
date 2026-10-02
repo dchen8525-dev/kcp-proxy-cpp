@@ -186,6 +186,10 @@ void KCPSession::on_update_tick() {
     // must NOT refresh the activity clock -- see KcpTunnel::maybe_send_keepalive.
     maybe_send_keepalive();
 
+    // A FIN refused by a full send window is re-driven as the window drains
+    // (see KcpTunnel::retry_pending_fin).
+    retry_pending_fin();
+
     // Graceful shutdown of the upstream target: once the target TCP connection
     // has closed, keep the session alive (flushing the data already queued in
     // KCP's send buffer to the client) until wait_send() reaches 0, then tear
@@ -211,8 +215,11 @@ void KCPSession::on_update_tick() {
 }
 
 void KCPSession::handle_kcp_output(byte_view data) {
-    if (!send_callback_) {
-        LOG_WARNING("kcp_session", fmt::format("{}: << handle_kcp_output - no callback, dropping {} bytes",
+    // Post-stop this fires for every remaining fragment of an in-flight flush
+    // (stop() clears the send callback first, and the encrypt-failure teardown
+    // below lands here too), so it is expected teardown noise, not a fault.
+    if (!is_active() || !send_callback_) {
+        LOG_DEBUG("kcp_session", fmt::format("{}: << handle_kcp_output - not running, dropping {} bytes",
                     session_id_, data.size()));
         return;
     }
@@ -222,7 +229,18 @@ void KCPSession::handle_kcp_output(byte_view data) {
     std::error_code ec = crypto_->encrypt_into(data, encrypted);
     if (ec) {
         metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR("kcp_session", fmt::format("{}: encrypt error: {}", session_id_, ec.message()));
+        // An undeliverable segment is a permanent hole in the byte stream, so
+        // keeping the session alive would only hang the peer's connection
+        // until its idle sweep -- e.g. once the nonce counter reaches
+        // MAX_COUNTER every encrypt refuses, and an EVP failure is equally
+        // unrecoverable. Tear down now; the client reconnects with a fresh
+        // session (and a fresh counter base). stop() is safe to run from
+        // inside the kcp flush: it clears the send callback (silencing the
+        // remaining fragments of this flush via the branch above) and never
+        // re-enters KCP.
+        LOG_ERROR("kcp_session", fmt::format("{}: encrypt error ({}), closing session",
+                  session_id_, ec.message()));
+        shut_down();
         return;
     }
     LOG_DEBUG("kcp_session", fmt::format("{}: encrypted -> {} bytes -> send_callback",

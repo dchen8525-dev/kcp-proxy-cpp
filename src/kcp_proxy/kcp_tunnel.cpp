@@ -47,17 +47,43 @@ void KcpTunnel::mark_handshake_done() {
 }
 
 void KcpTunnel::send_fin() {
+    // Latch the request, then try once now. Must run on the strand; the tick
+    // re-drives via retry_pending_fin() until the segment is queued or the
+    // tunnel dies.
+    fin_requested_.store(true);
+    do_send_fin();
+}
+
+void KcpTunnel::retry_pending_fin() {
+    if (!fin_requested_.load()) return;
+    if (fin_sent_.load()) return;
+    // wait_send() >= KCP_SNDWND is exactly ikcp_send's refusal condition
+    // (see the KCP_BACKPRESSURE_THRESHOLD note in config.hpp). Gating here
+    // keeps a window that cannot drain (dead peer, pending drain) from
+    // turning the 10ms tick into a futile retry every interval.
+    if (kcp_.wait_send() >= KCP_SNDWND) return;
+    do_send_fin();
+}
+
+void KcpTunnel::do_send_fin() {
     if (!fin_enabled_.load()) return;
     if (!is_active()) return;
     // At most one FIN per tunnel: the caller may reach here from more than one
-    // teardown path (e.g. a target read EOF and a later write error).
-    if (fin_sent_.exchange(true)) return;
+    // teardown path (e.g. a target read EOF and a later write error). The
+    // once-per-tunnel budget is only consumed when the segment is actually
+    // queued -- a refused ikcp_send queues nothing, and losing the FIN
+    // permanently would leave the peer waiting out its idle timeout for an
+    // end-of-stream it will never see.
+    if (fin_sent_.load()) return;
     auto body = build_control_payload(KCP_CONTROL_FIN);
     const size_t len = body.size();
     if (kcp_.send(byte_view(body.data(), len)) < 0) {
-        LOG_WARNING(log_module_, log_msg("FIN send failed"));
+        // Transient: the window drains as the peer ACKs and retry_pending_fin
+        // re-drives from the tick.
+        LOG_DEBUG(log_module_, log_msg("FIN send refused (window full), will retry"));
         return;
     }
+    fin_sent_.store(true);
     kcp_.update(now_kcp_ms());
     kcp_.flush();
     LOG_INFO(log_module_, log_msg("FIN sent (half-close)"));

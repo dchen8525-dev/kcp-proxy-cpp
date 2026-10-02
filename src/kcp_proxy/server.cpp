@@ -348,6 +348,35 @@ void KCPServer::handle_receive(size_t index, const std::error_code& ec,
 
 std::shared_ptr<KCPSession> KCPServer::route_datagram(
     const asio::ip::udp::endpoint& endpoint, byte_view data) {
+    // Containment: this path performs every large allocation the server can be
+    // talked into (the auth Crypto's EVP contexts, the ~20KB session object,
+    // the per-datagram receive copy, the strand-dispatch closures). Any of
+    // them throwing under memory pressure used to unwind out of io.run() and
+    // kill the whole server -- every live session -- over one datagram. The
+    // client contains the identical risk in handle_client_connection; this is
+    // the server's counterpart. Drop the datagram instead: a genuine client
+    // retransmits (KCP), the receive slot re-arms, the process survives.
+    try {
+        return route_datagram_impl(endpoint, data);
+    } catch (const std::exception& e) {
+        uint32_t suppressed = 0;
+        if (route_exception_log_.should_log(suppressed)) {
+            LOG_ERROR("server", "datagram routing failed: " + std::string(e.what()) +
+                        (suppressed ? " (" + std::to_string(suppressed) +
+                                      " more suppressed this interval)" : ""));
+        }
+        return nullptr;
+    } catch (...) {
+        uint32_t suppressed = 0;
+        if (route_exception_log_.should_log(suppressed)) {
+            LOG_ERROR("server", "datagram routing failed (unknown exception)");
+        }
+        return nullptr;
+    }
+}
+
+std::shared_ptr<KCPSession> KCPServer::route_datagram_impl(
+    const asio::ip::udp::endpoint& endpoint, byte_view data) {
     bool already_consumed = false;
     auto session = get_or_create_session(endpoint, data, already_consumed);
     if (!session) {
@@ -436,6 +465,8 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     // and replace it after the packet authenticates; only a dead/stopped
     // session, which holds nothing worth protecting, is reclaimed now.
     bool live_salt_mismatch = false;
+    bool stale_replaced = false;
+    bool cap_reached = false;
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
         auto it = sessions_.find(sid);
@@ -446,7 +477,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 }
                 live_salt_mismatch = true;
             } else {
-                LOG_DEBUG("server", sid + ": stale session found, replacing");
+                stale_replaced = true;
                 if (it->second) {
                     it->second->stop();
                 }
@@ -458,11 +489,19 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         // against the cap.
         const size_t effective =
             sessions_.size() - (live_salt_mismatch ? size_t{1} : size_t{0});
-        if (effective >= MAX_CONCURRENT_SESSIONS) {
-            LOG_WARNING("server", fmt::format("session cap reached ({}) dropping packet from {}",
-                        MAX_CONCURRENT_SESSIONS, sid));
-            return nullptr;
-        }
+        cap_reached = effective >= MAX_CONCURRENT_SESSIONS;
+    }
+    // Logging happens OUTSIDE the write lock: every LOG_* takes the logger's
+    // global mutex and a console stderr write can block for milliseconds,
+    // which would stall every concurrent router and sweeper waiting on this
+    // lock. Applies to every reject path below as well.
+    if (stale_replaced) {
+        LOG_DEBUG("server", sid + ": stale session found, replacing");
+    }
+    if (cap_reached) {
+        LOG_WARNING("server", fmt::format("session cap reached ({}) dropping packet from {}",
+                    MAX_CONCURRENT_SESSIONS, sid));
+        return nullptr;
     }
 
     // Authenticate BEFORE allocating a per-session KCP+strand+timer.
@@ -552,6 +591,19 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
 
     std::shared_ptr<KCPSession> session;
     size_t total_sessions = 0;
+    bool authenticated_reconnect = false;
+    // 拒绝原因只记枚举，日志文本在写锁释放后构造（字符串拼接是分配，锁内只做
+    // 判定）。DuplicateSalt 需要冲突会话的 sid——锁释放后 map 可能被并发修改，
+    // 必须拷贝，这是锁内仅剩的一次小分配。
+    enum class RejectReason {
+        None,
+        SessionCap,
+        DuplicateSalt,
+        ReplayedSalt,
+        TombstoneFull,
+    };
+    RejectReason rejection = RejectReason::None;
+    std::string duplicate_salt_with;
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
         // stop() sets stopped_ and swaps the session maps out under this same
@@ -572,7 +624,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             // holding this endpoint under a different salt is a real reconnect
             // on a reused source port rather than a forgery, and replacing it
             // is exactly what the deferred eviction above was waiting for.
-            LOG_DEBUG("server", sid + ": authenticated reconnect, replacing session");
+            authenticated_reconnect = true;
             if (it->second) {
                 it->second->stop();
             }
@@ -580,77 +632,101 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             drop_replaced_target_locked(sid);
         }
         if (sessions_.size() >= MAX_CONCURRENT_SESSIONS) {
-            LOG_WARNING("server", "session cap reached (" +
-                        std::to_string(MAX_CONCURRENT_SESSIONS) +
-                        "), dropping packet from " + sid);
-            return nullptr;
+            rejection = RejectReason::SessionCap;
+        } else {
+            // Duplicate-salt rejection: two sessions sharing a salt derive the same
+            // per-session AEAD key. Because the nonce counter also starts from the
+            // salt, a malicious client could force a same-key session against a live
+            // target by simply reusing its salt, and AES-GCM nonce/IV reuse would be
+            // catastrophic. Refuse to create a session whose salt a live session
+            // already claims. (Any dead session for this endpoint, or a live one
+            // this authenticated packet is replacing, was already erased above, so
+            // a client reconnecting on the same source port with a fresh salt is
+            // unaffected.)
+            for (const auto& [other_sid, other] : sessions_) {
+                if (other_sid == sid) continue;
+                if (other && other->is_alive() && other->is_running() &&
+                    other->salt_matches(encrypted_packet)) {
+                    duplicate_salt_with = other_sid;
+                    rejection = RejectReason::DuplicateSalt;
+                    break;
+                }
+            }
+            // Cross-session replay guard: the live-session check above cannot see
+            // a session that already died, but a replayed first datagram of a dead
+            // session would still pass AEAD (same salt -> same derived key) and the
+            // first-packet replay-window bypass would accept it -- including its
+            // SOCKS5 CONNECT, which we would then execute for the attacker. Refuse
+            // any salt accepted within the tombstone TTL. The check and the insert
+            // are under this same write lock, so two concurrent first datagrams
+            // sharing a salt cannot both win. Legitimate clients always generate a
+            // fresh random salt per session, so they never hit their own
+            // tombstones; the salt is already known-good here (the packet
+            // decrypted successfully).
+            if (rejection == RejectReason::None) {
+                const byte_view salt = session_crypto->session_salt();
+                const std::string salt_key(reinterpret_cast<const char*>(salt.data()),
+                                           salt.size());
+                const auto now = std::chrono::steady_clock::now();
+                const auto tomb = salt_tombstones_.find(salt_key);
+                if (tomb != salt_tombstones_.end() && tomb->second > now) {
+                    rejection = RejectReason::ReplayedSalt;
+                } else if (salt_tombstones_.size() >= MAX_SALT_TOMBSTONES) {
+                    // Fail closed: evicting early would re-open the replay window.
+                    // Only authenticated sessions insert, so reaching the cap means
+                    // implausible churn -- log it loudly.
+                    rejection = RejectReason::TombstoneFull;
+                } else {
+                    salt_tombstones_.emplace(std::move(salt_key),
+                                             now + std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC));
+                    session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid);
+                    // Set the send callback BEFORE publishing the session into sessions_.
+                    // The shared update tick can dispatch on_update_tick (and therefore
+                    // handle_kcp_output, which reads send_callback_) onto any thread the
+                    // moment the session becomes visible in the map; with -T > 1, setting
+                    // the callback after insertion would race with that read (the callback
+                    // is a plain std::function, not atomic). Publishing under the write
+                    // lock after full initialization keeps the handoff safe.
+                    auto self = shared_from_this();
+                    session->set_send_callback([self, addr](std::vector<uint8_t> data) {
+                        self->send_to_client(addr, std::move(data));
+                    });
+                    sessions_[sid] = session;
+                    total_sessions = sessions_.size();
+                }
+            }
         }
-        // Duplicate-salt rejection: two sessions sharing a salt derive the same
-        // per-session AEAD key. Because the nonce counter also starts from the
-        // salt, a malicious client could force a same-key session against a live
-        // target by simply reusing its salt, and AES-GCM nonce/IV reuse would be
-        // catastrophic. Refuse to create a session whose salt a live session
-        // already claims. (Any dead session for this endpoint, or a live one
-        // this authenticated packet is replacing, was already erased above, so
-        // a client reconnecting on the same source port with a fresh salt is
-        // unaffected.)
-        for (const auto& [other_sid, other] : sessions_) {
-            if (other_sid == sid) continue;
-            if (other && other->is_alive() && other->is_running() &&
-                other->salt_matches(encrypted_packet)) {
-                LOG_WARNING("server", fmt::format(
+    }
+
+    if (authenticated_reconnect) {
+        LOG_DEBUG("server", sid + ": authenticated reconnect, replacing session");
+    }
+    if (rejection != RejectReason::None) {
+        std::string rejection_line;
+        switch (rejection) {
+            case RejectReason::SessionCap:
+                rejection_line = "session cap reached (" +
+                                 std::to_string(MAX_CONCURRENT_SESSIONS) +
+                                 "), dropping packet from " + sid;
+                break;
+            case RejectReason::DuplicateSalt:
+                rejection_line = fmt::format(
                     "duplicate session salt rejected: {} collides with live session {}",
-                    sid, other_sid));
-                return nullptr;
-            }
-        }
-        // Cross-session replay guard: the live-session check above cannot see
-        // a session that already died, but a replayed first datagram of a dead
-        // session would still pass AEAD (same salt -> same derived key) and the
-        // first-packet replay-window bypass would accept it -- including its
-        // SOCKS5 CONNECT, which we would then execute for the attacker. Refuse
-        // any salt accepted within the tombstone TTL. The check and the insert
-        // are under this same write lock, so two concurrent first datagrams
-        // sharing a salt cannot both win. Legitimate clients always generate a
-        // fresh random salt per session, so they never hit their own
-        // tombstones; the salt is already known-good here (the packet
-        // decrypted successfully).
-        {
-            const byte_view salt = session_crypto->session_salt();
-            const std::string salt_key(reinterpret_cast<const char*>(salt.data()),
-                                       salt.size());
-            const auto now = std::chrono::steady_clock::now();
-            const auto tomb = salt_tombstones_.find(salt_key);
-            if (tomb != salt_tombstones_.end() && tomb->second > now) {
-                LOG_WARNING("server", "replayed session salt rejected from " + sid);
-                return nullptr;
-            }
-            if (salt_tombstones_.size() >= MAX_SALT_TOMBSTONES) {
-                // Fail closed: evicting early would re-open the replay window.
-                // Only authenticated sessions insert, so reaching the cap means
-                // implausible churn -- log it loudly.
-                LOG_WARNING("server", fmt::format(
+                    sid, duplicate_salt_with);
+                break;
+            case RejectReason::ReplayedSalt:
+                rejection_line = "replayed session salt rejected from " + sid;
+                break;
+            case RejectReason::TombstoneFull:
+                rejection_line = fmt::format(
                     "salt tombstone table full ({}), dropping packet from {}",
-                    MAX_SALT_TOMBSTONES, sid));
-                return nullptr;
-            }
-            salt_tombstones_.emplace(std::move(salt_key),
-                                     now + std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC));
+                    MAX_SALT_TOMBSTONES, sid);
+                break;
+            case RejectReason::None:
+                break;
         }
-        session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid);
-        // Set the send callback BEFORE publishing the session into sessions_.
-        // The shared update tick can dispatch on_update_tick (and therefore
-        // handle_kcp_output, which reads send_callback_) onto any thread the
-        // moment the session becomes visible in the map; with -T > 1, setting
-        // the callback after insertion would race with that read (the callback
-        // is a plain std::function, not atomic). Publishing under the write
-        // lock after full initialization keeps the handoff safe.
-        auto self = shared_from_this();
-        session->set_send_callback([self, addr](std::vector<uint8_t> data) {
-            self->send_to_client(addr, std::move(data));
-        });
-        sessions_[sid] = session;
-        total_sessions = sessions_.size();
+        LOG_WARNING("server", rejection_line);
+        return nullptr;
     }
 
     session->start();
@@ -773,15 +849,11 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
 
     // NeedMore: incomplete request, caller should read more data
     if (parsed.status == SOCKS5ParseStatus::NeedMore) {
-        if (accum.size() > FWD_BUF_SIZE) {
-            // Request too large, reject immediately
-            session->set_socks5_read_pending(false);
-            LOG_ERROR("server", "FAIL_STAGE=SOCKS5_PARSE_FAILED ERROR=request_too_large CLIENT_ENDPOINT=" +
-                      session->session_id() + " TARGET=-");
-            send_socks5_reply(session, SOCKS5_REPLY_GENERAL_FAILURE);
-            close_connection(session->session_id(), "socks5_too_large", session);
-            return true;  // complete with error
-        }
+        // The size bound lives at the append site (read_more_socks5's read
+        // handler), which checks BEFORE inserting the next fragment. Checked
+        // here, after the append, one full FWD_BUF_SIZE read still fit and
+        // only the second read tripped the test, so the accumulator actually
+        // grew to ~2x FWD_BUF_SIZE.
         return false;  // need more data
     }
 
@@ -872,6 +944,17 @@ void KCPServer::read_more_socks5(std::shared_ptr<KCPSession> session,
             return;
         }
 
+        // Bound the accumulator BEFORE appending. A valid SOCKS5 request is at
+        // most ~262 bytes (4 + 1 + 255 + 2), so FWD_BUF_SIZE is pure anti-DoS
+        // headroom; the point is that the buffer can never exceed it.
+        if (accum->size() + bytes > FWD_BUF_SIZE) {
+            session->set_socks5_read_pending(false);
+            LOG_ERROR("server", "FAIL_STAGE=SOCKS5_PARSE_FAILED ERROR=request_too_large CLIENT_ENDPOINT=" +
+                      session->session_id() + " TARGET=-");
+            send_socks5_reply(session, SOCKS5_REPLY_GENERAL_FAILURE);
+            close_connection(session->session_id(), "socks5_too_large", session);
+            return;
+        }
         accum->insert(accum->end(), buf->begin(), buf->begin() + static_cast<std::ptrdiff_t>(bytes));
         if (parse_accumulated_socks5(session, *accum, true)) {
             return;
@@ -1414,6 +1497,7 @@ void KCPServer::close_connection(const std::string& session_id, const char* call
                                  const std::shared_ptr<KCPSession>& owner) {
     std::shared_ptr<asio::ip::tcp::socket> sock_to_close;
     std::shared_ptr<KCPSession> session_to_stop;
+    bool skipped_replaced = false;
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
 
@@ -1424,24 +1508,32 @@ void KCPServer::close_connection(const std::string& session_id, const char* call
         if (owner) {
             auto sit = sessions_.find(session_id);
             if (sit == sessions_.end() || sit->second != owner) {
-                LOG_DEBUG("server", session_id + ": close_connection from " + std::string(caller) +
-                          " skipped - session already replaced");
-                return;
+                skipped_replaced = true;
             }
         }
-        LOG_INFO("server", session_id + ": close_connection from " + std::string(caller));
-
-        auto it = connections_.find(session_id);
-        if (it != connections_.end()) {
-            sock_to_close = std::move(it->second.tcp_socket);
-            connections_.erase(it);
-        }
-        auto sit = sessions_.find(session_id);
-        if (sit != sessions_.end()) {
-            session_to_stop = sit->second;
-            sessions_.erase(sit);
+        if (!skipped_replaced) {
+            auto it = connections_.find(session_id);
+            if (it != connections_.end()) {
+                sock_to_close = std::move(it->second.tcp_socket);
+                connections_.erase(it);
+            }
+            auto sit = sessions_.find(session_id);
+            if (sit != sessions_.end()) {
+                session_to_stop = sit->second;
+                sessions_.erase(sit);
+            }
         }
     }
+
+    // Logging happens OUTSIDE the write lock: the logger's mutex plus a
+    // possibly-slow stderr write must not extend this critical section (same
+    // reasoning as get_or_create_session).
+    if (skipped_replaced) {
+        LOG_DEBUG("server", session_id + ": close_connection from " + std::string(caller) +
+                  " skipped - session already replaced");
+        return;
+    }
+    LOG_INFO("server", session_id + ": close_connection from " + std::string(caller));
 
     if (sock_to_close) {
         // The socket is owned by its session's strand (see
@@ -1528,8 +1620,6 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
         // Find dead sessions
         for (auto& [sid, session] : sessions_) {
             if (session && !session->is_alive()) {
-                LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=idle_timeout CLIENT_ENDPOINT=" +
-                         sid + " TARGET=-");
                 dead_session_ids.push_back(sid);
                 sessions_to_stop.push_back(session);
                 auto conn_it = connections_.find(sid);
@@ -1556,6 +1646,14 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
         // Report the post-sweep count so "sessions=N" is the live figure, not
         // the count captured before dead sessions were erased.
         active_sessions = sessions_.size();
+    }
+
+    // Timeout diagnostics are logged OUTSIDE the write lock (see
+    // get_or_create_session): one console-bound INFO line per reaped session
+    // must not extend the sweep's critical section.
+    for (const auto& sid : dead_session_ids) {
+        LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=idle_timeout CLIENT_ENDPOINT=" +
+                 sid + " TARGET=-");
     }
 
     // Stop sessions and close sockets outside the lock

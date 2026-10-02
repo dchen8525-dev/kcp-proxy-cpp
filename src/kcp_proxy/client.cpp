@@ -643,20 +643,21 @@ void KCPProxyClient::read_socks5_reply(
                 return;
             }
 
+            // Cap the accumulator BEFORE appending, mirroring the server-side
+            // request bound in read_more_socks5: a reply that never completes
+            // would otherwise grow memory one chunk at a time, and checking
+            // only after the append let it reach ~2x FWD_BUF_SIZE.
+            if (accum->size() + bytes > FWD_BUF_SIZE) {
+                LOG_ERROR("client", "SOCKS5 reply too large (" +
+                          std::to_string(accum->size() + bytes) + " bytes), failing");
+                fail_with_reply(SOCKS5_REPLY_GENERAL_FAILURE);
+                return;
+            }
             accum->insert(accum->end(), chunk->begin(),
                           chunk->begin() + static_cast<std::ptrdiff_t>(bytes));
 
             const auto parsed = parse_socks5_reply(*accum);
             if (parsed.status == SOCKS5ReplyStatus::NeedMore) {
-                // Cap accumulation: a reply that never completes would grow
-                // memory one KCP message at a time. The server-side request
-                // parser rejects past FWD_BUF_SIZE the same way.
-                if (accum->size() > FWD_BUF_SIZE) {
-                    LOG_ERROR("client", "SOCKS5 reply too large (" +
-                              std::to_string(accum->size()) + " bytes), failing");
-                    fail_with_reply(SOCKS5_REPLY_GENERAL_FAILURE);
-                    return;
-                }
                 // Truncated reply: keep reading. Acting on the first two bytes
                 // treated a half-received reply as success.
                 read_socks5_reply(client_socket, session, accum, handshake_start,

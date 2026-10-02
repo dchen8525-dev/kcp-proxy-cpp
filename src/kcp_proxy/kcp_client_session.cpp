@@ -328,6 +328,10 @@ void KCPClientSession::on_update_tick() {
     // Application-layer keepalive (see KcpTunnel::maybe_send_keepalive).
     maybe_send_keepalive();
 
+    // A FIN refused by a full send window is re-driven as the window drains
+    // (see KcpTunnel::retry_pending_fin).
+    retry_pending_fin();
+
     // Re-arm is NOT done here: this method is driven by KCPProxyClient's
     // single shared 10ms tick timer (do_update_tick), which collapses N
     // per-session timer-heap entries into one. Fixed 10ms cadence -- we
@@ -442,7 +446,22 @@ void KCPClientSession::handle_kcp_output(byte_view data) {
     std::error_code ec = crypto_->encrypt_into(data, *send_buf);
     if (ec) {
         metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR("kcp_client", "encrypt error: " + ec.message());
+        // An undeliverable segment is a permanent hole in the byte stream, so
+        // the session must be torn down rather than left to hang until the
+        // idle timeout (e.g. once the nonce counter reaches MAX_COUNTER every
+        // encrypt refuses). The shutdown is DEFERRED via post(): this callback
+        // runs from inside a kcp flush -- including on_close()'s best-effort
+        // final flush, whose own failing segments would re-enter shut_down()
+        // and recurse if it ran synchronously. The latched flag keeps one
+        // failure to one log line + one teardown request.
+        if (!encrypt_teardown_.exchange(true)) {
+            LOG_ERROR("kcp_client", "encrypt error (" + ec.message() + "), closing session");
+            // shared_from_this() yields shared_ptr<KcpTunnel>; the posted
+            // teardown needs the derived type so the protected shut_down()
+            // stays accessible through the object expression.
+            auto self = std::static_pointer_cast<KCPClientSession>(shared_from_this());
+            asio::post(strand(), [self]() { self->shut_down(); });
+        }
         return;
     }
     LOG_DEBUG("kcp_client", "encrypted -> " + std::to_string(send_buf->size()) +

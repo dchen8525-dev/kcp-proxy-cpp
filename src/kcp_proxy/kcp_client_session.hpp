@@ -63,6 +63,10 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> connect_pending_{false};
+    // Latched on the first encrypt failure so the teardown it triggers is
+    // requested (and logged) exactly once, no matter how many queued segments
+    // fail while the session drains. See handle_kcp_output.
+    std::atomic<bool> encrypt_teardown_{false};
     // Last time a valid packet was received from the server (steady_clock us).
     // The client has no server-side idle sweep, so a connected session that
     // stops receiving for KCP_TIMEOUT_SEC is considered dead (server crashed or
