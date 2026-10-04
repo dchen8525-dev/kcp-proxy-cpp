@@ -522,7 +522,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     // code. These fields are only touched on the socket's strand (every receive
     // completion is bound to it), so plain values are safe.
     {
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = auth_clock_();
         if (now - auth_window_start_ >= std::chrono::seconds(1)) {
             auth_attempts_window_ = 0;
             auth_window_start_ = now;

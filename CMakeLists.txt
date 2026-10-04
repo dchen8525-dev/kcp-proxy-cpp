@@ -67,19 +67,39 @@ target_compile_definitions(kcp_proxy_lib PUBLIC ASIO_STANDALONE FMT_HEADER_ONLY)
 option(KCP_PROXY_ENABLE_NATIVE_TUNE
     "Optimize for the local CPU (-march=native). Keep OFF for portable release binaries."
     OFF)
+# AddressSanitizer. 与 MSVC 的 /GL（全程序优化）和 /RTC1（Debug 运行时检查）都
+# 不兼容，开启时同时去掉这两类标志；运行时库经 /INFERASANLIBS 自动链接。
+# 动态内存回归测试用：cmake -B build-asan -DKCP_PROXY_ENABLE_ASAN=ON 后在
+# Release 配置下跑 ctest，越界/UAF 会以 ASAN 报告形式直接失败退出。
+option(KCP_PROXY_ENABLE_ASAN
+    "Build with AddressSanitizer (disables /GL /LTCG /RTC1, which are incompatible)"
+    OFF)
 if(MSVC)
-    target_compile_options(kcp_proxy_lib PRIVATE
-        /W4           # Higher warning level
-        /wd4324       # C4324: padding from intentional alignas(64) cache-line
-                      # isolation on crypto keys / hot buffers -- suppress at
-                      # compiler level; header #pragma push/disable is not
-                      # reliable here under precompiled headers.
-        /O2           # Optimization level
-        /GL           # Whole program optimization
-        /Gy           # Enable function-level linking
-    )
-    target_link_options(kcp_proxy_lib PRIVATE /LTCG)  # Link-time code generation
+    if(KCP_PROXY_ENABLE_ASAN)
+        add_compile_options(/fsanitize=address)
+        add_link_options(/INFERASANLIBS)
+        # add_compile_options 只作用于其后创建的目标；kcp_proxy_lib 定义在前面，
+        # 必须显式补上，否则库与使用者一个有 ASAN 注解一个没有，LNK2038 直接
+        # 拒绝链接。
+        target_compile_options(kcp_proxy_lib PRIVATE /W4 /wd4324 /fsanitize=address)
+    else()
+        target_compile_options(kcp_proxy_lib PRIVATE
+            /W4           # Higher warning level
+            /wd4324       # C4324: padding from intentional alignas(64) cache-line
+                          # isolation on crypto keys / hot buffers -- suppress at
+                          # compiler level; header #pragma push/disable is not
+                          # reliable here under precompiled headers.
+            /O2           # Optimization level
+            /GL           # Whole program optimization
+            /Gy           # Enable function-level linking
+        )
+        target_link_options(kcp_proxy_lib PRIVATE /LTCG)  # Link-time code generation
+    endif()
 else()
+    if(KCP_PROXY_ENABLE_ASAN)
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address)
+    endif()
     target_compile_options(kcp_proxy_lib PRIVATE
         -Wall -Wextra -Wpedantic
         -O3

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -38,6 +39,14 @@ public:
     // local echo server). Each entry is "host" or "host:port"; an IPv6 host
     // may be bracketed as "[addr]:port".
     void set_allowed_targets(std::vector<std::string> targets);
+
+    // 测试专用：替换认证限流窗口的时钟（见 auth_clock_ 注释）。必须在
+    // start() 之前调用；注入后窗口推进由测试完全控制，速率断言与宿主机
+    // 速度解耦。
+    void set_auth_clock_for_test(
+        std::function<std::chrono::steady_clock::time_point()> clock) {
+        auth_clock_ = std::move(clock);
+    }
 
     // Route one received datagram: authenticate it (creating a session for an
     // unknown endpoint on success) and hand the bytes to KCP. Returns the
@@ -124,6 +133,12 @@ private:
     // count, is what makes the plain fields safe.)
     uint32_t auth_attempts_window_ = 0;
     std::chrono::steady_clock::time_point auth_window_start_{};
+    // 窗口时钟。生产路径用 steady_clock；测试注入假时钟后，1 秒限流窗口的
+    // 耗尽与重置不再依赖宿主机速度——ASAN/慢机下 5000 次循环可能跑超 1 秒真
+    // 实时间，窗口中途重置会让"预算耗尽"的断言随构建速度而翻转。仅在测试中
+    // 调用 setter；时钟本身只在接收 strand 上读取，无需同步。
+    std::function<std::chrono::steady_clock::time_point()> auth_clock_ =
+        [] { return std::chrono::steady_clock::now(); };
     // Per-source-address count of FAILED auth decrypts in the current window.
     // Checked BEFORE paying for a decrypt: an address that keeps failing is a
     // bad actor, so once it crosses MAX_AUTH_FAILURES_PER_ADDR_PER_SEC its

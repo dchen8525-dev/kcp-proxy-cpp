@@ -787,7 +787,19 @@ void test_server_session_routing_and_auth() {
     // threshold), so the global attempt budget is the backstop. Drive it with
     // one garbage attempt from each of many distinct addresses; once it is
     // spent, even a valid packet from a brand-new address must be dropped.
+    //
+    // The 1s rate-limit window runs on an INJECTED clock (100us per packet):
+    // 5002 calls advance fake time ~0.5s, so the window can never reset
+    // mid-flood. On the real clock this test raced the window -- under ASAN
+    // the 5001-iteration flood took >1s, the window reset, the budget
+    // refilled, and the final assertion flipped with build speed.
     {
+        auto fake_now = std::chrono::steady_clock::time_point{} +
+                        std::chrono::microseconds(1000);
+        server->set_auth_clock_for_test([fake_now]() mutable {
+            fake_now += std::chrono::microseconds(100);
+            return fake_now;
+        });
         const auto prev_level = current_log_level();
         set_log_level(LogLevel::Error);
         for (uint32_t i = 0; i <= MAX_AUTH_ATTEMPTS_PER_SEC; ++i) {
