@@ -1,5 +1,9 @@
 # Build output (CMake)
 build/
+# AddressSanitizer build tree (configure with -DKCP_PROXY_ENABLE_ASAN=ON);
+# same class of generated output as build/, kept separate so an ASAN build never
+# overwrites the normal one.
+build-asan/
 
 # vcpkg (tool and installed packages)
 vcpkg/
@@ -11,6 +15,9 @@ bin/
 
 # IDE
 .idea/
+
+# Editor/agent tooling artifacts (derived from this file; not project content)
+.zcodeignore
 
 # Executables and artifacts (build dir only)
 build/*.exe
