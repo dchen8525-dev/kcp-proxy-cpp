@@ -1,6 +1,9 @@
 {
   "extends": "electron-builder.base.json",
   "compression": "maximum",
+  "directories": {
+    "buildResources": "nsis"
+  },
   "win": {
     "target": "nsis",
     "icon": "assets/icon.png",
@@ -21,7 +24,9 @@
     "runAfterFinish": true,
     "installerLanguages": ["zh_CN", "en_US"],
     "language": "2052",
-    "unicode": true
+    "unicode": true,
+    "script": "installer.nsi",
+    "include": "installer.nsh"
   },
   "publish": {
     "provider": "github",

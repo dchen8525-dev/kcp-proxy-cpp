@@ -194,6 +194,52 @@ def test_gui_maps_darwin_to_the_macos_bin_dir():
 
 
 # --------------------------------------------------------------------------- #
+# the Windows installer shows real installation details
+# --------------------------------------------------------------------------- #
+def test_nsis_installer_shows_details():
+    """electron-builder's stock install section suppresses every status line
+    with `SetDetailsPrint none`, so the Setup.exe shows a bare progress bar:
+    no Extract / Output folder / Create shortcut feedback at all. The custom
+    NSIS script (gui/electron/nsis/) re-enables it; guard the wiring, because
+    every piece of it fails silently if dropped."""
+    config = json.loads(read("gui/electron/electron-builder.win.json"))
+    nsis = config.get("nsis", {})
+    require(nsis.get("script") == "installer.nsi",
+            'electron-builder.win.json must set nsis.script="installer.nsi"')
+    # include= does double duty: its file enables ShowInstDetails AND its
+    # presence is what makes electron-builder add the build resources dir to
+    # the makensis include path, so installSection_details.nsh resolves.
+    require(nsis.get("include") == "installer.nsh",
+            'electron-builder.win.json must set nsis.include="installer.nsh"')
+    require(config.get("directories", {}).get("buildResources") == "nsis",
+            'buildResources must point at "nsis" (repo .gitignore ignores every '
+            'build/ directory, so the NSIS scripts cannot live in build/)')
+    require((ROOT / "gui" / "electron" / "nsis" / "installer.nsi").is_file(),
+            "missing gui/electron/nsis/installer.nsi")
+
+    nsi = read("gui/electron/nsis/installer.nsi")
+    require('!include "installSection_details.nsh"' in nsi,
+            "installer.nsi must include the patched installSection_details.nsh, "
+            'not the stock "installSection.nsh"')
+    require("LangString detailExtracting" in nsi,
+            "installer.nsi must define the bilingual progress strings")
+
+    section = read("gui/electron/nsis/installSection_details.nsh")
+    # Match the instruction itself, not prose about it: the file documents the
+    # original bug in a comment, which mentions the same words.
+    require(re.search(r"^\s*SetDetailsPrint\s+none\b", section, re.MULTILINE) is None,
+            "installSection_details.nsh must not re-suppress details "
+            "(SetDetailsPrint none is the original bug)")
+    require("SetDetailsPrint both" in section,
+            "installSection_details.nsh must enable SetDetailsPrint both")
+    require('DetailPrint "$(detailExtracting)"' in section,
+            "installSection_details.nsh must print the extraction milestone")
+
+    require("ShowInstDetails show" in read("gui/electron/nsis/installer.nsh"),
+            "installer.nsh must show the details view by default")
+
+
+# --------------------------------------------------------------------------- #
 # deploy tooling (the one path that is fully local and was never executed)
 # --------------------------------------------------------------------------- #
 def test_deploy_dry_run():
@@ -459,6 +505,7 @@ TESTS = [
     test_gui_never_puts_the_key_on_the_command_line,
     test_gui_finds_the_dev_build,
     test_gui_maps_darwin_to_the_macos_bin_dir,
+    test_nsis_installer_shows_details,
     test_deploy_dry_run,
     test_service_scripts,
     test_udp_buffer_ceiling_agrees,
