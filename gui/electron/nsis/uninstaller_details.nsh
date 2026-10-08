@@ -98,7 +98,7 @@ FunctionEnd
 Function un.onInit
   SetOutPath $INSTDIR
   ${LogSet} on
-  
+
   !insertmacro check64BitAndSetRegView
 
   # Parse command line for /S flag and set silent mode
@@ -107,7 +107,7 @@ Function un.onInit
   ${IfNot} ${Errors}
     SetSilent silent
   ${EndIf}
-  
+
   ${If} ${Silent}
     call un.checkAppRunning
   ${else}
