@@ -27,13 +27,39 @@ import time
 KEY = "e2e_tunnel_test_key_123456"  # >= 16 chars, required by the server
 
 
-def free_port():
-    """Grab an ephemeral TCP port the OS just handed out."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+# Ports already handed out by free_port() during this run. Windows happily
+# returns the same ephemeral number to two consecutive probes (the first socket
+# is closed before anything binds it), so two servers can be told to share one
+# port -- which surfaces as a bind failure and "server exited early with code 1".
+_taken_ports = set()
+
+
+def free_port(proto=socket.SOCK_STREAM):
+    """Grab an ephemeral port the OS just handed out, for the protocol asked.
+
+    The probe must use the protocol the caller is going to bind: on Windows the
+    dynamic range is carved up per protocol (Hyper-V/WSL reserve whole blocks),
+    so a number that is free for TCP can already be taken for UDP. Probing TCP
+    and handing the number to the server's UDP socket made the server die at
+    startup with "Fatal error: failed to bind UDP socket" -- exit code 1.
+    """
+    kind = "UDP" if proto == socket.SOCK_DGRAM else "TCP"
+    for _ in range(50):
+        probe = socket.socket(socket.AF_INET, proto)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        finally:
+            probe.close()
+        if port not in _taken_ports:
+            _taken_ports.add(port)
+            return port
+    raise RuntimeError("no free %s port found in 50 attempts" % kind)
+
+
+def free_udp_port():
+    """free_port() for a UDP listener; see the protocol note there."""
+    return free_port(socket.SOCK_DGRAM)
 
 
 class EchoServer:
@@ -335,14 +361,31 @@ def start_pair(server_exe, client_exe, udp_port, socks_port, allow_target=None):
     return server_proc, client_proc
 
 
+def process_output(proc):
+    """Everything a FINISHED child wrote to its piped stdout.
+
+    The pair is spawned with stdout=PIPE and nothing drains it, because the
+    tunnel assertions only need the sockets; the cost is that a server that dies
+    on startup normally leaves no trace at all. Reading after poll() saw it exit
+    cannot block, and turns "server exited early with code 1" into the actual
+    "Fatal error: failed to bind UDP socket ..." line.
+    """
+    try:
+        return (proc.stdout.read() or b"").decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+        return "<output unavailable>"
+
+
 def wait_pair_ready(server_proc, client_proc, socks_port, timeout=15):
     if not wait_for_port("127.0.0.1", socks_port, timeout):
         raise RuntimeError("client SOCKS port never came up on 127.0.0.1:%d" % socks_port)
     time.sleep(0.3)
     if server_proc.poll() is not None:
-        raise RuntimeError("server exited early with code %s" % server_proc.returncode)
+        raise RuntimeError("server exited early with code %s, output:\n%s"
+                           % (server_proc.returncode, process_output(server_proc)))
     if client_proc.poll() is not None:
-        raise RuntimeError("client exited early with code %s" % client_proc.returncode)
+        raise RuntimeError("client exited early with code %s, output:\n%s"
+                           % (client_proc.returncode, process_output(client_proc)))
 
 
 def run_case(label, socks_port, echo_port, payload, timeout):
@@ -393,7 +436,7 @@ def main():
     extra_servers = []
     try:
         # --- Phase 1: allowlisted local target -> data survives the tunnel ---
-        udp1 = free_port()
+        udp1 = free_udp_port()
         socks1 = free_port()
         sp1, cp1 = start_pair(args.server, args.client, udp1, socks1,
                               "127.0.0.1:%d" % echo_port)
@@ -420,7 +463,7 @@ def main():
         print("  [ok] streaming: 10 ordered messages byte-exact")
 
         # --- Phase 2: default guard (no allowlist) must refuse the same target ---
-        udp2 = free_port()
+        udp2 = free_udp_port()
         socks2 = free_port()
         sp2, cp2 = start_pair(args.server, args.client, udp2, socks2, allow_target=None)
         procs += [sp2, cp2]
@@ -447,7 +490,7 @@ def main():
         watcher.start()
         extra_servers = [oneshot, watcher]
 
-        udp3 = free_port()
+        udp3 = free_udp_port()
         socks3 = free_port()
         sp3, cp3 = start_pair(
             args.server, args.client, udp3, socks3,

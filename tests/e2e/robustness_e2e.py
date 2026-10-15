@@ -71,6 +71,7 @@ from tunnel_e2e import (  # noqa: E402  (path tweak must precede the import)
     EchoServer,
     augment_dll_path,
     free_port,
+    free_udp_port,
     normalize_binary_path,
     recv_exact,
     run_case,
@@ -292,7 +293,7 @@ class CloseAfterEchoServer:
 # --------------------------------------------------------------------------- #
 def phase_wrong_key(server_exe, client_exe, log_dir):
     print("[A] wrong key: server must drop the client, app must be told no")
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, "wrongkey", log_level="INFO",
@@ -349,9 +350,17 @@ def phase_wrong_key(server_exe, client_exe, log_dir):
         # the packet has to die at the auth boundary.
         srv_log = log_text(server.log_path)
         if "new session" in srv_log:
+            dump_logs([server.log_path, client.log_path])
             raise AssertionError("server created a session for an unauthenticated client")
         if "DECRYPT_FAILED" not in srv_log:
-            raise AssertionError("server did not reject the wrong-key packet at auth")
+            # The pair passed the ready check, so either the server died later,
+            # the packet never reached it, or it was dropped before decrypt (an
+            # auth-gate reason, not a decrypt failure). Say which, with the tails.
+            dump_logs([server.log_path, client.log_path])
+            raise AssertionError(
+                "server did not reject the wrong-key packet at auth (server alive=%s, "
+                "exit=%s, client exit=%s)" % (server.alive(), server.exit_code(),
+                                              client.exit_code()))
         print("  [ok] server created no session; packet rejected (DECRYPT_FAILED)")
 
         if not server.alive() or not client.alive():
@@ -380,7 +389,7 @@ def _fake_kcp_header():
 
 def phase_garbage_flood(server_exe, client_exe, log_dir, echo_port):
     print("[B] garbage flood: hostile UDP datagrams must not crash or degrade the server")
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, "flood",
@@ -439,6 +448,7 @@ def phase_garbage_flood(server_exe, client_exe, log_dir, echo_port):
 
         srv_log = log_text(server.log_path)
         if "DECRYPT_FAILED" not in srv_log:
+            dump_logs([server.log_path, client.log_path])
             raise AssertionError("garbage was not rejected at the auth boundary")
         print("  [ok] garbage rejected at auth (DECRYPT_FAILED), never reached KCP")
 
@@ -545,7 +555,7 @@ def phase_concurrency(server_exe, client_exe, log_dir, server_threads=1,
     target = CloseAfterEchoServer(target_port)
     target.start()
 
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, tag,
@@ -655,7 +665,7 @@ def phase_env_key(server_exe, client_exe, log_dir, echo_port):
     print("[F] env key: KCP_PROXY_KEY must authenticate, and misfire cleanly")
 
     # --- positive: both sides keyed via the environment only ---
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, "envkey",
@@ -679,7 +689,7 @@ def phase_env_key(server_exe, client_exe, log_dir, echo_port):
 
     # --- negative: a wrong value in the env channel must behave like a wrong
     # --key: no session, auth rejection, local app told no ---
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, "envkey-wrong",
@@ -835,7 +845,7 @@ def phase_half_close(server_exe, client_exe, log_dir):
     target = HalfCloseTarget(target_port, chunks=chunks, gap=gap)
     target.start()
 
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, "halfclose",
@@ -1021,7 +1031,7 @@ def phase_big_response_target_close(server_exe, client_exe, log_dir):
     target = BigResponseThenCloseTarget(target_port, BIG_RESPONSE_BYTES)
     target.start()
 
-    udp_port = free_port()
+    udp_port = free_udp_port()
     socks_port = free_port()
     server, client = start_pair(server_exe, client_exe, udp_port, socks_port,
                                 KEY, log_dir, "bigresp",
