@@ -187,7 +187,14 @@ private:
     // flood that trips the rate limiter must not also swallow the first
     // "packet dropped" or decrypt-failure line, and vice versa. Each one always
     // emits its first occurrence, which is what the robustness suite greps for.
+    // The two auth-limiter rejections are likewise split: the per-address gate
+    // fires within the first ~20 packets of any bad source, so a shared
+    // instance would consume the interval and render the global-budget line
+    // (aggregate flood clamping -- the more severe signal) permanently
+    // invisible whenever both fire together, which is exactly when an operator
+    // needs to see it.
     LogThrottle auth_ratelimit_log_;
+    LogThrottle auth_global_budget_log_;
     LogThrottle drop_log_;
     LogThrottle decrypt_fail_log_;
     // Throttle for route_datagram's exception containment: a persistently

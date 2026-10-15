@@ -59,6 +59,51 @@ constexpr std::string_view info_for_direction(uint8_t direction) {
     return (direction == NONCE_DIR_CLIENT) ? "kcp-proxy/c2s/v1" : "kcp-proxy/s2c/v1";
 }
 
+// Per-datagram rejection diagnostics. Every WARNING path in decrypt_impl below
+// is reachable once per hostile datagram by any UDP sender, so an unthrottled
+// line is exactly the log DoS LogThrottle exists to stop (see its comment:
+// measured 10500 lines for 5000 datagrams) -- and since a format+timestamp+
+// write costs more than the small AEAD open it reports, the unthrottled line
+// also capped the server's flood-processing throughput below its own auth
+// budget. One PROCESS-WIDE throttle per reason: a per-Crypto-instance throttle
+// cannot bound the aggregate (every session constructs its own Crypto), and a
+// flood of one reason must not suppress another reason's first line. The first
+// line of a burst always prints, so grep-based diagnostics keep working.
+LogThrottle& salt_mismatch_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+LogThrottle& direction_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+LogThrottle& nonce_space_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+LogThrottle& replay_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+// Emit make_message() at most once per interval. The message is built lazily so
+// a suppressed occurrence pays neither the format nor the write -- the throttle
+// check comes first, mirroring the level check the LOG_* macros hoist.
+template <typename MakeMessage>
+void log_reject_throttled(LogThrottle& throttle, MakeMessage make_message) {
+    uint32_t suppressed = 0;
+    if (!throttle.should_log(suppressed)) return;
+    std::string message = make_message();
+    if (suppressed > 0) {
+        message += " (" + std::to_string(suppressed) +
+                   " more suppressed this interval)";
+    }
+    LOG_WARNING("crypto", message);
+}
+
 } // namespace
 
 // Fixed application-level salt prevents cross-application precomputation attacks.
@@ -398,7 +443,10 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         } else if (!matches_salt(ciphertext)) {
             // A session that already has a key must never receive a different
             // salt: that would indicate a cross-session injection attempt.
-            LOG_WARNING("crypto", "decrypt: session salt mismatch (possible injection)");
+            log_reject_throttled(salt_mismatch_log(), [] {
+                return std::string(
+                    "decrypt: session salt mismatch (possible injection)");
+            });
             return std::make_error_code(std::errc::permission_denied);
         }
 
@@ -410,8 +458,10 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         std::memcpy(nonce.data(), body.data(), NONCE_SIZE);
 
         if (nonce[8] != peer_direction_) {
-            LOG_WARNING("crypto", fmt::format("decrypt: wrong direction byte {} (expected {})",
-                        nonce[8], peer_direction_));
+            log_reject_throttled(direction_log(), [&] {
+                return fmt::format("decrypt: wrong direction byte {} (expected {})",
+                                   nonce[8], peer_direction_);
+            });
             return std::make_error_code(std::errc::permission_denied);
         }
 
@@ -435,7 +485,10 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         // a counter thousands ahead of the copy the peer already received. Only
         // a party holding the session key can produce an authenticated jump.
         if (counter >= MAX_COUNTER) {
-            LOG_WARNING("crypto", fmt::format("decrypt: counter {} outside the nonce space", counter));
+            log_reject_throttled(nonce_space_log(), [&] {
+                return fmt::format("decrypt: counter {} outside the nonce space",
+                                   counter);
+            });
             return std::make_error_code(std::errc::permission_denied);
         }
 
@@ -448,8 +501,11 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         // unauthenticated packet can never poison the window.
         const bool first_packet = server_mode_ && !any_received_;
         if (!first_packet && !check_replay_window(counter)) {
-            LOG_WARNING("crypto", fmt::format("decrypt: replay/stale rejected counter={} highest={}",
-                        counter, highest_received_));
+            log_reject_throttled(replay_log(), [&] {
+                return fmt::format(
+                    "decrypt: replay/stale rejected counter={} highest={}",
+                    counter, highest_received_);
+            });
             return make_error_code(crypto_errors::errc::replay);
         }
 

@@ -621,7 +621,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         }
         if (auth_attempts_window_ >= MAX_AUTH_ATTEMPTS_PER_SEC) {
             uint32_t suppressed = 0;
-            if (auth_ratelimit_log_.should_log(suppressed)) {
+            if (auth_global_budget_log_.should_log(suppressed)) {
                 LOG_WARNING("server", "auth attempt rate limit reached, dropping packet from " + sid +
                             (suppressed ? " (" + std::to_string(suppressed) +
                                           " more suppressed this interval)" : ""));

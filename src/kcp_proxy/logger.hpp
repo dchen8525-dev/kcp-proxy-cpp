@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <chrono>
@@ -28,10 +29,13 @@ enum class LogLevel { Debug, Info, Warning, Error };
 //         LOG_WARNING("server", "..." + fmt::format(" ({} suppressed)", suppressed));
 //     }
 //
-// Not thread-safe: callers must serialize it. The server's UDP receive path is
-// serialized by construction -- the socket is built on its own strand, and every
-// receive completion handler is explicitly bound to that strand, so handlers run
-// one at a time no matter how many receives are outstanding.
+// Thread-safe: should_log()/pending() are internally synchronized. The original
+// contract required callers to serialize (the server's UDP strand did), but
+// Crypto::decrypt_impl's rejection paths run on the UDP strand AND every
+// session strand, so a shared instance there would race -- and a per-instance
+// throttle cannot bound the aggregate. The mutex is uncontended on every
+// strand-confined call site and costs orders of magnitude less than the log
+// write it guards.
 class LogThrottle {
 public:
     explicit LogThrottle(std::chrono::milliseconds interval = std::chrono::seconds(1))
@@ -42,6 +46,7 @@ public:
     // first line of a window); on false it is left untouched. The first call
     // always emits, so a one-off rejection is never lost.
     bool should_log(uint32_t& suppressed) {
+        std::lock_guard<std::mutex> lock(mutex_);
         const auto now = std::chrono::steady_clock::now();
         if (now - window_start_ < interval_) {
             ++suppressed_;
@@ -55,9 +60,13 @@ public:
 
     // How many occurrences this throttle has swallowed since the last emission.
     // Lets a caller surface a final tally on a teardown path.
-    uint32_t pending() const { return suppressed_; }
+    uint32_t pending() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return suppressed_;
+    }
 
 private:
+    mutable std::mutex mutex_;
     std::chrono::steady_clock::time_point window_start_{};
     std::chrono::milliseconds interval_;
     uint32_t suppressed_ = 0;

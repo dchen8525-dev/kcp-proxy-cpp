@@ -7,6 +7,7 @@
 #include <asio/error.hpp>
 #include <asio/read.hpp>
 #include <asio/write.hpp>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -356,12 +357,15 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
 
     // Cancel handshake on timeout.
     handshake_deadline->async_wait(
-        [client, session, handshake_cancelled](const std::error_code& ec) {
+        [self, client, session, handshake_cancelled](const std::error_code& ec) {
             if (ec == asio::error::operation_aborted) return;
             if (handshake_cancelled->exchange(true)) return;
             LOG_WARNING("client", "SOCKS5 handshake timeout");
-            std::error_code ignored;
-            client->close(ignored);
+            // Same RST reasoning as abort_handshake: if an error reply is in
+            // flight when the deadline fires, a plain close() would discard
+            // it. self is captured (not this) because the timer can outlive
+            // the call that armed it.
+            self->close_local_socket(client);
             session->close();
         });
 
@@ -1125,6 +1129,57 @@ void KCPProxyClient::log_non_socks5_client(uint8_t first, uint8_t second) {
               " -- expected SOCKS5 version 0x05" + count);
 }
 
+void KCPProxyClient::close_local_socket(
+    const std::shared_ptr<asio::ip::tcp::socket>& sock) {
+    if (!sock || !sock->is_open()) return;
+    std::error_code ec;
+
+    // Cancel first: the handshake deadline can fire while a greeting/request
+    // read is still outstanding, and asio forbids mixing a synchronous read
+    // with an outstanding async one on the same socket. The cancelled
+    // completion is only queued (never inlined), and every handshake handler
+    // bails out on the cancelled flag before touching the socket again, so
+    // there is no re-entrancy and no concurrent socket access below.
+    sock->cancel(ec);
+
+    // Drain unread bytes (bounded): close() with unread data in the receive
+    // queue makes the kernel emit an RST, which DISCARDS the reply bytes
+    // already queued for the peer. Measured on Windows: a malformed 3-byte
+    // greeting ([0x04,0x01,0x00], of which the greeting read consumes only
+    // the first two) lost its 0x05 0xFF reply ~25% of the time -- the app
+    // saw connection_reset instead of the method selection. The loop never
+    // waits for the peer's EOF (that would leak the socket worse than the
+    // RST); it only removes what is already queued, at most 64 * 512 bytes,
+    // so a peer that keeps streaming garbage cannot spin this loop.
+    std::array<uint8_t, 512> scratch{};
+    size_t drained = 0;
+    for (int guard = 0; guard < 64; ++guard) {
+        ec.clear();
+        const size_t avail = sock->available(ec);
+        if (ec || avail == 0) break;
+        ec.clear();
+        const size_t got = sock->read_some(
+            asio::buffer(scratch.data(), std::min(avail, scratch.size())), ec);
+        if (ec || got == 0) break;
+        drained += got;
+    }
+    if (drained > 0) {
+        // Pipelined request bytes left behind by the parse that rejected the
+        // handshake. Worth a line: it is the exact precondition of the RST
+        // this function exists to prevent.
+        LOG_DEBUG("client", "close_local_socket: drained " +
+                  std::to_string(drained) +
+                  " unread byte(s) before FIN (RST would have discarded "
+                  "the reply)");
+    }
+
+    // FIN, not RST: shutdown(send) flushes the reply we already wrote and
+    // then half-closes, so the app reads the reply and only then sees EOF.
+    // close() after the drain no longer has unread data to trip over.
+    sock->shutdown(asio::ip::tcp::socket::shutdown_send, ec);
+    sock->close(ec);
+}
+
 void KCPProxyClient::abort_handshake(
     std::shared_ptr<asio::ip::tcp::socket> client_socket,
     std::shared_ptr<KCPClientSession> session,
@@ -1139,7 +1194,11 @@ void KCPProxyClient::abort_handshake(
     if (handshake_cancelled->exchange(true)) return;
     std::error_code ignored;
     handshake_deadline->cancel(ignored);
-    if (client_socket) client_socket->close(ignored);
+    // NOT a plain close(): most rejection paths have already written the app
+    // a reply (0xFF method selection, 0x04/0x07 request reply), and closing
+    // with the app's pipelined request bytes still unread turns into an RST
+    // that discards that reply. See close_local_socket.
+    if (client_socket) close_local_socket(client_socket);
     if (session) session->close();
 }
 

@@ -1747,6 +1747,128 @@ void test_client_abort_handshake_closes_local_socket() {
     app.close(ec);
 }
 
+// The RST-discard race in abort_handshake(), made observable end to end.
+//
+// A local app that opens with a malformed greeting AND pipelines one extra
+// byte ([0x04, 0x01, 0x00] -- the greeting read consumes only the first two)
+// used to lose the 0x05 0xFF method-selection reply ~25% of the time on
+// Windows: abort_handshake() called close() with the third byte still sitting
+// in the receive queue, the kernel answered a close-with-unread-data with an
+// RST, and the RST DISCARDED the reply bytes already queued for the app. The
+// app saw connection_reset where RFC 1928 promised a reply -- and the same
+// shape (reply + pipelined bytes) covers every rejection path: 0xFF for a
+// bad greeting, 0x07 for BIND/UDP-ASSOCIATE, 0x04 for an SSRF-blocked target.
+//
+// The race is an arrival-order contest, so it is not assertable in a single
+// shot; the exchange therefore repeats. close_local_socket() drains the
+// queue and half-closes (FIN) before closing, so every iteration must deliver
+// exactly the two reply bytes followed by a clean EOF.
+//
+// A live in-process KCP server is required because the greeting is only read
+// after the KCP handshake succeeds (see handle_client_connection): against a
+// dead server port the greeting is never consumed and nothing is replied.
+void test_client_malformed_greeting_keeps_its_reply() {
+    asio::io_context io;
+    const std::string key = "remote_test_key_123456";
+    const uint16_t server_port = free_udp_port();
+    const uint16_t listen_port = free_tcp_port();
+
+    auto server = std::make_shared<KCPServer>(io, server_port, key, "127.0.0.1");
+    server->start();
+    auto client = std::make_shared<KCPProxyClient>(
+        io, "127.0.0.1", server_port, key, "127.0.0.1", listen_port);
+    client->start();
+
+    std::thread runner([&io]() { io.run(); });
+    ClientIoGuard guard{io, runner};
+
+    const auto listen_ep =
+        asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), listen_port);
+
+    // The listener comes up asynchronously (resolve -> bind -> listen).
+    asio::io_context probe_io;
+    bool up = false;
+    for (int i = 0; i < 100 && !up; ++i) {
+        asio::ip::tcp::socket probe(probe_io);
+        std::error_code ec;
+        probe.connect(listen_ep, ec);
+        up = !ec;
+        if (up) {
+            probe.close(ec);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    expect_true(up, "client SOCKS5 listener never came up");
+
+    // 20 iterations: without the fix the per-iteration loss probability was
+    // ~25%, so a broken close is caught with probability 1 - 0.75^20 > 99.6%.
+    // The per-connection INFO chatter (new connection / greeting / KCP
+    // session lines) would otherwise bury the report, so it is folded away
+    // for the loop only -- a failing iteration still logs at ERROR.
+    int lost_replies = 0;
+    int resets = 0;
+    const int iterations = 20;
+    const auto prev_level = current_log_level();
+    set_log_level(LogLevel::Error);
+    for (int i = 0; i < iterations; ++i) {
+        asio::io_context app_io;
+        asio::ip::tcp::socket app(app_io);
+        std::error_code ec;
+        app.connect(listen_ep, ec);
+        expect_true(!ec, "local app could not connect to the client listener");
+
+        // Malformed greeting (version 0x04) with one pipelined extra byte.
+        const std::array<uint8_t, 3> greeting{0x04, 0x01, 0x00};
+        asio::write(app, asio::buffer(greeting), ec);
+
+        // The reply must arrive intact: exactly [0x05, 0xFF].
+        std::array<uint8_t, 2> reply{};
+        asio::read(app, asio::buffer(reply), ec);
+        if (ec || reply[0] != SOCKS5_VERSION ||
+            reply[1] != SOCKS5_AUTH_NO_ACCEPTABLE) {
+            if (ec == asio::error::connection_reset) ++resets;
+            ++lost_replies;
+            LOG_ERROR("test", "iteration " + std::to_string(i) +
+                      ": reply lost (ec=" +
+                      (ec ? ec.message() : std::string("none")) + ")");
+            app.close(ec);
+            continue;
+        }
+
+        // ...then a clean FIN, never an RST, and never an echo of the byte
+        // the greeting parse left behind.
+        std::array<uint8_t, 1> extra{};
+        const size_t n = app.read_some(asio::buffer(extra), ec);
+        if (ec != asio::error::eof) {
+            if (ec == asio::error::connection_reset) ++resets;
+            ++lost_replies;
+            LOG_ERROR("test", "iteration " + std::to_string(i) +
+                      ": expected FIN after the reply, got ec=" +
+                      (ec ? ec.message()
+                          : std::string("none, n=" + std::to_string(n))));
+        }
+        app.close(ec);
+    }
+    set_log_level(prev_level);
+
+    expect_true(lost_replies == 0,
+                "a malformed greeting must always be answered before the close "
+                "(an RST discards the reply -- see close_local_socket)");
+    expect_true(resets == 0, "the rejection close must be a FIN, not an RST");
+
+    // The client must still be serving afterwards, and the rejected sessions
+    // must have been released rather than held against the session cap.
+    asio::io_context app_io;
+    asio::ip::tcp::socket app2(app_io);
+    std::error_code ec;
+    app2.connect(listen_ep, ec);
+    expect_true(!ec, "client stopped accepting connections after rejections");
+    app2.close(ec);
+
+    server->stop();
+}
+
 // --allow-target is the only SSRF-guard bypass, so its parser is pinned
 // boundary by boundary. The wrapping regressions are the point of the two
 // "must NOT match" cases: loose std::stoi parsing used to turn "host:99999"
@@ -1785,6 +1907,42 @@ void test_log_throttle() {
     expect_true(throttle.should_log(suppressed), "post-window call must emit");
     expect_true(suppressed == 3, "emission must report the suppressed count");
     expect_true(throttle.pending() == 0, "the tally resets after an emission");
+}
+
+void test_log_throttle_concurrent_calls_balance() {
+    // LogThrottle is now internally synchronized because Crypto::decrypt_impl's
+    // rejection paths share process-wide instances across the server's UDP
+    // strand AND every session strand (see crypto.cpp). The invariant that
+    // makes the mutex observable: every call either emits or is folded into a
+    // later emission's tally, so across T threads the books must still balance
+    // exactly. A lost ++suppressed_ -- the symptom of the data race the mutex
+    // exists to stop -- leaves folded occurrences unaccounted for. The balance
+    // is timing-independent, so this cannot flake.
+    LogThrottle throttle(std::chrono::milliseconds(20));
+    constexpr int kThreads = 8;
+    constexpr int kCallsPerThread = 400;
+
+    std::atomic<int> emissions{0};
+    std::atomic<uint32_t> reported{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&throttle, &emissions, &reported, kCallsPerThread] {
+            for (int i = 0; i < kCallsPerThread; ++i) {
+                uint32_t suppressed = 0;
+                if (throttle.should_log(suppressed)) {
+                    emissions.fetch_add(1, std::memory_order_relaxed);
+                    reported.fetch_add(suppressed, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    const uint32_t total = static_cast<uint32_t>(kThreads * kCallsPerThread);
+    const uint32_t folded_away = total - static_cast<uint32_t>(emissions.load());
+    expect_true(reported.load() + throttle.pending() == folded_away,
+                "concurrent LogThrottle calls lost occurrences "
+                "(suppressed tally does not balance: unsynchronized?)");
 }
 
 void test_allowlist_matching() {
@@ -1892,6 +2050,7 @@ int main() {
         test_socks5_reply_parser();
         test_restricted_targets();
         test_log_throttle();
+        test_log_throttle_concurrent_calls_balance();
         test_allowlist_matching();
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
@@ -1914,6 +2073,7 @@ int main() {
         test_client_session_close_releases_parked_handler();
         test_client_session_keepalive_released_with_session();
         test_client_abort_handshake_closes_local_socket();
+        test_client_malformed_greeting_keeps_its_reply();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;

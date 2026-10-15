@@ -148,6 +148,16 @@ private:
                          std::shared_ptr<asio::steady_timer> handshake_deadline,
                          std::shared_ptr<std::atomic<bool>> handshake_cancelled);
 
+    // Close a local app socket without destroying the bytes we already sent
+    // it. See close_local_socket in client.cpp: a plain close() on a socket
+    // with unread data in its receive queue makes the kernel emit an RST,
+    // which discards the reply still queued for the app — so a malformed
+    // greeting produced "connection reset" instead of the 0xFF method
+    // selection, and a pipelined request lost its failure reply. Used on
+    // every path that answered (or deliberately did not answer) an app and
+    // is now tearing the connection down.
+    void close_local_socket(const std::shared_ptr<asio::ip::tcp::socket>& sock);
+
     void start_traffic_reporter();
     void report_traffic();
 
