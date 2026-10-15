@@ -87,6 +87,14 @@ constexpr int CONNECT_TIMEOUT_SEC = 15;
 constexpr int KCP_HANDSHAKE_TIMEOUT_SEC = 3;
 // Client-side SOCKS5 handshake timeout (greeting + request).
 constexpr int SOCKS5_HANDSHAKE_TIMEOUT_SEC = 30;
+// Server-side bound on how long a session may live without completing its
+// SOCKS5 handshake, reaped by the 30s cleanup sweep (see do_cleanup and
+// KcpTunnel::handshake_stalled). The idle sweep alone cannot do this: every
+// authenticated packet refreshes the activity clock, so a key-holding peer that
+// dribbles an unfinished CONNECT pins a session slot indefinitely.
+// 2x CONNECT_TIMEOUT_SEC because the handshake is legitimately still pending
+// while the upstream DNS + TCP connect runs.
+constexpr int SERVER_SOCKS5_HANDSHAKE_TIMEOUT_SEC = 2 * CONNECT_TIMEOUT_SEC;
 
 // Anti-replay beyond a session's lifetime. The server's Crypto bypasses the
 // replay window for a brand-new session's first packet (it seeds the window),
@@ -101,11 +109,15 @@ constexpr int SOCKS5_HANDSHAKE_TIMEOUT_SEC = 30;
 // a server restart resets it (a restart within the same key window reopens
 // the window; the date-derived key change closes it at the next rotation).
 constexpr int SALT_TOMBSTONE_TTL_SEC = 600;
-// Bound on the tombstone table. Only genuinely authenticated sessions insert
-// (one entry per session), so the table grows with real churn, not attacker
-// traffic; this is generous headroom over any plausible session rate. At the
-// cap, session creation is refused (fail-closed) rather than evicting early
-// and re-opening the replay window the table exists to close.
+// Bound on the tombstone table. One entry per accepted session, so the table
+// grows with the new-session RATE multiplied by the TTL (a session that dies
+// immediately still keeps its tombstone for the whole TTL): at 4x
+// MAX_CONCURRENT_SESSIONS this fills after roughly 27 new sessions/s sustained
+// for 10 minutes, which ordinary browser churn can reach. At the cap the
+// OLDEST tombstone is evicted, because refusing the new session instead (the
+// previous behavior) turned one client's churn -- or an authenticated peer's --
+// into a server-wide lockout of every new session for the rest of the TTL.
+// Eviction only reopens replay for a salt that was about to expire anyway.
 constexpr size_t MAX_SALT_TOMBSTONES = 4 * MAX_CONCURRENT_SESSIONS;
 
 // Buffer sizes

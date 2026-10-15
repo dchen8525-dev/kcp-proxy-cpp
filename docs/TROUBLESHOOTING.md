@@ -110,7 +110,10 @@ This is the complete list of stages the binaries emit (grep `FAIL_STAGE=` in `sr
 - `TCP_CONNECT_FAILED`: all outbound TCP connect attempts failed, or the connect timeout fired.
 - `TCP_READ_FAILED` / `TCP_WRITE_FAILED`: remote TCP stream failed during forwarding.
 - `UDP_SEND_FAILED`: UDP send failed.
-- `SESSION_TIMEOUT`: session idle/KCP timeout cleanup.
+- `SESSION_TIMEOUT`: session cleanup by the 30s sweep, either `ERROR=idle_timeout`
+  (no authenticated traffic for `KCP_TIMEOUT_SEC`) or `ERROR=handshake_timeout`
+  (the session never completed its SOCKS5 handshake within
+  `SERVER_SOCKS5_HANDSHAKE_TIMEOUT_SEC`).
 
 A failure to reach `CPP_REMOTE_REACHABLE` on the Android side (server stopped, wrong key, UDP blocked)
 does not surface as a stage on the server at all — there is no session to log one from, because the

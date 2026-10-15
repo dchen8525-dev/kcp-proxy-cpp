@@ -16,6 +16,7 @@ KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
       strand_(asio::make_strand(io.get_executor())),
       crypto_(std::move(crypto)),
       kcp_(conv),
+      created_us_(now_us()),
       log_module_(std::move(log_module)),
       log_tag_(std::move(log_tag)) {
     const int64_t now = now_us();
@@ -40,6 +41,11 @@ void KcpTunnel::touch_activity() {
 
 int64_t KcpTunnel::activity_age_us() const {
     return now_us() - last_activity_us_.load();
+}
+
+bool KcpTunnel::handshake_stalled(int64_t timeout_sec) const {
+    if (handshake_done_.load(std::memory_order_relaxed)) return false;
+    return (now_us() - created_us_) >= timeout_sec * 1000000;
 }
 
 void KcpTunnel::mark_handshake_done() {

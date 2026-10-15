@@ -422,6 +422,23 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
 
         LOG_DEBUG("crypto", fmt::format("decrypt: counter={} ciphertext={} bytes", counter, ciphertext.size()));
 
+        // Mirror the sender's invariant (see encrypt_impl): a counter at or
+        // above MAX_COUNTER can never be produced by either peer, so accepting
+        // one would only ever be a forge attempt -- and the nonce space must
+        // stay 48 bits for the counter/nonce-collision argument this design
+        // rests on. Rejected as a hard error rather than `replay`, because
+        // "replay" is counted and reported as normal loss.
+        //
+        // RESIDUAL (accepted): a counter far below MAX_COUNTER but hugely ahead
+        // of anything seen still slides the window past the honest peer, and no
+        // tighter bound is safe here -- a KCP retransmission legitimately carries
+        // a counter thousands ahead of the copy the peer already received. Only
+        // a party holding the session key can produce an authenticated jump.
+        if (counter >= MAX_COUNTER) {
+            LOG_WARNING("crypto", fmt::format("decrypt: counter {} outside the nonce space", counter));
+            return std::make_error_code(std::errc::permission_denied);
+        }
+
         // Server mode: bypass the replay window for the very first packet of a
         // new session (it also seeded the key above). After that, enforce normal
         // replay protection. Client mode always enforces the replay window (its

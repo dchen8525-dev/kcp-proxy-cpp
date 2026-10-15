@@ -621,7 +621,13 @@ void KCPProxyClient::read_socks5_reply(
     std::shared_ptr<HalfCloseGuard> half_close) {
 
     auto self = shared_from_this();
-    auto chunk = std::make_shared<std::array<uint8_t, SOCKS5_REPLY_BUF_SIZE>>();
+    // Sized to FWD_BUF_SIZE, not SOCKS5_REPLY_BUF_SIZE: async_read_some delivers
+    // one whole KCP message and fails the read when it does not fit the caller's
+    // buffer (see KcpTunnel::try_fulfill_read), so a 512-byte chunk would kill
+    // any tunnel whose server coalesces the SOCKS5 reply with the first block of
+    // target payload into one message. The accumulator below is still bounded by
+    // FWD_BUF_SIZE, so this does not raise the memory ceiling.
+    auto chunk = std::make_shared<std::array<uint8_t, FWD_BUF_SIZE>>();
     session->async_read_some(asio::buffer(*chunk),
         [this, client_socket, session, accum, chunk, handshake_start, handshake_deadline,
          handshake_cancelled, half_close, self]

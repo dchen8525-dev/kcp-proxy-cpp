@@ -88,6 +88,14 @@ public:
     // keepalive: a tunnel that has not finished connecting must not send one.
     bool is_handshake_done() const { return handshake_done_.load(); }
     virtual void mark_handshake_done();
+    // True when `timeout_sec` has elapsed since this tunnel was created and the
+    // SOCKS5 handshake still has not completed. Needed in addition to the
+    // idle check: touch_activity() refreshes on EVERY authenticated packet
+    // (keepalives and half-parsed SOCKS5 fragments included), so a peer that
+    // holds the key and dribbles a few bytes per minute keeps the idle sweep
+    // away forever and pins its session slot plus buffers. This clock is set
+    // once at creation and never refreshed, so no inbound traffic can reset it.
+    bool handshake_stalled(int64_t timeout_sec) const;
 
     // ------------------------- half-close (FIN) -----------------------------
     // Whether the peer negotiated FIN support (KCP_PROXY_HELLO_V2 / _ACK_V2).
@@ -172,6 +180,11 @@ protected:
     asio::strand<asio::io_context::executor_type> strand_;
     std::shared_ptr<Crypto> crypto_;
     KcpWrapper kcp_;
+    // Creation time in steady_clock micros. Written once by the constructor and
+    // only read afterwards, so it needs no atomic; it is deliberately separate
+    // from last_activity_us_, which every authenticated packet refreshes (see
+    // handshake_stalled()).
+    const int64_t created_us_;
 
     asio::mutable_buffer pending_read_buffer_{nullptr, 0};
     std::function<void(std::error_code, size_t)> pending_read_handler_;

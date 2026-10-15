@@ -183,6 +183,62 @@ void test_crypto_roundtrip_and_failures() {
     }
 }
 
+// A 44-byte datagram is the smallest legal wire packet: salt + nonce + tag with
+// ZERO ciphertext bytes. GCM has no separate "final block" to write, so this is
+// exactly the path where a zero-length output buffer reaches OpenSSL. If the
+// tag check is skipped there, an unauthenticated packet is accepted -- and in
+// server mode the first-packet bypass means it also gets committed to the replay
+// window and allocated a session.
+void test_crypto_empty_payload_is_authenticated() {
+    const std::string key = "remote_test_key_123456";
+    auto salt = Crypto::generate_session_salt();
+    Crypto sender(key, NONCE_DIR_CLIENT, salt);
+    auto wire = sender.encrypt(byte_view{});
+    expect_true(wire.size() == SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE,
+                "empty plaintext must encrypt to salt+nonce+tag only");
+
+    Crypto honest(key, NONCE_DIR_SERVER, {}, true);
+    expect_true(honest.decrypt(byte_view(wire)).empty(),
+                "honest empty packet decrypts to zero bytes");
+
+    std::vector<uint8_t> forged = wire;
+    for (size_t i = wire.size() - TAG_SIZE; i < forged.size(); ++i) forged[i] ^= 0xA5;
+    Crypto victim(key, NONCE_DIR_SERVER, {}, true);
+    expect_throw([&] { (void)victim.decrypt(byte_view(forged)); },
+                 "forged empty-payload packet must fail authentication");
+
+    // A zero-length ciphertext still carries the counter in the nonce, so the
+    // replay window must behave exactly as it does for a non-empty packet:
+    // replaying the honest one is rejected.
+    Crypto window(key, NONCE_DIR_SERVER, {}, true);
+    (void)window.decrypt(byte_view(wire));
+    expect_throw([&] { (void)window.decrypt(byte_view(wire)); },
+                 "replayed empty packet must be rejected");
+}
+
+// The server allocates a session from the first datagram, keyed by the salt it
+// carries. That allocation must never happen for a packet whose tag did not
+// verify -- otherwise one spoofed 44-byte datagram per (ip,port) is enough to
+// burn a session slot.
+void test_server_empty_packet_without_tag_does_not_create_session() {
+    const std::string key = "remote_test_key_123456";
+    asio::io_context io;
+    auto server = std::make_shared<KCPServer>(io, 8389, key, "127.0.0.1");
+    const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.3"), 40009);
+
+    auto salt = Crypto::generate_session_salt();
+    Crypto attacker(key, NONCE_DIR_CLIENT, salt, false);
+    auto honest = attacker.encrypt(byte_view{});
+
+    std::vector<uint8_t> forged = honest;
+    for (size_t i = honest.size() - TAG_SIZE; i < forged.size(); ++i) forged[i] ^= 0xA5;
+
+    expect_true(server->route_datagram(ep, byte_view(forged)) == nullptr,
+                "forged empty-payload datagram must not create a session");
+    expect_true(server->route_datagram(ep, byte_view(honest)) != nullptr,
+                "honest empty-payload datagram should create a session");
+}
+
 std::vector<uint8_t> build_request(std::string_view host, uint16_t port) {
     std::vector<uint8_t> req{SOCKS5_VERSION, SOCKS5_CMD_CONNECT, 0x00};
     auto addr = encode_address(host, port);
@@ -919,6 +975,113 @@ void test_server_rejects_replayed_salt_after_session_death() {
     auto fresh = reconnected.encrypt(req_view);
     expect_true(server->route_datagram(ep, byte_view(fresh.data(), fresh.size())) != nullptr,
                 "a fresh-salt session must still be accepted after a tombstone");
+}
+
+// The tombstone table is bounded, and hitting the cap must not become a
+// server-wide refusal. With the original fail-closed semantics, any
+// authenticated peer -- or simply ordinary churn above MAX_SALT_TOMBSTONES /
+// SALT_TOMBSTONE_TTL_SEC new sessions per second -- could lock every new client
+// out for the remainder of the TTL, to protect a salt that was about to expire
+// anyway. remember_salt_locked() now evicts the OLDEST entry instead.
+void test_server_tombstone_cap_evicts_instead_of_locking_out() {
+    asio::io_context io;
+    const std::string key = "tombstone_cap_test_key_1";
+    auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+
+    server->fill_salt_tombstones_for_test(MAX_SALT_TOMBSTONES);
+    expect_true(server->salt_tombstone_count_for_test() == MAX_SALT_TOMBSTONES,
+                "the table must be exactly at its cap");
+
+    const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41088);
+    const std::vector<uint8_t> connect_req = {0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80};
+    const byte_view req_view(connect_req.data(), connect_req.size());
+
+    Crypto client(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto first = client.encrypt(req_view);
+    auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
+    expect_true(session != nullptr, "a new salt must be accepted when the table is full");
+    expect_true(server->salt_tombstone_count_for_test() == MAX_SALT_TOMBSTONES,
+                "accepting it must evict an old tombstone, not grow past the cap");
+
+    // The session created on the eviction path is genuinely usable, not a
+    // half-initialised one.
+    auto second = client.encrypt(req_view);
+    expect_true(server->route_datagram(ep, byte_view(second.data(), second.size())) == session,
+                "the accepted session must keep serving its own salt");
+}
+
+// The session's send callback used to capture a STRONG shared_ptr to the server
+// while sessions_ holds the session: a two-node cycle, so the server stayed
+// alive (and ~KCPServer never ran) for as long as any session was in its own
+// map -- i.e. an embedder that drops its last reference leaks the whole server
+// plus every session, every EVP context and every ikcpcb in it. Every other
+// session-held callback (drained_cb_) is a weak_ptr for exactly this reason.
+//
+// This also pins down the counterpart requirement: route_datagram's strand
+// handlers touch the server through raw `this`, so they must hold a strong
+// reference themselves, or breaking the cycle would turn a leak into a
+// use-after-free of the server object.
+void test_server_is_released_when_its_owner_drops_it() {
+    asio::io_context io;
+    const std::string key = "release_cycle_test_key_123";
+    std::weak_ptr<KCPServer> weak_server;
+    {
+        auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+        weak_server = server;
+
+        const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41055);
+        const std::vector<uint8_t> connect_req = {0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80};
+        Crypto client(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+        auto first = client.encrypt(byte_view(connect_req.data(), connect_req.size()));
+
+        auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
+        expect_true(session != nullptr, "the first packet must create a session");
+
+        // Nothing but the server's own map (and the handler queued above) keeps
+        // them alive from here on.
+        session.reset();
+        server.reset();
+        io.poll();
+    }
+    expect_true(weak_server.expired(),
+                "dropping the last external reference must destroy the server");
+}
+
+// The idle sweep alone cannot reclaim a session whose peer never finishes the
+// SOCKS5 handshake: touch_activity() fires on every authenticated packet, so a
+// peer holding the key that dribbles an unfinished CONNECT keeps is_alive()
+// true forever and pins one of the MAX_CONCURRENT_SESSIONS slots (plus its
+// FWD_BUF_SIZE buffers) indefinitely. do_cleanup now also reaps on
+// handshake_stalled(), which is measured from creation and never refreshed.
+void test_server_session_handshake_stall_is_bounded() {
+    asio::io_context io;
+    const std::string key = "handshake_stall_test_key_1";
+    auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+
+    const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41077);
+    // Truncated CONNECT (VER/CMD/RSV only): parse_socks5_request returns
+    // NeedMore, so the session stays in the pending-handshake state.
+    const std::vector<uint8_t> partial = {0x05, 0x01, 0x00};
+    Crypto client(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
+    auto first = client.encrypt(byte_view(partial.data(), partial.size()));
+
+    auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
+    expect_true(session != nullptr, "the first packet must create a session");
+    expect_true(!session->is_handshake_done(), "a truncated request cannot complete the handshake");
+    // The blind spot itself: a stalled session still looks alive to the old
+    // sweep condition, so nothing but the new bound reclaims it.
+    expect_true(session->is_alive(), "a handshake-stalled session must still report alive");
+
+    expect_true(!session->handshake_stalled(SERVER_SOCKS5_HANDSHAKE_TIMEOUT_SEC),
+                "a just-created session must not be reaped");
+    // Zero grace: the clock runs from creation, so steady dribbling cannot
+    // postpone the reap the way it postpones the idle sweep.
+    expect_true(session->handshake_stalled(0), "an overdue handshake must be detected");
+
+    // Completion clears it, so a healthy tunnel can never be reaped this way.
+    session->mark_handshake_done();
+    expect_true(!session->handshake_stalled(0),
+                "a completed handshake must never count as stalled");
 }
 
 void test_session_oversized_kcp_message_fails_read() {
@@ -1722,6 +1885,8 @@ void test_allowlist_matching() {
 int main() {
     try {
         test_crypto_roundtrip_and_failures();
+        test_crypto_empty_payload_is_authenticated();
+        test_server_empty_packet_without_tag_does_not_create_session();
         test_socks5_parser();
         test_socks5_reply_bind_address();
         test_socks5_reply_parser();
@@ -1736,6 +1901,9 @@ int main() {
         test_server_session_routing_and_auth();
         test_server_unauth_packet_cannot_evict_live_session();
         test_server_rejects_replayed_salt_after_session_death();
+        test_server_tombstone_cap_evicts_instead_of_locking_out();
+        test_server_is_released_when_its_owner_drops_it();
+        test_server_session_handshake_stall_is_bounded();
         test_session_oversized_kcp_message_fails_read();
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();

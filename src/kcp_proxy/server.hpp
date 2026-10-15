@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -48,6 +49,14 @@ public:
         auth_clock_ = std::move(clock);
     }
 
+    // Test-only: pre-fill the salt tombstone table the way `n` accepted-then-
+    // dead sessions would, so the eviction path is reachable without creating
+    // 16k real sessions. Fills through the same remember_salt_locked() the
+    // routing path uses, cap and all.
+    void fill_salt_tombstones_for_test(size_t n);
+    // Test-only: current tombstone count, to assert the cap holds.
+    size_t salt_tombstone_count_for_test();
+
     // Route one received datagram: authenticate it (creating a session for an
     // unknown endpoint on success) and hand the bytes to KCP. Returns the
     // session that accepted the packet, or nullptr when it was rejected (auth
@@ -69,8 +78,9 @@ private:
     std::string key_;
 
     // Wipe the plaintext key from memory. Called after the key has been
-    // fully consumed (sessions are created lazily, so this is invoked by
-    // stop() rather than the constructor).
+    // fully consumed (sessions are created lazily, so this is invoked on the
+    // way down rather than in the constructor) and only from an executor that
+    // serializes with the sole reader, get_or_create_session().
     void wipe_key();
 
     asio::ip::udp::socket udp_socket_;
@@ -158,6 +168,16 @@ private:
     // session's salt must stay rejected.
     std::unordered_map<std::string, std::chrono::steady_clock::time_point>
         salt_tombstones_;
+    // Insertion order of salt_tombstones_, so the table can be bounded by
+    // evicting its OLDEST entry. One entry per accepted session, and a session
+    // that dies right away (an invalid SOCKS5 request closes it immediately)
+    // still leaves its tombstone for the whole TTL, so the table grows with the
+    // new-session RATE times the TTL, not with the number of live sessions:
+    // sustained ordinary churn reaches MAX_SALT_TOMBSTONES on its own. Rejecting
+    // new sessions at that point (the previous behavior) took the whole server
+    // down for the remaining TTL; evicting the oldest tombstone only reopens
+    // replay for a salt that was about to expire anyway.
+    std::deque<std::string> salt_tombstone_order_;
 
     // Throttles for the per-datagram rejection diagnostics. The auth counters
     // above cap the *work* a flood can force, but these lines each fire once per
@@ -223,6 +243,14 @@ private:
     // reads/writes, so a mid-connect old session can never re-insert
     // connections_[sid] after the new session took over the endpoint.
     void drop_replaced_target_locked(const std::string& sid);
+    // Both require the sessions_mutex_ write lock (same "_locked" convention).
+    // Drop tombstones whose TTL has passed, oldest first; keeps
+    // salt_tombstones_ and salt_tombstone_order_ in step.
+    void prune_salt_tombstones_locked();
+    // Record a salt as seen until `expiry`, evicting the oldest tombstones to
+    // stay under MAX_SALT_TOMBSTONES.
+    void remember_salt_locked(std::string salt_key,
+                              std::chrono::steady_clock::time_point expiry);
     void handle_kcp_data(std::shared_ptr<KCPSession> session,
                          const asio::ip::udp::endpoint& sender);
     void handle_socks5_request(std::shared_ptr<KCPSession> session);

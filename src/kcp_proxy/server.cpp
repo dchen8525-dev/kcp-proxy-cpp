@@ -58,6 +58,11 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
 
 KCPServer::~KCPServer() {
     stop();
+    // stop() defers the wipe to the receive strand (see there); if the
+    // io_context was already stopped that handler never ran. Nothing can be
+    // reading key_ here -- every reader holds a strong reference to the
+    // server, and this only runs once the last one is gone.
+    wipe_key();
 }
 
 void KCPServer::set_allowed_targets(std::vector<std::string> targets) {
@@ -216,6 +221,15 @@ void KCPServer::stop() {
         std::error_code ignored;
         udp_socket_.close(ignored);
         receive_backoff_timer_.cancel(ignored);
+        // The key is wiped HERE, not by the caller: get_or_create_session reads
+        // key_ while building a new session's Crypto, and every reader of it is
+        // bound to this strand. wipe_key() frees the buffer, so calling it from
+        // the signal-handler thread (stop()'s caller, an unrelated io thread
+        // when -T > 1) races with an in-flight auth decrypt. If io.stop()
+        // follows stop() immediately, as in main(), this handler never runs and
+        // ~KCPServer does the wipe instead -- equally safe, since no handler
+        // holding a strong reference can be live at that point.
+        wipe_key();
     });
 
     std::unordered_map<std::string, std::shared_ptr<KCPSession>> drained_sessions;
@@ -240,8 +254,6 @@ void KCPServer::stop() {
     }
 
     LOG_INFO("server", "stopped");
-
-    wipe_key();
 }
 
 void KCPServer::do_receive() {
@@ -398,16 +410,82 @@ std::shared_ptr<KCPSession> KCPServer::route_datagram_impl(
         // run the session-driven logic (handle_kcp_data) in the SAME dispatch
         // so its KCP-state reads (peek_size/wait_send) are serialized with
         // the strand handlers that mutate KCP.
-        session->receive_data(data, [this, session, endpoint]() {
+        //
+        // `self` is not optional: these closures reach the server through a raw
+        // `this`, and the session no longer pins it (its send callback is a
+        // weak_ptr), so a queued handler must keep the server alive itself.
+        auto self = shared_from_this();
+        session->receive_data(data, [this, self, session, endpoint]() {
             handle_kcp_data(session, endpoint);
         });
     } else {
         LOG_DEBUG("server", session->session_id() + ": first packet already consumed (injected)");
-        asio::dispatch(session->strand(), [this, session, endpoint]() {
+        auto self = shared_from_this();
+        asio::dispatch(session->strand(), [this, self, session, endpoint]() {
             handle_kcp_data(session, endpoint);
         });
     }
     return session;
+}
+
+void KCPServer::prune_salt_tombstones_locked() {
+    // Every entry gets the same TTL, so insertion order IS expiry order: the
+    // front of the queue is always the next one to drop, which makes the sweep
+    // O(entries actually removed) instead of O(table size).
+    const auto now = std::chrono::steady_clock::now();
+    while (!salt_tombstone_order_.empty()) {
+        auto it = salt_tombstones_.find(salt_tombstone_order_.front());
+        if (it == salt_tombstones_.end()) {
+            // Only reachable if an eviction dropped the map entry first; keep
+            // the two containers in step rather than trusting that.
+            salt_tombstone_order_.pop_front();
+            continue;
+        }
+        if (it->second > now) break;
+        salt_tombstones_.erase(it);
+        salt_tombstone_order_.pop_front();
+    }
+}
+
+void KCPServer::remember_salt_locked(
+    std::string salt_key, std::chrono::steady_clock::time_point expiry) {
+    prune_salt_tombstones_locked();
+    // Bound the table by discarding the OLDEST tombstones. The alternative
+    // (refusing the new session at the cap) let any authenticated peer -- or
+    // ordinary churn above MAX_SALT_TOMBSTONES / SALT_TOMBSTONE_TTL_SEC
+    // new sessions per second -- lock out every new session on the server for
+    // the rest of the TTL, to protect a salt that was about to expire anyway.
+    while (salt_tombstones_.size() >= MAX_SALT_TOMBSTONES) {
+        if (salt_tombstone_order_.empty()) break;
+        auto oldest = salt_tombstones_.find(salt_tombstone_order_.front());
+        if (oldest != salt_tombstones_.end()) salt_tombstones_.erase(oldest);
+        salt_tombstone_order_.pop_front();
+    }
+    salt_tombstone_order_.push_back(salt_key);
+    // insert_or_assign, not emplace: the caller reaches here for a salt whose
+    // tombstone is present-but-expired, and emplace would leave the stale
+    // expiry in place.
+    salt_tombstones_.insert_or_assign(std::move(salt_key), expiry);
+}
+
+void KCPServer::fill_salt_tombstones_for_test(size_t n) {
+    std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
+    const auto expiry = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC);
+    for (size_t i = 0; i < n; ++i) {
+        // Distinct 16-byte keys, the same width as a real session salt.
+        std::string key(SESSION_SALT_SIZE, '\0');
+        key[0] = static_cast<char>(i & 0xFF);
+        key[1] = static_cast<char>((i >> 8) & 0xFF);
+        key[2] = static_cast<char>((i >> 16) & 0xFF);
+        key[3] = static_cast<char>((i >> 24) & 0xFF);
+        remember_salt_locked(std::move(key), expiry);
+    }
+}
+
+size_t KCPServer::salt_tombstone_count_for_test() {
+    std::shared_lock<std::shared_mutex> lock(sessions_mutex_);
+    return salt_tombstones_.size();
 }
 
 void KCPServer::drop_replaced_target_locked(const std::string& sid) {
@@ -600,7 +678,6 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         SessionCap,
         DuplicateSalt,
         ReplayedSalt,
-        TombstoneFull,
     };
     RejectReason rejection = RejectReason::None;
     std::string duplicate_salt_with;
@@ -645,8 +722,15 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             // unaffected.)
             for (const auto& [other_sid, other] : sessions_) {
                 if (other_sid == sid) continue;
-                if (other && other->is_alive() && other->is_running() &&
-                    other->salt_matches(encrypted_packet)) {
+                // Compare the salt FIRST. It is a 16-byte CRYPTO_memcmp, while
+                // is_alive() reads the steady clock -- the previous order paid a
+                // clock read for every one of up to MAX_CONCURRENT_SESSIONS
+                // entries for every new session, which is work any authenticated
+                // peer can request at will. Semantics are unchanged: a salt match
+                // on a session the sweep has not reaped yet is still not a
+                // duplicate.
+                if (!other || !other->salt_matches(encrypted_packet)) continue;
+                if (other->is_alive() && other->is_running()) {
                     duplicate_salt_with = other_sid;
                     rejection = RejectReason::DuplicateSalt;
                     break;
@@ -671,15 +755,13 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 const auto tomb = salt_tombstones_.find(salt_key);
                 if (tomb != salt_tombstones_.end() && tomb->second > now) {
                     rejection = RejectReason::ReplayedSalt;
-                } else if (salt_tombstones_.size() >= MAX_SALT_TOMBSTONES) {
-                    // Fail closed: evicting early would re-open the replay window.
-                    // Only authenticated sessions insert, so reaching the cap means
-                    // implausible churn -- log it loudly.
-                    rejection = RejectReason::TombstoneFull;
                 } else {
-                    salt_tombstones_.emplace(std::move(salt_key),
-                                             now + std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC));
                     session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid);
+                    // Record the tombstone only after the session exists: an
+                    // insert that then lost make_shared() to an exception would
+                    // blacklist a salt that was never accepted for the whole TTL.
+                    remember_salt_locked(std::move(salt_key),
+                                         now + std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC));
                     // Set the send callback BEFORE publishing the session into sessions_.
                     // The shared update tick can dispatch on_update_tick (and therefore
                     // handle_kcp_output, which reads send_callback_) onto any thread the
@@ -687,10 +769,19 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                     // the callback after insertion would race with that read (the callback
                     // is a plain std::function, not atomic). Publishing under the write
                     // lock after full initialization keeps the handoff safe.
-                    auto self = shared_from_this();
-                    session->set_send_callback([self, addr](std::vector<uint8_t> data) {
-                        self->send_to_client(addr, std::move(data));
-                    });
+                    // weak, NOT strong. sessions_ already holds this session; a
+                    // strong server reference here completes a two-node cycle
+                    // (server -> session -> server), so ~KCPServer could never
+                    // run while any session was still in its own map. The
+                    // session may legitimately outlive the server at shutdown --
+                    // dropping the datagram is then the right answer. Same
+                    // reason drained_cb_ is a weak_ptr (see start_forwarding).
+                    session->set_send_callback(
+                        [w = weak_from_this(), addr](std::vector<uint8_t> data) {
+                            auto server = w.lock();
+                            if (!server) return;
+                            server->send_to_client(addr, std::move(data));
+                        });
                     sessions_[sid] = session;
                     total_sessions = sessions_.size();
                 }
@@ -716,11 +807,6 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 break;
             case RejectReason::ReplayedSalt:
                 rejection_line = "replayed session salt rejected from " + sid;
-                break;
-            case RejectReason::TombstoneFull:
-                rejection_line = fmt::format(
-                    "salt tombstone table full ({}), dropping packet from {}",
-                    MAX_SALT_TOMBSTONES, sid);
                 break;
             case RejectReason::None:
                 break;
@@ -1154,14 +1240,25 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         // has expired, this session is gone and the sid (if
                         // present) belongs to a newer one -- skip the teardown.
                         //
+                        // The server reference is weak for the same reason as
+                        // send_callback_: this callback is stored ON the session,
+                        // and the tick that invokes it (do_update_tick) dispatches
+                        // with a weak reference and so holds no server lifetime.
+                        // A raw `this` would be a use-after-free whenever a
+                        // session outlives the server during shutdown.
+                        //
                         // Strand discipline: drained_cb_ is a plain std::function
                         // that on_update_tick reads and moves ON the session
                         // strand. This connect completion handler runs on that
                         // same strand (tcp_socket was built on it), so a plain
                         // store here is serialized with the tick.
                         session->set_drained_callback(
-                            [this, sid, w = std::weak_ptr<KCPSession>(session)]() {
-                                if (auto s = w.lock()) close_connection(sid, "target_drained", s);
+                            [w = weak_from_this(), sid, s = std::weak_ptr<KCPSession>(session)]() {
+                                auto server = w.lock();
+                                if (!server) return;
+                                if (auto session_s = s.lock()) {
+                                    server->close_connection(sid, "target_drained", session_s);
+                                }
                             });
                         forward_tcp_to_kcp(sid, session, tcp_socket);
                         // Eagerly arm the kcp->tcp direction so data that queued
@@ -1369,6 +1466,20 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
     std::shared_ptr<asio::ip::tcp::socket> tcp_sock;
     {
         std::shared_lock<std::shared_mutex> lock(sessions_mutex_);
+        // Identity check first: the map key is the peer endpoint, which a
+        // reconnecting client reuses. A loop still queued on a replaced
+        // session's strand would otherwise pick up the NEWER session's socket
+        // and make asio member calls on it from the wrong strand (a contract
+        // violation) while feeding the old client's bytes into the new target
+        // connection. Same rule as start_forwarding and close_connection; the
+        // invariant holds because connections_[sid] is only inserted once
+        // sessions_[sid] is that session, and both are erased together.
+        auto sit = sessions_.find(sid);
+        if (sit == sessions_.end() || sit->second != session) {
+            LOG_DEBUG("server", sid + ": forward_kcp_to_tcp - session no longer owns this endpoint");
+            session->set_forward_read_pending(false);
+            return;
+        }
         auto it = connections_.find(sid);
         if (it == connections_.end() || !it->second.tcp_socket) {
             LOG_INFO("server", sid + ": forward_kcp_to_tcp - no TCP connection found");
@@ -1600,6 +1711,7 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
     std::vector<std::shared_ptr<KCPSession>> sessions_to_stop;
     std::vector<std::shared_ptr<asio::ip::tcp::socket>> sockets_to_close;
     std::vector<std::string> dead_session_ids;
+    std::vector<std::string> stalled_session_ids;
     // Aggregate session traffic metrics (reported each sweep).
     uint64_t total_pkts_sent = 0, total_pkts_recv = 0;
     uint64_t total_bytes_sent = 0, total_bytes_recv = 0;
@@ -1617,15 +1729,22 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
             total_bytes_recv += m.bytes_received.load(std::memory_order_relaxed);
         }
 
-        // Find dead sessions
+        // Find dead sessions: idle-reaped, or stalled short of completing the
+        // SOCKS5 handshake (two independent conditions; see
+        // KcpTunnel::handshake_stalled for why is_alive() cannot cover the
+        // second one).
         for (auto& [sid, session] : sessions_) {
-            if (session && !session->is_alive()) {
+            if (!session) continue;
+            if (session->is_alive()) {
+                if (!session->handshake_stalled(SERVER_SOCKS5_HANDSHAKE_TIMEOUT_SEC)) continue;
+                stalled_session_ids.push_back(sid);
+            } else {
                 dead_session_ids.push_back(sid);
-                sessions_to_stop.push_back(session);
-                auto conn_it = connections_.find(sid);
-                if (conn_it != connections_.end() && conn_it->second.tcp_socket) {
-                    sockets_to_close.push_back(conn_it->second.tcp_socket);
-                }
+            }
+            sessions_to_stop.push_back(session);
+            auto conn_it = connections_.find(sid);
+            if (conn_it != connections_.end() && conn_it->second.tcp_socket) {
+                sockets_to_close.push_back(conn_it->second.tcp_socket);
             }
         }
 
@@ -1634,15 +1753,12 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
             sessions_.erase(sid);
             connections_.erase(sid);
         }
-        // Sweep expired salt tombstones (see get_or_create_session).
-        const auto now = std::chrono::steady_clock::now();
-        for (auto it = salt_tombstones_.begin(); it != salt_tombstones_.end();) {
-            if (it->second <= now) {
-                it = salt_tombstones_.erase(it);
-            } else {
-                ++it;
-            }
+        for (const auto& sid : stalled_session_ids) {
+            sessions_.erase(sid);
+            connections_.erase(sid);
         }
+        // Sweep expired salt tombstones (see get_or_create_session).
+        prune_salt_tombstones_locked();
         // Report the post-sweep count so "sessions=N" is the live figure, not
         // the count captured before dead sessions were erased.
         active_sessions = sessions_.size();
@@ -1653,6 +1769,10 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
     // must not extend the sweep's critical section.
     for (const auto& sid : dead_session_ids) {
         LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=idle_timeout CLIENT_ENDPOINT=" +
+                 sid + " TARGET=-");
+    }
+    for (const auto& sid : stalled_session_ids) {
+        LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=handshake_timeout CLIENT_ENDPOINT=" +
                  sid + " TARGET=-");
     }
 
@@ -1687,10 +1807,11 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
 
 void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr,
                                std::vector<uint8_t> data) {
-    if (!running_ || !udp_socket_.is_open()) {
-        LOG_WARNING("server", "send_to_client: not running or socket closed");
-        return;
-    }
+    // No udp_socket_ state may be inspected here: this runs on a per-session
+    // strand while stop() closes the socket on the socket's own strand, and
+    // asio forbids concurrent member calls on a shared object (is_open() reads
+    // the non-atomic socket state). The identical guard runs inside the
+    // dispatch below, on the executor it belongs to.
 
     LOG_DEBUG("server", "send_to_client: sending " + std::to_string(data.size()) +
              " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));
