@@ -19,6 +19,26 @@
 
 namespace kcp_proxy {
 
+namespace {
+
+// Process-wide throttles for the per-datagram UDP diagnostics. The client
+// creates one socket (and one KcpWrapper/logger call site) per local TCP
+// connection, so a per-session throttle cannot bound the aggregate: 512
+// sessions in a persistently failing state would still emit 512 * 100 lines/s.
+// "UDP receive error" in particular is re-driven by the 10ms backoff, exactly
+// like the server's -- bounded retries, unbounded logging.
+LogThrottle& client_udp_recv_error_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+LogThrottle& client_udp_send_error_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+} // namespace
+
 KCPClientSession::KCPClientSession(asio::io_context& io,
                                    asio::ip::udp::endpoint server_addr,
                                    std::shared_ptr<Crypto> crypto,
@@ -367,7 +387,12 @@ void KCPClientSession::do_udp_receive() {
                             LOG_DEBUG("kcp_client", "UDP ICMP port unreachable received (ignored)");
                             do_udp_receive();
                         } else {
-                            LOG_ERROR("kcp_client", "UDP receive error: " + ec.message());
+                            uint32_t suppressed = 0;
+                            if (client_udp_recv_error_log().should_log(suppressed)) {
+                                LOG_ERROR("kcp_client", "UDP receive error: " + ec.message() +
+                                          (suppressed ? " (" + std::to_string(suppressed) +
+                                                        " more suppressed this interval)" : ""));
+                            }
                             // Unknown errors can complete immediately and
                             // repeatedly with no external pacing, so an
                             // unbounded re-arm here is a busy spin plus an ERROR
@@ -426,8 +451,11 @@ void KCPClientSession::on_receive(byte_view packet) {
               " encrypted -> " + std::to_string(decrypt_buf_.size()) + " decrypted");
     int input_ret = kcp_.input(byte_view(decrypt_buf_.data(), decrypt_buf_.size()));
     if (input_ret < 0) {
-        LOG_WARNING("kcp_client", "ikcp_input rejected packet, ret=" +
-                    std::to_string(input_ret));
+        // Throttled for the same reason as the server side: the server holds
+        // the session key too, so a hostile (or merely corrupted) datagram can
+        // reach this once per packet -- see log_kcp_input_rejected.
+        log_kcp_input_rejected("kcp_client", std::string_view(), input_ret,
+                               decrypt_buf_.size());
         return;
     }
     LOG_DEBUG("kcp_client", "ikcp_input ok, peek=" + std::to_string(kcp_.peek_size()));
@@ -477,7 +505,14 @@ void KCPClientSession::handle_kcp_output(byte_view data) {
         asio::bind_executor(strand(),
             [this, self, send_buf](const std::error_code& ec, size_t bytes_sent) {
                 if (ec && ec != asio::error::operation_aborted) {
-                    LOG_ERROR("kcp_client", "UDP send error: " + ec.message());
+                    // One completion per datagram: an unthrottled line here is
+                    // one line per packet whenever the path is failing.
+                    uint32_t suppressed = 0;
+                    if (client_udp_send_error_log().should_log(suppressed)) {
+                        LOG_ERROR("kcp_client", "UDP send error: " + ec.message() +
+                                  (suppressed ? " (" + std::to_string(suppressed) +
+                                                " more suppressed this interval)" : ""));
+                    }
                 } else if (!ec) {
                     LOG_DEBUG("kcp_client", "UDP sent " + std::to_string(bytes_sent) + " bytes");
                 }

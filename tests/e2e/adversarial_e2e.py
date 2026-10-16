@@ -56,6 +56,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -85,6 +86,20 @@ FLOOD_ADDRS = (
     ["127.0.3.%d" % i for i in range(1, 201)]
 )
 FLOOD_PER_ADDR = 25          # datagrams per source: 20 counted + 5 gate-dropped
+# The blast must CLEAR MAX_AUTH_ATTEMPTS_PER_SEC inside a single 1s window, so
+# what matters is the achieved send RATE, not the packet count.
+#
+# Two things dominate that rate, and both were once charged to the measured
+# window, which is why an earlier version of this phase sat at ~4.9k/s -- right
+# ON the 5000/s budget, so it passed or failed on host speed instead of on the
+# server's behaviour:
+#   * socket()+bind() for 800 distinct loopback addresses costs seconds on
+#     Windows. Those sockets are now created before the clock starts (below).
+#   * one Python thread cannot drive 800 sockets fast enough; sendto() releases
+#     the GIL, so slicing the address space across threads really does scale.
+# Measured on this host with sockets pre-created: 1 thread = 8.4k/s,
+# 8 threads = 10.5k/s, against 12.5k/s for the same blast aimed at a dead port.
+FLOOD_SENDER_THREADS = 8
 # Mirrors of the server's two-level auth throttle (config.hpp).
 MAX_AUTH_ATTEMPTS_PER_SEC = 5000
 MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20
@@ -513,19 +528,43 @@ def phase_multi_source_flood(server_exe, client_exe, log_dir, echo_port):
         random.seed(1)
         packets = [bytes(random.getrandbits(8) for _ in range(60))
                    for _ in range(FLOOD_PER_ADDR)]
+        # One sender thread per slice of the address space -- see
+        # FLOOD_SENDER_THREADS for why, and for the measured rates.
+        #
+        # The sockets are created and bound ONCE, before the clock starts:
+        # 800 socket()+bind() calls cost seconds on Windows and would other-
+        # wise be charged to the blast, understating the achieved rate.
         senders = []
-        sent = 0
+        for addr in FLOOD_ADDRS:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((addr, 0))
+            senders.append(sock)
+        slices = [senders[i::FLOOD_SENDER_THREADS]
+                  for i in range(FLOOD_SENDER_THREADS)]
+        slices = [s for s in slices if s]
+        sent = [0]
+        sent_lock = threading.Lock()
         target = ("127.0.0.1", udp_port)
+
+        def blast(sock_slice):
+            local = 0
+            try:
+                for sock in sock_slice:
+                    for pkt in packets:
+                        sock.sendto(pkt, target)
+                        local += 1
+            finally:
+                with sent_lock:
+                    sent[0] += local
+
         try:
-            for addr in FLOOD_ADDRS:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((addr, 0))
-                senders.append(sock)
             started = time.time()
-            for sock in senders:
-                for pkt in packets:
-                    sock.sendto(pkt, target)
-                    sent += 1
+            threads = [threading.Thread(target=blast, args=(s,))
+                       for s in slices]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
             elapsed = time.time() - started
         finally:
             for sock in senders:
@@ -533,8 +572,22 @@ def phase_multi_source_flood(server_exe, client_exe, log_dir, echo_port):
                     sock.close()
                 except OSError:
                     pass
-        print("  [ok] blasted %d datagrams from %d distinct sources in %.2fs"
-              % (sent, len(FLOOD_ADDRS), elapsed))
+        achieved_rate = sent[0] / elapsed if elapsed > 0 else 0.0
+        print("  [ok] blasted %d datagrams from %d distinct sources via %d "
+              "threads in %.2fs (%.0f/s)"
+              % (sent[0], len(FLOOD_ADDRS), len(slices), elapsed,
+                 achieved_rate))
+        # Only ~80% of these are ever counted (each address is gate-dropped
+        # after 20 failures), so the send rate has to clear the budget by a
+        # margin. Saying so here turns a slow host into a diagnosable failure
+        # instead of the misleading "budget never engaged".
+        if achieved_rate * 0.8 <= MAX_AUTH_ATTEMPTS_PER_SEC:
+            raise AssertionError(
+                "the blast reached only %.0f datagrams/s (~%.0f/s counted "
+                "after the per-address gate), which cannot exceed the %d/s "
+                "budget -- raise FLOOD_SENDER_THREADS or the host is too slow"
+                % (achieved_rate, achieved_rate * 0.8,
+                   MAX_AUTH_ATTEMPTS_PER_SEC))
 
         if not server.alive():
             raise AssertionError("server died under the multi-source flood")
@@ -545,11 +598,12 @@ def phase_multi_source_flood(server_exe, client_exe, log_dir, echo_port):
         # The global budget line is the whole point of this phase: it is the
         # only defense left once every source address is distinct.
         if not wait_for_log(server.log_path,
-                            "auth attempt rate limit reached", 5):
+                            "auth attempt rate limit reached", 10):
             raise AssertionError(
                 "global auth budget never engaged: %d attempts from %d "
-                "sources should exceed %d/s"
-                % (sent, len(FLOOD_ADDRS), MAX_AUTH_ATTEMPTS_PER_SEC))
+                "sources at %.0f/s should exceed %d/s"
+                % (sent[0], len(FLOOD_ADDRS), achieved_rate,
+                   MAX_AUTH_ATTEMPTS_PER_SEC))
         print("  [ok] global auth-attempt budget engaged under the flood")
 
         # The budget is a 1-second window: once it resets, legitimate NEW

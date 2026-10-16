@@ -330,7 +330,17 @@ void KCPServer::handle_receive(size_t index, const std::error_code& ec,
                 LOG_DEBUG("server", "UDP ICMP port unreachable received (ignored)");
                 arm_receive_slot(index);
             } else {
-                LOG_ERROR("server", "UDP receive error: " + ec.message());
+                // Throttled: park_receive_slot() bounds how often the socket is
+                // retried, not how often this line is emitted -- one per slot
+                // per 10ms is ~1600 stderr writes/s while the condition lasts.
+                // The first occurrence always prints, so the failure is still
+                // visible the moment it starts.
+                uint32_t suppressed = 0;
+                if (recv_error_log_.should_log(suppressed)) {
+                    LOG_ERROR("server", "UDP receive error: " + ec.message() +
+                              (suppressed ? " (" + std::to_string(suppressed) +
+                                            " more suppressed this interval)" : ""));
+                }
                 park_receive_slot(index);
             }
         }
@@ -1830,11 +1840,18 @@ void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr,
             }
             udp_socket_.async_send_to(
                 asio::buffer(*buf), addr,
-                [buf, addr](const std::error_code& ec, size_t bytes_sent) {
+                [buf, addr, this, self](const std::error_code& ec, size_t bytes_sent) {
                     if (ec && ec != asio::error::operation_aborted) {
-                        LOG_ERROR("server", "FAIL_STAGE=UDP_SEND_FAILED ERROR=" + ec.message() +
-                                  " CLIENT_ENDPOINT=" + addr.address().to_string() +
-                                  ":" + std::to_string(addr.port()) + " TARGET=-");
+                        // One completion per datagram, so an unthrottled line
+                        // here is one line per packet whenever sends fail.
+                        uint32_t suppressed = 0;
+                        if (send_error_log_.should_log(suppressed)) {
+                            LOG_ERROR("server", "FAIL_STAGE=UDP_SEND_FAILED ERROR=" + ec.message() +
+                                      " CLIENT_ENDPOINT=" + addr.address().to_string() +
+                                      ":" + std::to_string(addr.port()) + " TARGET=-" +
+                                      (suppressed ? " (" + std::to_string(suppressed) +
+                                                    " more suppressed this interval)" : ""));
+                        }
                     } else if (!ec) {
                         LOG_DEBUG("server", "UDP sent " + std::to_string(bytes_sent) +
                                  " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));

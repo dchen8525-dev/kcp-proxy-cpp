@@ -200,6 +200,17 @@ private:
     // Throttle for route_datagram's exception containment: a persistently
     // failing allocation would otherwise emit one ERROR line per datagram.
     LogThrottle route_exception_log_;
+    // Throttle for the UDP receive error path. An unknown receive error parks
+    // its slot and the shared 10ms backoff re-arms it, so a socket in a
+    // persistently failing state emits one ERROR line per slot per 10ms -- up
+    // to UDP_RECV_SLOTS * 100 lines/s, sustained for as long as the condition
+    // lasts. The backoff bounds the RETRY rate, not the logging, so without
+    // this the "bounded" path is still ~1600 formatted stderr writes a second.
+    LogThrottle recv_error_log_;
+    // Throttle for UDP send failures: async_send_to's completion runs once per
+    // datagram, so a socket that keeps failing (or a peer whose path is down)
+    // gets one ERROR line per packet -- attacker-paced on the receive side.
+    LogThrottle send_error_log_;
 
     // Targets whitelisted via --allow-target; the SSRF guard refuses a target
     // only if it is restricted AND not in this list. Read-only after start().

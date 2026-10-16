@@ -7,6 +7,31 @@
 
 namespace kcp_proxy {
 
+namespace {
+
+// One throttle for the whole process: a per-session instance cannot bound the
+// aggregate across N sessions, and a flood split across reasons must not
+// swallow the first line of another. See log_kcp_input_rejected in the header.
+LogThrottle& kcp_input_reject_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+} // namespace
+
+void log_kcp_input_rejected(std::string_view log_module, std::string_view tag,
+                            int ret, size_t size) {
+    uint32_t suppressed = 0;
+    if (!kcp_input_reject_log().should_log(suppressed)) return;
+    const std::string prefix = tag.empty() ? std::string()
+                                           : std::string(tag) + ": ";
+    LOG_WARNING(std::string(log_module),
+                prefix + "FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_" +
+                std::to_string(ret) + " size=" + std::to_string(size) +
+                (suppressed ? " (" + std::to_string(suppressed) +
+                              " more suppressed this interval)" : ""));
+}
+
 KcpWrapper::KcpWrapper(uint32_t conv) {
     kcp_ = ikcp_create(conv, this);
     if (!kcp_) {
@@ -89,8 +114,11 @@ int KcpWrapper::input(byte_view data) {
     int ret = ikcp_input(kcp_, reinterpret_cast<const char*>(data.data()),
                          static_cast<int>(data.size()));
     if (ret < 0) {
-        LOG_WARNING("kcp_wrapper", "ikcp_input failed: ret=" + std::to_string(ret) +
-                    " size=" + std::to_string(data.size()));
+        // Detail only, and at DEBUG: the throttled, once-per-datagram line is
+        // the caller's (log_kcp_input_rejected), which already carries ret and
+        // the size. Logging both made one rejected datagram cost two WARNINGs.
+        LOG_DEBUG("kcp_wrapper", "ikcp_input failed: ret=" + std::to_string(ret) +
+                  " size=" + std::to_string(data.size()));
     } else {
         LOG_DEBUG("kcp_wrapper", "ikcp_input ok: " + std::to_string(data.size()) +
                   " bytes, peek=" + std::to_string(peek_size()));

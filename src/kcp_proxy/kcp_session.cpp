@@ -123,8 +123,11 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
               session_id_, encrypted.size(), decrypt_buf_.size(), kcp_.peek_size()));
     int input_ret = kcp_.input(byte_view(decrypt_buf_.data(), decrypt_buf_.size()));
     if (input_ret < 0) {
-        LOG_WARNING("kcp_session", fmt::format("FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_{} CLIENT_ENDPOINT={} TARGET=-",
-                    input_ret, session_id_));
+        // Throttled: any peer holding the session key can make ikcp_input()
+        // refuse (a truncated segment or a wrong conv is enough), so this is
+        // reachable once per datagram -- see log_kcp_input_rejected.
+        log_kcp_input_rejected("kcp_session", session_id_, input_ret,
+                               decrypt_buf_.size());
         return;
     }
     LOG_DEBUG("kcp_session", fmt::format("{}: ikcp_input ok, peek_after={} wait_send={}",
@@ -148,8 +151,8 @@ void KCPSession::on_inject_decrypted(std::vector<uint8_t> decrypted) {
               session_id_, decrypted.size(), kcp_.peek_size()));
     int input_ret = kcp_.input(byte_view(decrypted.data(), decrypted.size()));
     if (input_ret < 0) {
-        LOG_WARNING("kcp_session", fmt::format("FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_{} CLIENT_ENDPOINT={} TARGET=-",
-                    input_ret, session_id_));
+        log_kcp_input_rejected("kcp_session", session_id_, input_ret,
+                               decrypted.size());
         return;
     }
     LOG_DEBUG("kcp_session", fmt::format("{}: inject ok, peek_after={}", session_id_, kcp_.peek_size()));
@@ -184,7 +187,17 @@ void KCPSession::on_update_tick() {
     // Application-layer keepalive: a live but idle tunnel would otherwise be
     // reaped by the peer's idle sweep (KCP_TIMEOUT_SEC). Sending a heartbeat
     // must NOT refresh the activity clock -- see KcpTunnel::maybe_send_keepalive.
-    maybe_send_keepalive();
+    //
+    // Skipped once the target has closed: the session is now only draining the
+    // bytes already queued to the client, and the drained check below keys off
+    // wait_send() == 0. A heartbeat queued in that window pushes wait_send()
+    // back above zero and stays there until the peer ACKs it, so the teardown
+    // waits an extra round trip for a packet whose only purpose is to keep a
+    // connection alive that is already half-dead -- and, with a peer that has
+    // gone away, until the 60s idle sweep instead of the drain completing.
+    if (!target_closed_.load()) {
+        maybe_send_keepalive();
+    }
 
     // A FIN refused by a full send window is re-driven as the window drains
     // (see KcpTunnel::retry_pending_fin).

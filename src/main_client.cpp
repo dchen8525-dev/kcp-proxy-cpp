@@ -123,6 +123,16 @@ int main(int argc, char* argv[]) {
             } catch (const std::exception& e) {
                 std::cerr << "Fatal error in I/O thread: " << e.what() << std::endl;
                 io_failed.store(true);
+            } catch (...) {
+                // Same reasoning as the server's io.run(): this is a bare
+                // worker thread with no handler of its own, so ANY escaping
+                // exception -- not just std::exception -- terminates the
+                // process before the diagnostic can print. Catching only
+                // std::exception left that hole open for e.g. a custom error
+                // type thrown by a handler, or a rethrow of something that is
+                // not derived from std::exception.
+                std::cerr << "Fatal error in I/O thread: unknown exception" << std::endl;
+                io_failed.store(true);
             }
         });
         io_thread.join();

@@ -4,6 +4,7 @@
 #include "byte_view.hpp"
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 extern "C" {
@@ -11,6 +12,26 @@ extern "C" {
 }
 
 namespace kcp_proxy {
+
+// Single, process-wide, throttled diagnostic for a datagram ikcp_input()
+// refused. Reachable once per hostile (or merely corrupted) datagram by anyone
+// holding the session key -- a truncated segment or a wrong conv is enough --
+// so an unthrottled line here is exactly the log DoS LogThrottle exists to
+// stop: a format pass, a timestamp and a write(2) per datagram, handed over
+// for free. Both tunnels route their ikcp_input failure through this one
+// emitter so:
+//   * the aggregate is bounded (a per-session throttle cannot bound N
+//     sessions, and every session has its own KcpWrapper), and
+//   * the line is emitted ONCE per datagram. Before this, KcpWrapper::input()
+//     logged its own WARNING and every caller logged a second one, so a single
+//     bad datagram produced two lines -- double the cost of the DoS and double
+//     the noise in any grep for one rejection.
+// The first occurrence of a burst always prints, so the FAIL_STAGE marker the
+// diagnostics and tests grep for is never lost.
+// `tag` is the server's session id (empty on the client), matching each side's
+// existing line prefix.
+void log_kcp_input_rejected(std::string_view log_module, std::string_view tag,
+                            int ret, size_t size);
 
 class KcpWrapper {
 public:

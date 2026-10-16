@@ -20,6 +20,13 @@ std::mutex g_log_mutex;
 FILE* g_log_file = nullptr;
 #endif
 
+// Test sink (see set_log_sink_for_test in the header). Consumed under its own
+// mutex and only invoked AFTER the log line has been written, never while
+// g_log_mutex is held: a sink that logged again (or asserted) would otherwise
+// deadlock on it.
+std::mutex g_sink_mutex;
+LogSink g_log_sink;
+
 bool to_local_time(std::time_t t, std::tm& out) {
 #if defined(_WIN32)
     return localtime_s(&out, &t) == 0;
@@ -28,6 +35,11 @@ bool to_local_time(std::time_t t, std::tm& out) {
 #endif
 }
 } // namespace
+
+void set_log_sink_for_test(LogSink sink) {
+    std::lock_guard<std::mutex> lock(g_sink_mutex);
+    g_log_sink = std::move(sink);
+}
 
 void set_log_level(LogLevel level) {
     g_log_level.store(level, std::memory_order_relaxed);
@@ -97,6 +109,13 @@ void log(LogLevel level, std::string_view module, std::string_view message) {
         std::cerr << line << '\n';
     }
 #endif
+
+    LogSink sink;
+    {
+        std::lock_guard<std::mutex> lock(g_sink_mutex);
+        sink = g_log_sink;
+    }
+    if (sink) sink(level, module, message);
 }
 
 } // namespace kcp_proxy

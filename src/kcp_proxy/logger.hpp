@@ -1,6 +1,9 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <cstdint>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -29,6 +32,13 @@ enum class LogLevel { Debug, Info, Warning, Error };
 //         LOG_WARNING("server", "..." + fmt::format(" ({} suppressed)", suppressed));
 //     }
 //
+// The tally saturates at UINT32_MAX instead of wrapping: a sustained flood
+// folds occurrences into it for as long as the condition lasts, so an
+// unbounded rate eventually exceeds 2^32 and a wrapping counter would report a
+// count lower than what was actually dropped -- understating the very signal
+// an operator reads to size the attack. 2^32 suppressed datagrams in one
+// interval is not reachable in practice; UB is.
+//
 // Thread-safe: should_log()/pending() are internally synchronized. The original
 // contract required callers to serialize (the server's UDP strand did), but
 // Crypto::decrypt_impl's rejection paths run on the UDP strand AND every
@@ -49,11 +59,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const auto now = std::chrono::steady_clock::now();
         if (now - window_start_ < interval_) {
-            ++suppressed_;
+            note_suppressed_locked(1);
             return false;
         }
         window_start_ = now;
-        suppressed = suppressed_;
+        suppressed = clamp_to_u32(suppressed_);
         suppressed_ = 0;
         return true;
     }
@@ -62,20 +72,56 @@ public:
     // Lets a caller surface a final tally on a teardown path.
     uint32_t pending() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return suppressed_;
+        return clamp_to_u32(suppressed_);
+    }
+
+    // Test-only: fold `n` occurrences into the tally without waiting for real
+    // traffic. Reaching the 2^32 saturation point otherwise needs billions of
+    // hostile datagrams, so this is what makes the saturating behaviour (and
+    // the no-wrap invariant it protects) testable at all.
+    void add_suppressed_for_test(uint64_t n) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        note_suppressed_locked(n);
     }
 
 private:
+    // Saturating add: see the class comment.
+    void note_suppressed_locked(uint64_t n) {
+        constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+        if (suppressed_ > kMax - n) {
+            suppressed_ = kMax;
+        } else {
+            suppressed_ += n;
+        }
+    }
+    static uint32_t clamp_to_u32(uint64_t v) {
+        constexpr uint64_t kU32Max = std::numeric_limits<uint32_t>::max();
+        return v > kU32Max ? kU32Max : static_cast<uint32_t>(v);
+    }
+
     mutable std::mutex mutex_;
     std::chrono::steady_clock::time_point window_start_{};
     std::chrono::milliseconds interval_;
-    uint32_t suppressed_ = 0;
+    // Wide enough that it cannot wrap, so saturation is the only clamping the
+    // reported count ever needs.
+    uint64_t suppressed_ = 0;
 };
 
 void set_log_level(LogLevel level);
 LogLevel current_log_level() noexcept;
 void set_log_file_path(const char* path);
 void log(LogLevel level, std::string_view module, std::string_view message);
+
+// Test-only: receive every line the logger actually emits, in addition to the
+// normal stderr/file output. Logging is the only observable side effect of the
+// server's rejection paths, so counting lines is the only way to assert that a
+// per-datagram diagnostic is bounded -- the property every LogThrottle in this
+// codebase exists to provide, and the one that silently regressed twice
+// (unthrottled WARNINGs, then a shared throttle masking its sibling's line).
+// Pass an empty function to uninstall. Not thread-safe against concurrent
+// install/uninstall; tests install it before starting traffic.
+using LogSink = std::function<void(LogLevel, std::string_view, std::string_view)>;
+void set_log_sink_for_test(LogSink sink);
 
 // Performance-optimized logging with fmt library
 template <typename... Args>

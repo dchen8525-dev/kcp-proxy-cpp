@@ -14,6 +14,7 @@
 #include <cassert>
 #include <array>
 #include <atomic>
+#include <limits>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -2038,6 +2039,71 @@ void test_allowlist_matching() {
                 "empty allowlist matches nothing");
 }
 
+// --------------------------------------------------------------------------- //
+// Round 1-5: adversarial review follow-ups
+// --------------------------------------------------------------------------- //
+
+void test_log_throttle_saturates_instead_of_wrapping() {
+    constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
+    // The tally is what an operator reads to size a flood. A counter that wraps
+    // at 2^32 reports a count LOWER than what was actually dropped -- and does
+    // so silently, only under the sustained flood where the number matters.
+    LogThrottle throttle(std::chrono::seconds(30));
+
+    // Far past the uint32 range: a saturated counter must still report the
+    // maximum, never wrap around to a small (or zero) number.
+    throttle.add_suppressed_for_test(static_cast<uint64_t>(kU32Max) + 1000ull);
+    expect_true(throttle.pending() == kU32Max,
+                "suppressed tally must saturate at kU32Max");
+
+    // And it must stay there, not decay past the cap on further occurrences.
+    throttle.add_suppressed_for_test(1);
+    expect_true(throttle.pending() == kU32Max,
+                "saturated tally must not move on further occurrences");
+
+    // The reported value on emission is the saturated one.
+    uint32_t suppressed = 0;
+    expect_true(throttle.should_log(suppressed), "first emission should fire");
+    expect_true(suppressed == kU32Max, "emission reports the saturated tally");
+    expect_true(throttle.pending() == 0, "tally resets after an emission");
+}
+
+void test_kcp_input_rejection_log_is_bounded_and_single_line() {
+    // Two defects in one path, both attacker-paced:
+    //   * KcpWrapper::input() logged its own WARNING AND every caller logged a
+    //     second one, so one rejected datagram cost two lines.
+    //   * neither was throttled, so a peer holding the session key (a
+    //     truncated segment or a wrong conv is enough to make ikcp_input
+    //     refuse) got a formatted stderr write per datagram, for free.
+    std::atomic<int> warnings{0};
+    std::atomic<int> kcp_input_lines{0};
+    set_log_sink_for_test([&](LogLevel level, std::string_view,
+                              std::string_view message) {
+        if (level != LogLevel::Warning) return;
+        warnings.fetch_add(1, std::memory_order_relaxed);
+        if (message.find("FAIL_STAGE=KCP_INPUT_FAILED") != std::string_view::npos) {
+            kcp_input_lines.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    // Feed a burst far larger than any plausible packet rate.
+    constexpr int kDatagrams = 5000;
+    for (int i = 0; i < kDatagrams; ++i) {
+        log_kcp_input_rejected("kcp_test", "sid:1234", -1, 37);
+    }
+    set_log_sink_for_test(LogSink{});
+
+    // Bounded: one line per interval, not one per datagram.
+    expect_true(kcp_input_lines.load() >= 1,
+                "the first rejection must always be visible");
+    expect_true(kcp_input_lines.load() <= 2,
+                "ikcp_input rejections must be throttled, not one line per datagram");
+    // Single line per event: no second WARNING from the wrapper for the same
+    // datagram (that duplication doubled the cost of the DoS).
+    expect_true(warnings.load() == kcp_input_lines.load(),
+                "one rejected datagram must produce exactly one warning line");
+}
+
 } // namespace
 
 int main() {
@@ -2074,6 +2140,8 @@ int main() {
         test_client_session_keepalive_released_with_session();
         test_client_abort_handshake_closes_local_socket();
         test_client_malformed_greeting_keeps_its_reply();
+        test_log_throttle_saturates_instead_of_wrapping();
+        test_kcp_input_rejection_log_is_bounded_and_single_line();
     } catch (const std::exception& e) {
         std::cerr << "test failed: " << e.what() << "\n";
         return 1;
