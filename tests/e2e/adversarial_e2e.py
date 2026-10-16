@@ -777,9 +777,12 @@ class StalledTarget:
     1..8 established fillers): the connect hangs ~2.0s and then fails with
     WSAECONNREFUSED -- Windows RSTs the overflow connection instead of
     dropping the SYN. Linux drops the overflow SYN, so connect() hangs until
-    the peer gives up. The suite therefore probes the platform at runtime
-    (see phase_stalled_target) instead of assuming one behavior; this class
-    only guarantees the backlog is full.
+    the peer gives up. macOS/BSD also drops the overflow SYN, but its own SYN
+    retransmissions (1s + 2s + 4s) run out at ~7.8s and the connect fails
+    with ETIMEDOUT -- well before the server's 15s deadline. The suite
+    therefore probes the platform at runtime (see phase_stalled_target)
+    instead of assuming one behavior; this class only guarantees the backlog
+    is full.
     """
 
     def __init__(self, port):
@@ -832,15 +835,20 @@ def phase_stalled_target(server_exe, client_exe, log_dir, echo_port):
         require_pair_ready(server, client, socks_port)
 
         # What does THIS kernel do when the accept queue is full? Linux drops
-        # the overflow SYN, so connect() hangs until the server's
-        # CONNECT_TIMEOUT_SEC deadline fires (reply 0x04 HOST_UNREACHABLE,
-        # reason connect_timeout). Windows RSTs the overflow connection after
-        # ~2s, so connect() fails with ECONNREFUSED (reply 0x05
-        # CONNECTION_REFUSED, reason tcp_connect_failed). Both outcomes are
-        # clean and correctly mapped by the server; probe once and assert the
-        # path this platform actually delivers. The shared contract -- a
-        # clean SOCKS5 error reply, the session reaped via close_connection,
-        # and a functional service afterwards -- is asserted either way.
+        # the overflow SYN and retries it for minutes, so connect() hangs
+        # until the server's CONNECT_TIMEOUT_SEC deadline fires (reply 0x04
+        # HOST_UNREACHABLE, reason connect_timeout). Windows RSTs the overflow
+        # connection after ~2s, so connect() fails with ECONNREFUSED (reply
+        # 0x05 CONNECTION_REFUSED, reason tcp_connect_failed). macOS/BSD also
+        # drops the overflow SYN, but its own SYN retransmissions run out at
+        # ~7.8s and the connect fails with ETIMEDOUT (reply 0x04 --
+        # get_error_reply_code maps timed_out to HOST_UNREACHABLE -- reason
+        # tcp_connect_failed), BEFORE the 15s deadline. All three outcomes
+        # are clean and correctly mapped by the server; probe once and then
+        # branch on the close reason the server actually logged, keeping a
+        # timing sanity check per branch. The shared contract -- a clean
+        # SOCKS5 error reply, the session reaped via close_connection, and a
+        # functional service afterwards -- is asserted either way.
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.settimeout(3.0)
         try:
@@ -866,21 +874,42 @@ def phase_stalled_target(server_exe, client_exe, log_dir, echo_port):
         rep = read_request_reply(s, timeout=2 * CONNECT_TIMEOUT_SEC + 10)
         elapsed = time.time() - started
         if mode == "blackhole":
-            assert rep == 0x04, \
-                "stalled connect must fail with HOST_UNREACHABLE (0x04), got 0x%02x" % rep
-            # The reply must come from the server's deadline, not a kernel RST.
-            assert elapsed >= CONNECT_TIMEOUT_SEC - 2, \
-                "stalled connect replied after %.1fs, before the %ds connect deadline" % (
-                    elapsed, CONNECT_TIMEOUT_SEC)
-            print("  [ok] connect timeout replied 0x04 after %.1fs" % elapsed)
+            # Branch on the close reason the server actually logged, not on
+            # the platform name: Linux can only exit via the server's 15s
+            # deadline, while macOS/BSD's own SYN retransmissions give up
+            # first (~7.8s, ETIMEDOUT -> 0x04). Both are the clean outcome
+            # this phase exists to prove; each branch carries its own timing
+            # sanity check.
+            assert rep in (0x04, 0x05), \
+                "stalled connect must fail with a clean SOCKS5 error, got 0x%02x" % rep
+            if wait_for_log(server.log_path,
+                            "close_connection from connect_timeout", 5):
+                # Deadline-driven path (Linux): the reply must come from the
+                # server's timer, not from an early kernel decision.
+                assert rep == 0x04, \
+                    "connect timeout must reply HOST_UNREACHABLE (0x04), got 0x%02x" % rep
+                assert elapsed >= CONNECT_TIMEOUT_SEC - 2, \
+                    "deadline-driven reply arrived after only %.1fs" % elapsed
+                print("  [ok] connect timeout replied 0x04 after %.1fs" % elapsed)
+                reap_reason = "connect_timeout"
+            elif wait_for_log(server.log_path,
+                              "close_connection from tcp_connect_failed", 5):
+                # Kernel-gave-up path (macOS/BSD): the connect error beat the
+                # deadline, so the reply may legitimately arrive early.
+                assert elapsed < CONNECT_TIMEOUT_SEC, \
+                    "kernel error arrived at %.1fs, past the %ds deadline" % (
+                        elapsed, CONNECT_TIMEOUT_SEC)
+                print("  [ok] kernel SYN retries exhausted before the %ds "
+                      "deadline: replied 0x%02x after %.1fs"
+                      % (CONNECT_TIMEOUT_SEC, rep, elapsed))
+                reap_reason = "tcp_connect_failed"
+            else:
+                raise AssertionError(
+                    "stalled-connect session was never reaped: neither "
+                    "connect_timeout nor tcp_connect_failed close in the log")
             expect_eof(s, what="stalled-target connection")
             s.close()
-            if not wait_for_log(server.log_path, "connect_timeout", 5):
-                raise AssertionError("server never logged the connect timeout")
-            if not wait_for_log(server.log_path,
-                                "close_connection from connect_timeout", 5):
-                raise AssertionError("stalled-connect session was never closed")
-            print("  [ok] session reaped via close_connection(connect_timeout)")
+            print("  [ok] session reaped via close_connection(%s)" % reap_reason)
         else:
             assert rep == 0x05, \
                 "refused connect must fail with CONNECTION_REFUSED (0x05), got 0x%02x" % rep
