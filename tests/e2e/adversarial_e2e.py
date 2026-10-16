@@ -118,6 +118,22 @@ FLOOD_PER_ADDR = 25          # datagrams per source: 20 counted + 5 gate-dropped
 # Measured on this host with sockets pre-created: 1 thread = 8.4k/s,
 # 8 threads = 10.5k/s, against 12.5k/s for the same blast aimed at a dead port.
 FLOOD_SENDER_THREADS = 8
+# Ceiling on the aggregate send rate, enforced by pacing the blast (below).
+# The budget engages only when the SERVER counts >= 5001 attempts inside one
+# of its own 1s windows, and the server counts at its own processing pace --
+# so what matters is not how fast the test can send, but that the server can
+# keep up with what is sent. An unpaced blast reaches ~94k/s on a fast CI
+# runner (9x the dev-box rate above): that burst overruns the server's single
+# io thread and overflows the UDP receive buffer, and the kernel drops the
+# excess SILENTLY. The server then sees a fraction of the flood, never counts
+# 5001 in a window, and the phase fails with "budget never engaged" against a
+# perfectly healthy server. Pacing to ~10k/s keeps the send rate below the
+# server's drain rate so every datagram is processed, while the ~2s blast
+# still leaves ~8000 counted attempts (800 sources x 20) in every 1s window.
+# It is a ceiling, not a floor: a host too slow to reach it sends at its own
+# maximum, and the achieved-rate check below turns that into an honest,
+# actionable failure instead of a misleading "budget never engaged".
+FLOOD_TARGET_RATE = 10000
 # Mirrors of the server's two-level auth throttle (config.hpp).
 MAX_AUTH_ATTEMPTS_PER_SEC = 5000
 MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20
@@ -555,6 +571,11 @@ def phase_multi_source_flood(server_exe, client_exe, log_dir, echo_port):
         # the outcome independent of where the boundaries fall -- any split of
         # 16000 leaves a half >= 8000, and a counted span over ~2s always
         # contains at least one full window.
+        #
+        # The blast is paced to FLOOD_TARGET_RATE so that ~2s span is STEADY
+        # delivery the server actually processes: unpaced on a fast host the
+        # same 20000 datagrams land in 0.2s, the kernel drops the overflow,
+        # and the server never reaches the budget (see the constant).
         random.seed(1)
         packets = [bytes(random.getrandbits(8) for _ in range(60))
                    for _ in range(FLOOD_PER_ADDR)]
@@ -578,11 +599,29 @@ def phase_multi_source_flood(server_exe, client_exe, log_dir, echo_port):
 
         def blast(sock_slice):
             local = 0
+            # Pace this slice at (target / threads) so the aggregate holds
+            # near FLOOD_TARGET_RATE -- see the constant for why an unpaced
+            # burst defeats the phase on fast hosts. Deadline-driven, not
+            # fixed-sleep: each batch is due batch/rate seconds after the
+            # previous one, and a sleep that overruns (Windows timer
+            # granularity is ~15.6ms) is caught up by the next batch instead
+            # of accumulating. The paced rate is therefore min(target, what
+            # this host can actually send): pacing never makes a host slower
+            # than it already was, it only stops a fast one from overrunning
+            # the server.
+            per_thread_rate = FLOOD_TARGET_RATE / max(1, len(slices))
+            batch = 100
+            next_due = time.monotonic()
             try:
                 for sock in sock_slice:
                     for pkt in packets:
                         sock.sendto(pkt, target)
                         local += 1
+                        if local % batch == 0:
+                            next_due += batch / per_thread_rate
+                            delay = next_due - time.monotonic()
+                            if delay > 0:
+                                time.sleep(delay)
             finally:
                 with sent_lock:
                     sent[0] += local
