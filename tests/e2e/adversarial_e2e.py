@@ -21,6 +21,10 @@ neither of the other two suites touches:
      that (a) it engages, and (b) legitimate new sessions are served again
      once the 1s window resets. The flood is sized so the outcome does not
      depend on where the window boundaries fall (see the phase body).
+     macOS: only 127.0.0.1 is configured on lo0, so distinct 127/8 sources are
+     unavailable and the per-address gate (20/s) caps any single-source blast
+     far below the 5000/s budget -- the phase skips there, and the single-source
+     per-address-gate coverage runs on every platform in robustness phase B.
   C. Client session cap - 520 simultaneous local connections against a client
      whose MAX_CLIENT_SESSIONS is 512: the excess must be refused, the cap
      tickets must be released when the connections close (a leak here would
@@ -76,9 +80,23 @@ from tunnel_e2e import (  # noqa: E402  (path tweak must precede the import)
 
 # Phase C: the client's compile-time cap (config.hpp MAX_CLIENT_SESSIONS).
 MAX_CLIENT_SESSIONS = 512
+
+# macOS only configures 127.0.0.1 on lo0; the rest of 127/8 is NOT routable,
+# so datagrams cannot be sourced from 127.0.0.2..127.0.3.200 the way Linux and
+# Windows allow. With a single usable source address the per-address failure
+# gate (20/s) caps counted attempts and the GLOBAL auth budget (5000/s) can
+# never be reached -- phase B's global-budget half is structurally untestable
+# there. macOS also paces loopback UDP bursts to a trickle (see the robustness
+# suite's phase B), so even the per-address gate is only provable with the
+# OS-pacing-aware fallback that suite already implements. Phase B therefore
+# skips on macOS; every assertion it could make there already has a home:
+#   * global budget via many distinct sources -> this phase (Linux/Windows)
+#   * single-source flood, per-address gate, recovery  -> robustness phase B
+IS_MACOS = sys.platform == "darwin"
+
 # Phase B: distinct loopback sources. 127/8 is entirely loopback, so
 # 127.0.0.2..127.0.0.201, 127.0.1.1..127.0.1.200, 127.0.2.1..127.0.2.200 and
-# 127.0.3.1..127.0.3.200 give 800 addresses.
+# 127.0.3.1..127.0.3.200 give 800 addresses (Linux/Windows only).
 FLOOD_ADDRS = (
     ["127.0.0.%d" % i for i in range(2, 202)] +
     ["127.0.1.%d" % i for i in range(1, 201)] +
@@ -498,6 +516,18 @@ def phase_protocol_abuse(server_exe, client_exe, log_dir, echo_port):
 # phase B: many-source flood -> global auth budget, then recovery
 # --------------------------------------------------------------------------- #
 def phase_multi_source_flood(server_exe, client_exe, log_dir, echo_port):
+    if IS_MACOS:
+        # See IS_MACOS above for the full argument. Skipped BEFORE starting any
+        # process: nothing this phase can assert on macOS is not already
+        # asserted by the robustness suite's phase B, which runs here too.
+        print("[B] SKIP on macOS: the global-budget flood needs 800 distinct "
+              "127/8 source addresses; macOS only configures 127.0.0.1, so "
+              "the per-address gate caps counted attempts at %d/s and the "
+              "%d/s global budget is unreachable. Single-source per-address "
+              "coverage lives in robustness phase B, which runs on this "
+              "platform." % (MAX_AUTH_FAILURES_PER_ADDR_PER_SEC,
+                             MAX_AUTH_ATTEMPTS_PER_SEC))
+        return
     print("[B] many-source UDP flood: the GLOBAL auth budget must engage and "
           "legitimate sessions must be served again afterwards")
     udp_port = free_udp_port()
