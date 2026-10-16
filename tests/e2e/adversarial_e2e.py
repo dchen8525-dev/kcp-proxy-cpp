@@ -1066,23 +1066,27 @@ def main():
     print("E2E adversarial suite: server=%s" % args.server)
     log_paths = []
     try:
-        phase_protocol_abuse(args.server, args.client, log_dir, echo_port)
+        # Register each phase's logs BEFORE running the phase: a phase that
+        # raises must leave its own evidence in the dump below (and the
+        # cleanup in ``finally`` must still find the files). Registering
+        # after the call silently drops the failing phase's logs.
         log_paths += [os.path.join(log_dir, "abuse-server.log"),
                       os.path.join(log_dir, "abuse-client.log")]
-        phase_multi_source_flood(args.server, args.client, log_dir, echo_port)
+        phase_protocol_abuse(args.server, args.client, log_dir, echo_port)
         log_paths += [os.path.join(log_dir, "multiflood-server.log"),
                       os.path.join(log_dir, "multiflood-client.log")]
-        phase_client_session_cap(args.server, args.client, log_dir, echo_port)
+        phase_multi_source_flood(args.server, args.client, log_dir, echo_port)
         log_paths += [os.path.join(log_dir, "clientcap-server.log"),
                       os.path.join(log_dir, "clientcap-client.log")]
-        phase_stalled_target(args.server, args.client, log_dir, echo_port)
+        phase_client_session_cap(args.server, args.client, log_dir, echo_port)
         log_paths += [os.path.join(log_dir, "stalled-server.log"),
                       os.path.join(log_dir, "stalled-client.log")]
-        phase_restart_and_key_rotation(args.server, args.client, log_dir,
-                                       echo_port)
+        phase_stalled_target(args.server, args.client, log_dir, echo_port)
         log_paths += [os.path.join(log_dir, "restart-server.log"),
                       os.path.join(log_dir, "restart-client.log"),
                       os.path.join(log_dir, "restart-rotated-server.log")]
+        phase_restart_and_key_rotation(args.server, args.client, log_dir,
+                                       echo_port)
 
         print("E2E ADVERSARIAL TEST PASSED")
         return 0

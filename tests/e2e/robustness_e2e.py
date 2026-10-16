@@ -91,6 +91,14 @@ FLOOD_PACKETS = 1500
 # here so the assertion tracks the value it is actually testing. The gate counts
 # failed decrypts, not attempts, so a legitimate client is never throttled.
 MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20
+# Mirror of the C++ server constants that bound the SLOWEST legitimate session
+# reclamation path (config.hpp): once the peer goes quiet the session stops
+# refreshing its activity clock, the idle sweep reaps it after
+# KCP_TIMEOUT_SEC of silence, and that sweep runs every 30s. A reclamation
+# slower than fast-path window but inside this bound is correct behavior, not
+# a leak.
+KCP_TIMEOUT_SEC = 60
+SWEEP_INTERVAL_SEC = 30
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +167,33 @@ def wait_for_count(path, needle, target, timeout):
     seen = 0
     while time.time() < deadline:
         seen = count_in(path, needle)
+        if seen >= target:
+            return seen
+        time.sleep(0.2)
+    return seen
+
+
+def count_reclaimed(path):
+    """Sessions the server has erased from its tables, by ANY path.
+
+    ``close_connection from`` covers every orderly/close-driven teardown. The
+    idle/handshake sweep never passes through close_connection -- it logs
+    ``FAIL_STAGE=SESSION_TIMEOUT ERROR=idle_timeout`` (or handshake_timeout)
+    and erases directly -- so a session reaped by the sweep is fully reclaimed
+    yet invisible to a target_drained-only count. Both families erase from
+    sessions_/connections_, so both are reclamation.
+    """
+    return (count_in(path, "close_connection from ")
+            + count_in(path, "ERROR=idle_timeout")
+            + count_in(path, "ERROR=handshake_timeout"))
+
+
+def wait_for_reclaimed(path, target, timeout):
+    """Poll until at least ``target`` sessions have been reclaimed by any path."""
+    deadline = time.time() + timeout
+    seen = 0
+    while time.time() < deadline:
+        seen = count_reclaimed(path)
         if seen >= target:
             return seen
         time.sleep(0.2)
@@ -568,6 +603,7 @@ def phase_concurrency(server_exe, client_exe, log_dir, server_threads=1,
         # measure the burst as a delta from a post-readiness baseline.
         base_created = count_in(server.log_path, "new session:")
         base_drained = count_in(server.log_path, "close_connection from target_drained")
+        base_reclaimed = count_reclaimed(server.log_path)
 
         results = {}
         threads = [threading.Thread(target=_concurrent_tunnel,
@@ -600,16 +636,48 @@ def phase_concurrency(server_exe, client_exe, log_dir, server_threads=1,
         # ...and reclaimed once its target closed (the session is erased from
         # sessions_/connections_ inside close_connection, so this proves the
         # cleanup actually happened rather than merely being scheduled).
+        #
+        # Fast path: every session reclaimed through the drained callback
+        # inside the window. That is the normal case (sub-second on loopback)
+        # and it is what proves the drain path holds under concurrency.
         drained_total = wait_for_count(server.log_path,
                                        "close_connection from target_drained",
                                        base_drained + N_CONCURRENT, 25)
         drained = drained_total - base_drained
-        if drained < N_CONCURRENT:
-            raise AssertionError(
-                "only %d/%d sessions were reclaimed after their target closed "
-                "(session/table leak)" % (drained, N_CONCURRENT))
-        print("  [ok] all %d burst sessions reclaimed (no session/table leak)"
-              % drained)
+        if drained >= N_CONCURRENT:
+            print("  [ok] all %d burst sessions reclaimed (no session/table leak)"
+                  % drained)
+        else:
+            # Do NOT call this a leak yet. A session whose final ACK was
+            # dropped by a full kernel receive queue during the burst -- with
+            # the client already gone -- can never drain: the server keeps
+            # retransmitting into a closed socket until the idle sweep reaps
+            # it, and the sweep logs SESSION_TIMEOUT instead of passing
+            # through close_connection. Counting only target_drained turns
+            # that slow-but-correct reclamation into a false leak report (a
+            # release once failed exactly this way: 99/100 at the 25s mark,
+            # the same binary green twice before and after). Wait out the
+            # slowest legitimate path -- idle timeout plus one sweep period --
+            # and only then, if the tables still hold sessions, call it a leak.
+            if not server.alive():
+                raise AssertionError(
+                    "server died while %d/%d burst sessions were still "
+                    "undrained" % (N_CONCURRENT - drained, N_CONCURRENT))
+            print("  [..] %d/%d drained within 25s; waiting for the idle-sweep "
+                  "path before calling it a leak" % (drained, N_CONCURRENT))
+            reclaimed_total = wait_for_reclaimed(
+                server.log_path, base_reclaimed + N_CONCURRENT,
+                KCP_TIMEOUT_SEC + SWEEP_INTERVAL_SEC + 10)
+            reclaimed = reclaimed_total - base_reclaimed
+            if reclaimed < N_CONCURRENT:
+                raise AssertionError(
+                    "only %d/%d burst sessions were reclaimed by ANY path "
+                    "(drained callback: %d) -- session/table leak"
+                    % (reclaimed, N_CONCURRENT, drained))
+            print("  [ok] all %d burst sessions reclaimed, but %d missed the "
+                  "25s drained window and were reaped by the idle sweep "
+                  "instead (slow drain under load, not a leak)"
+                  % (reclaimed, N_CONCURRENT - drained))
 
         # An abrupt reset (SO_LINGER 0 => RST, not FIN) must not wedge anything.
         for _ in range(N_RST):
@@ -1142,34 +1210,39 @@ def main():
     print("E2E robustness suite: server=%s" % args.server)
     log_paths = []
     try:
-        phase_wrong_key(args.server, args.client, log_dir)
+        # Register each phase's logs BEFORE running the phase. A phase that
+        # raises must leave its own evidence in the dump below (and the
+        # cleanup in ``finally`` must still find the files). Registering
+        # after the call silently drops the failing phase's logs -- which is
+        # exactly how a real CI failure once lost its only crime-scene logs.
         log_paths += [os.path.join(log_dir, "wrongkey-server.log"),
                       os.path.join(log_dir, "wrongkey-client.log")]
-        phase_garbage_flood(args.server, args.client, log_dir, echo_port)
+        phase_wrong_key(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "flood-server.log"),
                       os.path.join(log_dir, "flood-client.log")]
-        phase_concurrency(args.server, args.client, log_dir)
+        phase_garbage_flood(args.server, args.client, log_dir, echo_port)
         log_paths += [os.path.join(log_dir, "concurrency-server.log"),
                       os.path.join(log_dir, "concurrency-client.log")]
+        phase_concurrency(args.server, args.client, log_dir)
         # The strand + shared_mutex thread-safety design is claimed to hold
         # under multiple io_context workers; run the same burst against a
         # 4-thread server so that claim has runtime coverage.
-        phase_concurrency(args.server, args.client, log_dir, server_threads=4,
-                          tag="concurrency-t4")
         log_paths += [os.path.join(log_dir, "concurrency-t4-server.log"),
                       os.path.join(log_dir, "concurrency-t4-client.log")]
-        phase_half_close(args.server, args.client, log_dir)
+        phase_concurrency(args.server, args.client, log_dir, server_threads=4,
+                          tag="concurrency-t4")
         log_paths += [os.path.join(log_dir, "halfclose-server.log"),
                       os.path.join(log_dir, "halfclose-client.log")]
-        phase_big_response_target_close(args.server, args.client, log_dir)
+        phase_half_close(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "bigresp-server.log"),
                       os.path.join(log_dir, "bigresp-client.log")]
-        phase_env_key(args.server, args.client, log_dir, echo_port)
+        phase_big_response_target_close(args.server, args.client, log_dir)
         log_paths += [os.path.join(log_dir, "envkey-server.log"),
                       os.path.join(log_dir, "envkey-client.log"),
                       os.path.join(log_dir, "envkey-wrong-server.log"),
                       os.path.join(log_dir, "envkey-wrong-client.log"),
                       os.path.join(log_dir, "envkey-missing-client.log")]
+        phase_env_key(args.server, args.client, log_dir, echo_port)
 
         print("E2E ROBUSTNESS TEST PASSED")
         return 0
