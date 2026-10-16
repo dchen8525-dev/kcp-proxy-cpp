@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Validated in the main process so utils.js stays the single source of truth
   // for rules that must agree with the server (see the handler in main.js).
   validateConfig: (config) => ipcRenderer.invoke('validate-config', config),
+  // Packaged app version (drives the sidebar footer label).
+  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
   // Proxy control
   startProxy: () => ipcRenderer.invoke('start-proxy'),

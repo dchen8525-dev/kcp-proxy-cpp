@@ -213,8 +213,8 @@ UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=2
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载Windows GUI客户端：
 
 ```
-KCP-Proxy-Client-0.0.11-Setup.exe     # NSIS 安装包（推荐）
-KCP-Proxy-Client-0.0.11-Portable.exe  # 免安装单文件版
+KCP-Proxy-0.0.11-Setup.exe     # NSIS 安装包（推荐）
+KCP-Proxy-0.0.11-Portable.exe  # 免安装单文件版
 ```
 
 运行安装包，或直接运行免安装版。

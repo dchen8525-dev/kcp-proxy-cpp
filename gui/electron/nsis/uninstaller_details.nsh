@@ -1,4 +1,4 @@
-# Patched uninstaller for KCP Proxy Client.
+# Patched uninstaller for KCP Proxy.
 #
 # Base: app-builder-lib@26.15.3 templates/nsis/uninstaller.nsh, copied
 # verbatim except for un.checkAppRunning below. If electron-builder is

@@ -1,4 +1,4 @@
-# Patched install section for KCP Proxy Client.
+# Patched install section for KCP Proxy.
 #
 # Base: app-builder-lib@26.15.3 templates/nsis/installSection.nsh, copied
 # verbatim except for the changes marked "DETAILS PATCH" below. If

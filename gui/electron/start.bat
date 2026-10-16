@@ -6,5 +6,5 @@ if not exist "node_modules\" (
     call npm install
 )
 
-echo Starting KCP Proxy Client GUI...
+echo Starting KCP Proxy GUI...
 call npm start

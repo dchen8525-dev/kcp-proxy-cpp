@@ -9,87 +9,91 @@
        form-action are not covered by default-src in every engine, and nothing
        in this UI embeds a plugin, uses a <base> tag, or submits a form. -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>KCP Proxy Client</title>
+  <title>KCP Proxy</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <!-- Custom title bar -->
-  <div class="title-bar">
-    <div class="title-bar-drag">
-      <span class="title">KCP Proxy Client</span>
-      <span class="subtitle">SOCKS5 · 加密 KCP 通道</span>
-    </div>
-    <div class="title-bar-controls">
-      <button class="title-btn minimize" id="btn-minimize" title="最小化">─</button>
-      <button class="title-btn maximize" id="btn-maximize" title="最大化/还原">□</button>
-      <button class="title-btn close" id="btn-close" title="关闭">✕</button>
-    </div>
-  </div>
-
-  <!-- Main content -->
-  <div class="container">
-    <!-- Server settings card -->
-    <div class="card">
-      <div class="card-title">服务器</div>
-      <div class="form-group">
-        <label for="serverHost">地址 (IP/域名)</label>
-        <input type="text" id="serverHost" placeholder="例如: example.com">
-      </div>
-      <div class="form-row">
-        <div class="form-group half">
-          <label for="serverPort">端口</label>
-          <input type="text" id="serverPort" placeholder="8388">
-        </div>
-        <div class="form-group half">
-          <label for="localPort">本地 SOCKS 端口</label>
-          <input type="text" id="localPort" placeholder="1080">
+  <div class="app">
+    <!-- Custom title bar -->
+    <header class="titlebar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="7.5" stroke="#26221a" stroke-width="1.4"/><path d="M2.5 12h19" stroke="#26221a" stroke-width="1.4"/><circle cx="12" cy="12" r="2.2" fill="#b5432f"/></svg>
+        <div class="brand-text">
+          <div class="brand-title">KCP Proxy</div>
+          <div class="brand-sub">SOCKS5 OVER KCP</div>
         </div>
       </div>
-    </div>
+      <div class="title-bar-controls">
+        <button class="title-btn minimize" id="btn-minimize" title="最小化">─</button>
+        <button class="title-btn maximize" id="btn-maximize" title="最大化/还原">□</button>
+        <button class="title-btn close" id="btn-close" title="关闭">✕</button>
+      </div>
+    </header>
 
-    <!-- Key settings card -->
-    <div class="card">
-      <div class="card-title">密钥</div>
-      <div class="form-group">
-        <label for="keySuffix">密钥后缀（完整密钥 = 北京日期 + 后缀）</label>
-        <input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线">
-      </div>
-    </div>
+    <div class="body">
+      <!-- Sidebar -->
+      <aside class="side">
+        <div>
+          <div class="cap">导 航</div>
+          <nav class="nav">
+            <a class="on" role="button" tabindex="0" aria-current="page" data-v="v-home"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6"/><path d="M8 8 11 5"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/></svg>概览</a>
+            <a role="button" tabindex="0" data-v="v-conf"><svg viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/><circle cx="6" cy="4" r="1.4"/><circle cx="10" cy="8" r="1.4"/><circle cx="5" cy="12" r="1.4"/></svg>连接设置</a>
+            <a role="button" tabindex="0" data-v="v-log"><svg viewBox="0 0 16 16"><rect x="3" y="2" width="10" height="12" rx="1"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3"/></svg>运行日志</a>
+          </nav>
+        </div>
+        <div class="foot" id="side-foot">v0.0.11 · 纸感墨白</div>
+      </aside>
 
-    <!-- Action area: options (left) + action buttons (right); settings auto-save -->
-    <div class="action-row">
-      <div class="checkbox-row">
-        <label class="checkbox-label">
-          <input type="checkbox" id="autoReconnect">
-          <span class="checkbox-custom"></span>
-          <span>断线重连</span>
-        </label>
-      </div>
-      <div class="button-group">
-        <button class="btn btn-secondary" id="btn-test">测试连接</button>
-        <button class="btn btn-primary" id="btn-start">启动代理</button>
-        <button class="btn btn-danger" id="btn-stop" disabled>停止代理</button>
-      </div>
-    </div>
+      <!-- Main -->
+      <main class="main">
+        <!-- 概览 -->
+        <section class="view" id="v-home">
+          <div class="eyebrow">当前状态</div>
+          <h1 class="status"><span class="seal" id="status-dot"></span><span id="status-text">未运行</span></h1>
+          <div class="status-sub">SOCKS5 over KCP 加密隧道 · 每日密钥自动轮换</div>
+          <hr class="rule"/>
+          <dl class="kv">
+            <div><dt>本地 SOCKS5</dt><dd><code id="ov-socks">socks5://127.0.0.1:1080</code></dd></div>
+            <div><dt>上游服务器</dt><dd><code id="ov-upstream">—</code></dd></div>
+            <div><dt>密钥模式</dt><dd><code>每日密钥（北京日期 + 后缀）</code></dd></div>
+          </dl>
+          <div class="actions">
+            <button class="btn btn-fill" id="btn-start">启动代理</button>
+            <button class="btn btn-dark" id="btn-stop" disabled>停止代理</button>
+            <button class="btn btn-line" id="btn-test">测试连接</button>
+            <span class="traffic-indicator" id="traffic-indicator" hidden>
+              <span class="traffic-up">↑ 0 B</span>
+              <span class="traffic-down">↓ 0 B</span>
+            </span>
+          </div>
+        </section>
 
-    <!-- Status + traffic indicator -->
-    <div class="status-row">
-      <div class="status-indicator">
-        <span class="status-dot" id="status-dot"></span>
-        <span class="status-text" id="status-text">未运行</span>
-      </div>
-      <div class="traffic-indicator" id="traffic-indicator" hidden>
-        <span class="traffic-up">↑ 0 B</span>
-        <span class="traffic-down">↓ 0 B</span>
-      </div>
-    </div>
+        <!-- 连接设置 -->
+        <section class="view" id="v-conf" hidden>
+          <h2 class="view-title">连接设置</h2>
+          <div class="view-sub">修改后自动保存，重连生效。</div>
+          <div class="grid2">
+            <div class="fld"><label for="serverHost">服务器地址 (IP/域名)</label><input type="text" id="serverHost" placeholder="例如: example.com" spellcheck="false"/></div>
+            <div class="fld"><label for="serverPort">服务器端口</label><input type="text" id="serverPort" placeholder="8388" inputmode="numeric"/></div>
+            <div class="fld"><label for="localPort">本地 SOCKS 端口</label><input type="text" id="localPort" placeholder="1080" inputmode="numeric"/></div>
+            <div class="fld"><label for="keySuffix">密钥后缀</label><input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线" spellcheck="false"/></div>
+          </div>
+          <div class="checks">
+            <label class="checkbox-label"><input type="checkbox" id="autoReconnect"/><span class="checkbox-custom"></span><span>断线重连</span></label>
+          </div>
+          <div class="note">完整密钥 = 北京日期 (YYYYMMDD) + 后缀。固定密钥（<code>-k</code>）仅在命令行客户端可用。</div>
+        </section>
 
-    <!-- Log card (expanded by default; click the title to toggle) -->
-    <div class="card log-card" id="log-card">
-      <div class="card-title log-toggle" id="log-toggle" title="点击展开/收起日志">
-        日志 <span class="log-chevron">▾</span>
-      </div>
-      <div class="log-container" id="log-container"></div>
+        <!-- 运行日志 -->
+        <section class="view" id="v-log" hidden>
+          <h2 class="view-title">运行日志</h2>
+          <div class="view-sub">自动滚动跟随尾部 · 保留最近 1000 行</div>
+          <div class="log-card" id="log-card">
+            <div class="log-toggle" id="log-toggle" role="button" tabindex="0" title="点击展开/收起日志">运行日志 <span class="log-chevron">▾</span></div>
+            <div class="log-container" id="log-container"></div>
+          </div>
+        </section>
+      </main>
     </div>
   </div>
 

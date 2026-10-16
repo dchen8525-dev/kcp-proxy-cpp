@@ -18,7 +18,10 @@ const elements = {
   trafficDown: document.querySelector('.traffic-down'),
   logCard: document.getElementById('log-card'),
   logToggle: document.getElementById('log-toggle'),
-  logContainer: document.getElementById('log-container')
+  logContainer: document.getElementById('log-container'),
+  ovSocks: document.getElementById('ov-socks'),
+  ovUpstream: document.getElementById('ov-upstream'),
+  sideFoot: document.getElementById('side-foot')
 };
 
 // State
@@ -27,6 +30,11 @@ let isRunning = false;
 
 // Initialize
 async function init() {
+  // The sidebar is pure DOM, so wire it before any bridge check — that keeps
+  // navigation working even in a bare browser preview where electronAPI is
+  // absent (the rest of the controls need the bridge and stay inert there).
+  setupNav();
+
   if (!window.electronAPI) {
     // The preload failed (e.g. sandboxed require of a local module). Without
     // the bridge nothing can work — say so instead of leaving every button
@@ -52,6 +60,13 @@ async function init() {
     appendLog(`读取配置失败: ${err.message}`, 'error');
   }
 
+  // Cosmetic: replace the hardcoded fallback in the sidebar footer with the
+  // real packaged version so it never drifts on a release.
+  try {
+    const version = await window.electronAPI.getAppVersion();
+    if (version) elements.sideFoot.textContent = `v${version} · 纸感墨白`;
+  } catch { /* version label is cosmetic — keep the HTML fallback */ }
+
   appendLog('提示：填写完成后点击「启动代理」即可。', 'info');
 }
 
@@ -62,6 +77,46 @@ function populateForm(config) {
   elements.localPort.value = config.localPort || '1080';
   elements.keySuffix.value = config.keySuffix || '';
   elements.autoReconnect.checked = config.autoReconnect !== false;
+  refreshOverview();
+}
+
+// Keep the overview's read-only summary in sync with the form values.
+function refreshOverview() {
+  const localPort = elements.localPort.value.trim() || '1080';
+  elements.ovSocks.textContent = `socks5://127.0.0.1:${localPort}`;
+
+  const host = elements.serverHost.value.trim();
+  const serverPort = elements.serverPort.value.trim() || '8388';
+  elements.ovUpstream.textContent = host ? `${host}:${serverPort}` : '—';
+}
+
+// Sidebar view switching: show the section whose id matches the nav link's
+// data-v, and mark that link active. The mockup uses the same data-v contract.
+function setupNav() {
+  const links = document.querySelectorAll('.nav a[data-v]');
+  const views = document.querySelectorAll('.view');
+
+  const activate = (a) => {
+    links.forEach((x) => {
+      x.classList.remove('on');
+      x.removeAttribute('aria-current');
+    });
+    a.classList.add('on');
+    a.setAttribute('aria-current', 'page');
+    views.forEach((v) => { v.hidden = v.id !== a.dataset.v; });
+  };
+
+  links.forEach((a) => {
+    a.addEventListener('click', () => activate(a));
+    // The links carry role="button" + tabindex (no href), so Enter/Space must
+    // activate them — a real <a href> would handle this for free.
+    a.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        activate(a);
+      }
+    });
+  });
 }
 
 // Setup event listeners
@@ -95,8 +150,14 @@ function setupEventListeners() {
   elements.autoReconnect.addEventListener('change', saveSettings);
 
   // Log panel: expanded by default, the title toggles it
-  elements.logToggle.addEventListener('click', () => {
-    elements.logCard.classList.toggle('collapsed');
+  const toggleLog = () => elements.logCard.classList.toggle('collapsed');
+  elements.logToggle.addEventListener('click', toggleLog);
+  // log-toggle carries role="button" + tabindex, so Enter/Space must toggle too.
+  elements.logToggle.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      toggleLog();
+    }
   });
 }
 
@@ -147,6 +208,7 @@ async function saveSettings() {
   // persisting them is best-effort, so a failed write must not leave `config`
   // describing the previous values.
   config = newConfig;
+  refreshOverview();
   try {
     await window.electronAPI.saveConfig(newConfig);
   } catch (err) {

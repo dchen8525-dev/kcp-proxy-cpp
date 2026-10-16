@@ -1,4 +1,4 @@
-# Custom NSIS include hook for KCP Proxy Client (electron-builder nsis.include).
+# Custom NSIS include hook for KCP Proxy (electron-builder nsis.include).
 #
 # Besides the attribute below, the mere existence of this file matters:
 # electron-builder only adds the build/ directory to the makensis include

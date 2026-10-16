@@ -191,13 +191,17 @@ function generateKey() {
 // Create main window
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 520,
-    height: 680,
-    minWidth: 480,
-    minHeight: 600,
+    // Wide enough for the porcelain sidebar (190px) + main column. The old
+    // 520px single-column size left only ~220px of usable content once the
+    // sidebar took its cut, overflowing the overview kv rows (a long
+    // socks5:// URL) and forcing a horizontal scrollbar on .main.
+    width: 760,
+    height: 720,
+    minWidth: 620,
+    minHeight: 620,
     frame: false, // Frameless for custom title bar
     transparent: false,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#f7f3ea',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -247,7 +251,7 @@ function createWindow() {
     if (process.argv.includes('--hidden')) {
       if (!store.get('hasHiddenOnce')) {
         tray?.displayBalloon({
-          title: 'KCP Proxy Client',
+          title: 'KCP Proxy',
           content: '程序已随系统启动并最小化到系统托盘，点击托盘图标可打开主界面'
         });
         store.set('hasHiddenOnce', true);
@@ -269,7 +273,7 @@ function createWindow() {
     // Show notification on first hide
     if (!store.get('hasHiddenOnce')) {
       tray?.displayBalloon({
-        title: 'KCP Proxy Client',
+        title: 'KCP Proxy',
         content: '程序已最小化到系统托盘，点击托盘图标可重新打开'
       });
       store.set('hasHiddenOnce', true);
@@ -366,7 +370,7 @@ function createTray() {
     }
   ]);
 
-  tray.setToolTip('KCP Proxy Client');
+  tray.setToolTip('KCP Proxy');
   tray.setContextMenu(contextMenu);
   trayMenu = contextMenu;
 
@@ -695,7 +699,7 @@ function updateStatus(running) {
   // Update tray icon and tooltip
   const statusIcon = createStatusIcon(running);
   tray?.setImage(statusIcon.resize({ width: 16, height: 16 }));
-  tray?.setToolTip(running ? 'KCP Proxy Client (运行中)' : 'KCP Proxy Client (未运行)');
+  tray?.setToolTip(running ? 'KCP Proxy (运行中)' : 'KCP Proxy (未运行)');
 
   // Update tray menu. Address items by id, not by array index: the template
   // grows over time and index-based access silently toggles the wrong item
@@ -841,6 +845,10 @@ ipcMain.handle('stop-proxy', async () => {
 });
 
 ipcMain.handle('get-status', () => isRunning);
+
+// Packaged version for the sidebar footer. The HTML ships a hardcoded fallback
+// that would drift on every release; this keeps the label truthful.
+ipcMain.handle('get-app-version', () => app.getVersion());
 
 // Test connection to the server. The server listens on UDP, so a TCP connect
 // proves nothing (it would RST against a perfectly healthy server, or false-

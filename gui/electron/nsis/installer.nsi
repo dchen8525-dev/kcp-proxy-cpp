@@ -1,4 +1,4 @@
-# Custom NSIS script for KCP Proxy Client (electron-builder nsis.script).
+# Custom NSIS script for KCP Proxy (electron-builder nsis.script).
 #
 # Base: app-builder-lib@26.15.3 templates/nsis/installer.nsi, copied verbatim
 # except for the changes marked "DETAILS PATCH" below. If electron-builder is

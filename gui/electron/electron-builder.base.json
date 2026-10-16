@@ -1,6 +1,6 @@
 {
   "appId": "com.kcp-proxy.gui",
-  "productName": "KCP Proxy Client",
+  "productName": "KCP Proxy",
   "copyright": "Copyright © 2024 kcp-proxy",
   "directories": {
     "output": "dist"

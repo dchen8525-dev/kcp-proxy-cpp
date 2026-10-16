@@ -1,4 +1,4 @@
-# KCP Proxy Client - Electron GUI
+# KCP Proxy - Electron GUI
 
 基于 Electron 的现代化 GUI 客户端，支持 Windows 和 Linux 平台。
 
@@ -30,7 +30,7 @@ npm start
 npm run build:win
 ```
 
-打包结果：`dist/KCP-Proxy-Client-<版本>-Setup.exe`
+打包结果：`dist/KCP-Proxy-<版本>-Setup.exe`
 
 安装程序为完整向导（非一键安装）：
 - 可选安装目录
@@ -42,13 +42,13 @@ npm run build:win
 npm run build:linux
 ```
 
-打包结果：`dist/KCP-Proxy-Client-<版本>.AppImage`
+打包结果：`dist/KCP-Proxy-<版本>.AppImage`
 
 ## 配置文件
 
 配置保存在 Electron 的 `userData` 目录下（`config.json`）：
-- Windows 打包版: `%APPDATA%/KCP Proxy Client/config.json`
-- Linux 打包版: `~/.config/KCP Proxy Client/config.json`
+- Windows 打包版: `%APPDATA%/KCP Proxy/config.json`
+- Linux 打包版: `~/.config/KCP Proxy/config.json`
 - 开发模式（`npm start`）: 目录名为 `kcp-proxy-gui`
 
 ## 功能说明

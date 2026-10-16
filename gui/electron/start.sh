@@ -8,5 +8,5 @@ if [ ! -d "node_modules" ]; then
     npm install
 fi
 
-echo "Starting KCP Proxy Client GUI..."
+echo "Starting KCP Proxy GUI..."
 npm start
