@@ -138,11 +138,11 @@ cmake --build --preset release --parallel
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载最新的deb包：
 
 ```bash
-# 下载deb包（以v0.0.10为例）
-wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.10/kcp-proxy-server_0.0.10_amd64.deb
+# 下载deb包（以v0.0.11为例）
+wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.11/kcp-proxy-server_0.0.11_amd64.deb
 
 # 安装
-sudo dpkg -i kcp-proxy-server_0.0.10_amd64.deb
+sudo dpkg -i kcp-proxy-server_0.0.11_amd64.deb
 
 # 启动服务
 sudo systemctl start kcp-proxy-server
@@ -213,8 +213,8 @@ UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=2
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载Windows GUI客户端：
 
 ```
-KCP-Proxy-Client-0.0.10-Setup.exe     # NSIS 安装包（推荐）
-KCP-Proxy-Client-0.0.10-Portable.exe  # 免安装单文件版
+KCP-Proxy-Client-0.0.11-Setup.exe     # NSIS 安装包（推荐）
+KCP-Proxy-Client-0.0.11-Portable.exe  # 免安装单文件版
 ```
 
 运行安装包，或直接运行免安装版。
