@@ -840,7 +840,7 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
 
     # The generated suffix must actually land in server.env, and the file must
     # stay 0600 -- it holds the long-lived half of the daily key.
-    require('sed -i "s|^SUFFIX=.*' in postinst,
+    require('sed "s|^SUFFIX=.*|SUFFIX=$gen_suffix|"' in postinst,
             "postinst must write the generated suffix into the existing "
             "server.env via sed (a full-file rewrite would clobber PORT/HOST)")
     require("chmod 600" in postinst,
@@ -851,9 +851,13 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import beijing_timer_schedule_check as bj
 
-    i = postinst.index('        cur_suffix=""')
+    i = postinst.index('        env_file="/etc/kcp-proxy/server.env"')
     j = postinst.index("systemctl reset-failed", i)
     block = postinst[i:j]
+    require("sed -i" not in block,
+            "the suffix block must not use sed -i: BSD sed takes the next "
+            "argument as the backup suffix and silently modifies nothing "
+            "(the first 0.0.20 CI run failed on macos for exactly this)")
 
     shell = bj.resolve_shell("bash")
     if shell:

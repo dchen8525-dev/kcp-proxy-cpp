@@ -422,22 +422,30 @@ case "$1" in
         # server.env and tried to restart by hand. Generate a machine-local
         # random suffix instead so a fresh `apt install` comes up on the very
         # first restart; an already-configured suffix is left untouched.
+        env_file="{ENV_FILE}"
         cur_suffix=""
-        if [ -f {ENV_FILE} ]; then
-            cur_suffix=$(grep -E '^SUFFIX=' {ENV_FILE} | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
+        if [ -f "$env_file" ]; then
+            cur_suffix=$(grep -E '^SUFFIX=' "$env_file" | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
         fi
         if [ -z "$cur_suffix" ]; then
-            # 64 random bytes -> 128 hex chars -> keep 24. od+tr is POSIX;
-            # /dev/urandom exists on every Linux host this deb targets.
-            gen_suffix=$(head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \\n' | cut -c1-24)
+            # 2048 random bytes squeezed down to their hex digits (~128 chars
+            # survive on average), keep 24. tr -dc + head -c behave identically
+            # on GNU and BSD userland; the od option spelling and in-place sed
+            # do NOT (BSD sed in-place mode eats the next argument as the
+            # backup suffix and silently modifies nothing -- that is how the
+            # first 0.0.20 CI run failed on macos).
+            gen_suffix=$(head -c 2048 /dev/urandom | tr -dc 'a-f0-9' | head -c 24)
             if [ -n "$gen_suffix" ]; then
                 mkdir -p {ENV_DIR}
-                if [ -f {ENV_FILE} ]; then
-                    sed -i "s|^SUFFIX=.*|SUFFIX=$gen_suffix|" {ENV_FILE}
+                if [ -f "$env_file" ]; then
+                    # Rewrite via temp+mv: the only in-place form GNU and BSD
+                    # sed agree on.
+                    sed "s|^SUFFIX=.*|SUFFIX=$gen_suffix|" "$env_file" > "$env_file.tmp" \\
+                        && mv -f "$env_file.tmp" "$env_file"
                 else
-                    printf 'SUFFIX=%s\\n' "$gen_suffix" > {ENV_FILE}
+                    printf 'SUFFIX=%s\\n' "$gen_suffix" > "$env_file"
                 fi
-                chmod 600 {ENV_FILE}
+                chmod 600 "$env_file"
                 echo "kcp-proxy-server: no SUFFIX configured -- generated a random" >&2
                 echo "  one in {ENV_FILE}. Full daily key = Beijing date (YYYYMMDD)" >&2
                 echo "  + that suffix. Read it with:" >&2
