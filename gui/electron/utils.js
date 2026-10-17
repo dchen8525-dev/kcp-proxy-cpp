@@ -3,6 +3,9 @@
 // Pure helpers shared between the Electron main process (main.js) and unit
 // tests. No Electron imports — keep this file dependency-free.
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 // Beijing date (YYYYMMDD) for the "daily key" mode. Beijing is UTC+8.
 function getBeijingDate(now = new Date()) {
   const beijing = new Date(now.getTime() + (8 * 60 * 60 * 1000));
@@ -80,6 +83,23 @@ function buildClientEnv(key, baseEnv = process.env) {
   return { ...baseEnv, KCP_PROXY_KEY: key };
 }
 
+// Resolve the app icon asset for the window/tray. The Electron main process
+// looks in the app directory first (dev and unpacked builds) and then in
+// process.resourcesPath (where some packaging layouts relocate assets).
+// PNG is preferred over ICO: it decodes on every platform, while the ICO is
+// the Windows-only multi-size ladder. Returns null when no asset exists —
+// the caller decides how to degrade (window: Electron default; tray: skip).
+function resolveAppIconPath(appDir, resourcesDir, exists = fs.existsSync) {
+  for (const dir of [appDir, resourcesDir]) {
+    if (!dir) continue;
+    for (const name of ['icon.png', 'icon.ico']) {
+      const candidate = path.join(dir, 'assets', name);
+      if (exists(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
 module.exports = {
   getBeijingDate,
   generateKey,
@@ -88,6 +108,7 @@ module.exports = {
   validateLaunchConfig,
   buildClientArgs,
   buildClientEnv,
+  resolveAppIconPath,
   SUFFIX_RE,
   FIXED_KEY_RE
 };

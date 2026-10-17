@@ -4,8 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const dns = require('dns');
 const net = require('net');
-const zlib = require('zlib');
-const { generateKey: buildKey, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes } = require('./utils');
+const { generateKey: buildKey, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, resolveAppIconPath } = require('./utils');
 
 // Auto-updater (electron-updater) — loaded lazily to keep dev/preview simple.
 let autoUpdater = null;
@@ -295,32 +294,26 @@ function createWindow() {
 
 // Create system tray
 function createTray() {
-  let icon;
-
-  // Try multiple icon paths
-  const iconPaths = [
-    path.join(__dirname, 'assets/icon.png'),
-    path.join(__dirname, 'assets/icon.ico'),
-    path.join(process.resourcesPath, 'assets/icon.png'),
-    path.join(process.resourcesPath, 'assets/icon.ico')
-  ];
-
-  for (const iconPath of iconPaths) {
-    if (fs.existsSync(iconPath)) {
-      try {
-        icon = nativeImage.createFromPath(iconPath);
-        if (!icon.isEmpty()) {
-          break;
-        }
-      } catch (err) {
-        console.error('Failed to load icon:', iconPath, err);
-      }
-    }
+  // The tray shows the app icon itself. It used to be overwritten with a
+  // programmatic green/gray dot on every status change, which hid the brand
+  // icon entirely (and read as "the old icon" after the icon redesign).
+  // Status now lives in the tooltip and the start/stop menu items.
+  const iconPath = resolveAppIconPath(__dirname, process.resourcesPath);
+  if (!iconPath) {
+    console.error('tray icon asset not found (assets/icon.png|ico) — tray disabled');
+    return;
   }
 
-  // Fallback: create icons programmatically (running = green, stopped = gray)
+  let icon;
+  try {
+    icon = nativeImage.createFromPath(iconPath);
+  } catch (err) {
+    console.error('Failed to load tray icon:', iconPath, err);
+    return;
+  }
   if (!icon || icon.isEmpty()) {
-    icon = createStatusIcon(false); // Start with stopped icon
+    console.error('Tray icon is empty:', iconPath);
+    return;
   }
 
   try {
@@ -378,94 +371,6 @@ function createTray() {
     mainWindow?.show();
     mainWindow?.focus();
   });
-}
-
-// Minimal RGBA PNG encoder (zlib-based). nativeImage does NOT decode SVG data
-// URLs (returns an empty image), so the status icon is emitted as a real PNG
-// buffer instead of an <svg> string.
-function encodePng(rgba, width, height) {
-  // PNG signature
-  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-  // IHDR: 8-bit RGBA, no interlace
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // color type RGBA
-  ihdr[10] = 0; // compression
-  ihdr[11] = 0; // filter
-  ihdr[12] = 0; // interlace
-
-  // Raw image: each scanline prefixed with filter byte 0
-  const stride = width * 4;
-  const raw = Buffer.alloc((stride + 1) * height);
-  for (let y = 0; y < height; y++) {
-    raw[y * (stride + 1)] = 0;
-    rgba.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
-  }
-  const idat = zlib.deflateSync(raw);
-
-  const chunk = (type, data) => {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(data.length, 0);
-    const typeBuf = Buffer.from(type, 'ascii');
-    const crc = Buffer.alloc(4);
-    crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
-    return Buffer.concat([len, typeBuf, data, crc]);
-  };
-
-  return Buffer.concat([
-    signature,
-    chunk('IHDR', ihdr),
-    chunk('IDAT', idat),
-    chunk('IEND', Buffer.alloc(0))
-  ]);
-}
-
-const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[n] = c;
-  }
-  return table;
-})();
-
-function crc32(buf) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    crc = CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-// Create status icon programmatically (green = running, gray = stopped)
-function createStatusIcon(running) {
-  const color = running ? [0x10, 0x7c, 0x10, 0xff] : [0x61, 0x61, 0x61, 0xff]; // Green or Gray
-  const size = 16;
-  const cx = 8, cy = 8, r = 6.5; // 16x16 circle with 1.5px margin
-
-  // Build RGBA pixel buffer (transparent background + solid circle)
-  const pixels = Buffer.alloc(size * size * 4);
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const dx = x + 0.5 - cx;
-      const dy = y + 0.5 - cy;
-      const off = (y * size + x) * 4;
-      if (Math.sqrt(dx * dx + dy * dy) <= r) {
-        pixels[off] = color[0];
-        pixels[off + 1] = color[1];
-        pixels[off + 2] = color[2];
-        pixels[off + 3] = color[3];
-      }
-    }
-  }
-
-  return nativeImage.createFromBuffer(encodePng(pixels, size, size));
 }
 
 // Start proxy client process
@@ -696,9 +601,8 @@ function scheduleReconnect() {
 function updateStatus(running) {
   mainWindow?.webContents.send('status-update', running);
 
-  // Update tray icon and tooltip
-  const statusIcon = createStatusIcon(running);
-  tray?.setImage(statusIcon.resize({ width: 16, height: 16 }));
+  // Update tray tooltip. The tray IMAGE is static — it is the app icon set
+  // once in createTray(); status is carried by the tooltip and the menu.
   tray?.setToolTip(running ? 'KCP Proxy (运行中)' : 'KCP Proxy (未运行)');
 
   // Update tray menu. Address items by id, not by array index: the template

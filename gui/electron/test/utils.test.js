@@ -8,7 +8,8 @@ const {
   generateKey,
   formatBytes,
   isValidPort,
-  validateLaunchConfig
+  validateLaunchConfig,
+  resolveAppIconPath
 } = require('../utils.js');
 
 test('getBeijingDate formats Beijing date as YYYYMMDD', () => {
@@ -134,4 +135,66 @@ test('validateLaunchConfig rejects invalid suffix characters in daily mode', () 
     serverHost: 'h', serverPort: '8388', localPort: '1080',
     keyMode: 'daily', keySuffix: 'bad suffix!!'
   }));
+});
+
+// ---------------------------------------------------------------------------
+// resolveAppIconPath — the window/tray icon lookup used by main.js.
+// The tray regression this pins: the icon must come from the packaged asset
+// (assets/icon.png preferred, icon.ico as the Windows fallback), never from a
+// programmatic substitute that hides the brand icon.
+// ---------------------------------------------------------------------------
+
+// Fake filesystem: only the listed paths exist. Returns the exists() callback.
+function fakeExists(paths) {
+  const set = new Set(paths.map((p) => p.replaceAll('\\', '/')));
+  return (p) => set.has(p.replaceAll('\\', '/'));
+}
+
+// path.join emits the platform separator (backslash on Windows), so compare
+// the resolved path through a normalizer instead of literal strings.
+const norm = (p) => (p === null ? null : p.replaceAll('\\', '/'));
+
+test('resolveAppIconPath prefers the app dir PNG over the ICO', () => {
+  const exists = fakeExists([
+    '/app/assets/icon.png',
+    '/app/assets/icon.ico'
+  ]);
+  assert.strictEqual(
+    norm(resolveAppIconPath('/app', null, exists)),
+    '/app/assets/icon.png'
+  );
+});
+
+test('resolveAppIconPath falls back to the ICO when the PNG is absent', () => {
+  const exists = fakeExists(['/app/assets/icon.ico']);
+  assert.strictEqual(
+    norm(resolveAppIconPath('/app', null, exists)),
+    '/app/assets/icon.ico'
+  );
+});
+
+test('resolveAppIconPath falls back to resourcesPath after the app dir', () => {
+  // Nothing under the app dir; the packaged layout keeps assets in resources.
+  const exists = fakeExists(['/resources/assets/icon.png']);
+  assert.strictEqual(
+    norm(resolveAppIconPath('/app', '/resources', exists)),
+    '/resources/assets/icon.png'
+  );
+});
+
+test('resolveAppIconPath returns null when no icon asset exists', () => {
+  // A null result must make the caller degrade loudly (skip the tray), not
+  // silently substitute a different-looking icon.
+  assert.strictEqual(
+    resolveAppIconPath('/app', '/resources', fakeExists([])),
+    null
+  );
+});
+
+test('resolveAppIconPath tolerates a missing resourcesDir (dev mode)', () => {
+  const exists = fakeExists(['/app/assets/icon.png']);
+  assert.strictEqual(
+    norm(resolveAppIconPath('/app', undefined, exists)),
+    '/app/assets/icon.png'
+  );
 });

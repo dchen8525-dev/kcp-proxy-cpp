@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import re
+import struct
 import subprocess
 import sys
 import tarfile
@@ -457,6 +458,93 @@ def test_versions_agree():
             "gui/electron/package.json version must match CMakeLists.txt")
 
 
+# --------------------------------------------------------------------------- #
+# GUI icon assets (taskbar / tray)
+# --------------------------------------------------------------------------- #
+def test_gui_icon_assets_are_valid():
+    """The 2026-10-17 incident: the shipped 米纸白 tile read as a white square
+    at taskbar size and the tray never showed the app icon. These checks pin
+    the shape of the assets so a regeneration cannot silently ship a broken,
+    truncated or low-contrast icon again."""
+    assets = ROOT / "gui" / "electron" / "assets"
+
+    png = (assets / "icon.png").read_bytes()
+    require(png[:8] == b"\x89PNG\r\n\x1a\n", "icon.png is not a PNG file")
+    require(len(png) >= 24, "icon.png is truncated")
+    width, height = struct.unpack(">II", png[16:24])
+    require((width, height) == (512, 512),
+            f"icon.png must be a 512x512 master, got {width}x{height}")
+    require(png[25] == 6,
+            f"icon.png must be 8-bit RGBA (color type 6), got {png[25]}")
+
+    ico = (assets / "icon.ico").read_bytes()
+    require(ico[:4] == b"\x00\x00\x01\x00",
+            "icon.ico must start with the ICO magic (reserved=0, type=1)")
+    count = struct.unpack("<H", ico[4:6])[0]
+    require(count >= 4, f"icon.ico must carry at least 4 sizes, got {count}")
+    sizes = []
+    for i in range(count):
+        off = 6 + i * 16
+        w, _h, _ncol, _res, _planes, bpp, size, offset = struct.unpack(
+            "<BBBBHHII", ico[off:off + 16])
+        entry = ico[offset:offset + size]
+        is_png = entry[:8] == b"\x89PNG\r\n\x1a\n"
+        is_bmp = len(entry) >= 4 and struct.unpack("<I", entry[:4])[0] == 40
+        require(is_png or is_bmp,
+                f"icon.ico entry {i} is neither a PNG nor a BMP payload")
+        require(bpp == 32, f"icon.ico entry {i} must be 32bpp, got {bpp}")
+        sizes.append(w or 256)
+    require(256 in sizes,
+            "icon.ico must contain a 256x256 entry (Windows shell requirement)")
+    require(16 in sizes,
+            "icon.ico must contain a 16x16 entry (tray / small taskbar)")
+
+    svg = (assets / "icon.svg").read_text(encoding="utf-8")
+    for color in ("#26221a", "#b5432f"):
+        require(color in svg,
+                f"icon.svg must keep the styles.css palette color {color}")
+
+
+def test_gui_builder_and_tray_icons_wired():
+    """The runtime window/tray icon comes from assets/icon.png, and the EXE /
+    shortcut icon is embedded by electron-builder. A wrong path or format here
+    silently falls back to the default Electron icon -- a white square in the
+    taskbar, exactly the reported symptom."""
+    base = json.loads(read("gui/electron/electron-builder.base.json"))
+    for pattern in ("assets/*.png", "assets/*.ico"):
+        require(pattern in base["files"],
+                f"electron-builder.base.json must package {pattern}")
+
+    win = json.loads(read("gui/electron/electron-builder.win.json"))
+    portable = json.loads(read("gui/electron/electron-builder.portable.json"))
+    linux = json.loads(read("gui/electron/electron-builder.linux.json"))
+
+    # rcedit embeds the Windows EXE icon and wants a classic multi-size .ico;
+    # the ICO is also the documented format and skips the icons-CLI conversion.
+    require(win["win"]["icon"] == "assets/icon.ico",
+            "electron-builder.win.json win.icon must be assets/icon.ico")
+    require(portable["win"]["icon"] == "assets/icon.ico",
+            "electron-builder.portable.json win.icon must be assets/icon.ico")
+    require(linux["linux"]["icon"] == "assets/icon.png",
+            "electron-builder.linux.json linux.icon must be assets/icon.png")
+
+    for config, key in ((win, "win"), (portable, "win"), (linux, "linux")):
+        rel = config[key]["icon"]
+        require((ROOT / "gui" / "electron" / rel).is_file(),
+                f"{rel} referenced by the {key} builder config does not exist")
+
+    # The tray regression itself, frozen as a contract: the tray image is the
+    # app icon resolved from the packaged assets, and nothing may override it
+    # with a programmatic substitute (that is how the icon disappeared).
+    main_js = read("gui/electron/main.js")
+    require("resolveAppIconPath" in main_js,
+            "main.js must resolve the tray icon through resolveAppIconPath")
+    require("setImage" not in main_js,
+            "main.js must not override the tray image (status lives in the tooltip)")
+    require("createStatusIcon" not in main_js,
+            "main.js must not carry the retired programmatic status-icon code")
+
+
 def test_suffix_validation_agrees():
     """The shell and Python halves of the suffix rule must not drift: the
     installer validates it on the server, deploy.py validates it before upload."""
@@ -538,6 +626,8 @@ TESTS = [
     test_udp_buffer_ceiling_agrees,
     test_vcpkg_pins_agree,
     test_versions_agree,
+    test_gui_icon_assets_are_valid,
+    test_gui_builder_and_tray_icons_wired,
     test_suffix_validation_agrees,
     test_ci_runs_this_suite_and_the_whitespace_check,
     test_archive_members,

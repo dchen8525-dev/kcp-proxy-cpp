@@ -2,7 +2,7 @@
   "extends": "./electron-builder.win.json",
   "win": {
     "target": "portable",
-    "icon": "assets/icon.png",
+    "icon": "assets/icon.ico",
     "artifactName": "KCP-Proxy-${version}-Portable.${ext}"
   }
 }

@@ -1,6 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <!-- KCP Proxy Client · Porcelain icon source (matches icon.png/icon.ico) -->
-  <rect x="0" y="0" width="256" height="256" rx="57.6" fill="#f7f3ea"/>
-  <rect x="0.75" y="0.75" width="254.5" height="254.5" rx="56.9" fill="none" stroke="#e3dbc7" stroke-width="1.5"/>
-  <polygon points="137.7,48.6 71.3,141.0 106.9,141.0 100.5,207.4 184.7,110.2 144.2,110.2" fill="#b5432f" stroke="#26221a" stroke-width="6.9" stroke-linejoin="round"/>
+  <!-- KCP Proxy Client · 墨底朱砂 icon source (matches icon.png/icon.ico) -->
+  <!-- Ink tile + cinnabar bolt: legible at 16px taskbar/tray sizes on any theme.
+       Palette mirrors gui/electron/styles.css (ink/cinnabar/paper-2). -->
+  <rect x="0" y="0" width="256" height="256" rx="57.6" fill="#26221a"/>
+  <rect x="0.8" y="0.8" width="254.5" height="254.5" rx="56.9" fill="none" stroke="#3a342a" stroke-width="1.5"/>
+  <polygon points="138.1,69.8 88.4,138.9 115.0,138.9 110.3,188.6 173.2,115.9 142.9,115.9" fill="#b5432f" stroke="#fffdf7" stroke-width="4.1" stroke-linejoin="round"/>
 </svg>
