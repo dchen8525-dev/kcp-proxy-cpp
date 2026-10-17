@@ -138,8 +138,8 @@ cmake --build --preset release --parallel
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载最新的deb包：
 
 ```bash
-# 下载deb包（以v0.0.13为例）
-wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.13/kcp-proxy-server_0.0.13_amd64.deb
+# 下载deb包（以v0.0.14为例）
+wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.14/kcp-proxy-server_0.0.14_amd64.deb
 
 # 安装
 sudo dpkg -i kcp-proxy-server_0.0.11_amd64.deb
