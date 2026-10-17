@@ -334,6 +334,35 @@ code {
   color: var(--ink);
 }
 
+/* ── Inline test-connection result (overview, beside the button) ── */
+/* The probe's detail lives in the runtime-log view; this line is the quiet
+   outcome so the overview page never looks inert after a click. */
+.test-result {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  line-height: 1.5;
+  letter-spacing: .02em;
+  color: var(--ink-2);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.test-result[hidden] {
+  display: none;
+}
+
+.test-result[data-state="pending"] {
+  color: var(--ink-3);
+}
+
+.test-result[data-state="success"] {
+  color: var(--cinnabar);
+}
+
+.test-result[data-state="error"] {
+  color: #a03024;
+}
+
 /* ── Traffic indicator ── */
 .traffic-indicator {
   display: flex;

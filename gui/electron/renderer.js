@@ -21,6 +21,7 @@ const elements = {
   logContainer: document.getElementById('log-container'),
   ovSocks: document.getElementById('ov-socks'),
   ovUpstream: document.getElementById('ov-upstream'),
+  testResult: document.getElementById('test-result'),
   sideFoot: document.getElementById('side-foot')
 };
 
@@ -217,33 +218,64 @@ async function saveSettings() {
 }
 
 // Test connection
+//
+// The probe's own progress lives in the runtime-log view, but the button sits
+// on the overview page — without an inline result there, a user who stays on
+// the overview sees the button flash "测试中..." and change nothing else, which
+// reads as "the button does nothing". So every outcome also lands in
+// #test-result (aria-live), right next to the button, in the mockup's
+// restrained ink-on-paper voice.
 async function testConnection() {
-  await saveSettings();
+  // The probe reads the values in `config`, so persist the form first — but a
+  // failed save must not silently kill the test (the user asked to test what
+  // is on screen, not to verify the disk). Never rejects.
+  try {
+    await saveSettings();
+  } catch (err) {
+    appendLog(`设置保存失败（仍按当前表单测试）: ${err.message}`, 'error');
+  }
 
   const host = config.serverHost;
   if (!host) {
+    showTestResult('error', '请先填写服务器地址');
     appendLog('请填写服务器地址后再测试', 'error');
     return;
   }
 
   elements.btnTest.disabled = true;
   elements.btnTest.textContent = '测试中...';
+  showTestResult('pending', `正在测试 ${host}:${config.serverPort} ...`);
   appendLog(`测试连接 ${host}:${config.serverPort} ...`, 'info');
 
   try {
     const result = await window.electronAPI.testConnection(host, config.serverPort);
     if (result.ok) {
+      showTestResult('success', result.message);
       appendLog(`✓ ${result.message}`, 'info');
     } else {
+      showTestResult('error', result.message);
       appendLog(`✗ ${result.message}`, 'error');
     }
   } catch (err) {
+    // An IPC throw (bridge gone, handler crashed) — the button is the only
+    // thing the user can act on, so it must not stay stuck on "测试中...".
+    showTestResult('error', `测试失败: ${err.message}`);
     appendLog(`测试连接失败: ${err.message}`, 'error');
   } finally {
     // Always restore the button, even if the IPC call threw.
     elements.btnTest.disabled = false;
     elements.btnTest.textContent = '测试连接';
   }
+}
+
+// Inline outcome beside the 测试连接 button: one quiet line, ink on paper.
+// state is 'pending' | 'success' | 'error'; the message is shown verbatim.
+function showTestResult(state, message) {
+  const el = elements.testResult;
+  if (!el) return;
+  el.textContent = message;
+  el.dataset.state = state;
+  el.hidden = false;
 }
 
 // Start proxy
