@@ -142,7 +142,7 @@ cmake --build --preset release --parallel
 wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.0.14/kcp-proxy-server_0.0.14_amd64.deb
 
 # 安装
-sudo dpkg -i kcp-proxy-server_0.0.11_amd64.deb
+sudo dpkg -i kcp-proxy-server_0.0.14_amd64.deb
 
 # 启动服务
 sudo systemctl start kcp-proxy-server
@@ -200,9 +200,14 @@ UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=2
 
 # 可选参数
 ./deploy.sh root@1.2.3.4 -P 2222              # 自定义SSH端口
-./deploy.sh root@1.2.3.4 --suffix 'MyS3cret!'  # 自定义密钥后缀
+./deploy.sh root@1.2.3.4 --prompt-suffix      # 交互式隐藏输入密钥后缀（推荐，不进 shell 历史与 ps）
+KCP_PROXY_DEPLOY_SUFFIX='MyStrongSuffix' ./deploy.sh root@1.2.3.4   # 或用环境变量传后缀
+./deploy.sh root@1.2.3.4 --suffix MyStrongSuffix   # 直接传参：⚠️ 会出现在 shell 历史与 ps 输出中
 ./deploy.sh root@1.2.3.4 --uninstall           # 卸载
 ```
+
+密钥后缀为 8-128 位字母、数字、`.`、`_` 或 `-`。省略后缀时沿用服务端现有值
+（首次安装为内建默认值）。
 
 ---
 
@@ -213,8 +218,8 @@ UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=2
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载Windows GUI客户端：
 
 ```
-KCP-Proxy-0.0.11-Setup.exe     # NSIS 安装包（推荐）
-KCP-Proxy-0.0.11-Portable.exe  # 免安装单文件版
+KCP-Proxy-0.0.14-Setup.exe     # NSIS 安装包（推荐）
+KCP-Proxy-0.0.14-Portable.exe  # 免安装单文件版
 ```
 
 运行安装包，或直接运行免安装版。
@@ -242,6 +247,7 @@ KCP-Proxy-0.0.11-Portable.exe  # 免安装单文件版
 
 - ✅ 系统托盘支持（关闭窗口不退出）
 - ✅ 实时日志显示
+- ✅ 连接测试结果内联显示（概览页即时反馈，不必翻日志）
 - ✅ 托盘快速启动/停止
 - ✅ 配置自动保存
 
@@ -253,8 +259,9 @@ KCP-Proxy-0.0.11-Portable.exe  # 免安装单文件版
 - 服务端每天自动轮换；GUI 只使用这种模式
 
 **固定密钥（仅命令行客户端）**：
-- 通过 `-k <密钥>` 手动指定（至少16字符），例如 `remote_test_key_123456`
+- 通过 `-k <密钥>` 手动指定（至少16字符，例如 `<SECRET_KEY>`）
 - 仅在与 `kcp-proxy-server -k` 搭配、且不依赖每日轮换时使用
+- ⚠️ 安全提示：本仓库文档与测试中出现的 `remote_test_key_123456` 是**公开的演示/测试密钥**，任何人都能看到。生产环境必须替换为**你自己生成的随机强密钥（≥16 字符）**，切勿使用示例值或弱密钥。
 
 ---
 
@@ -430,7 +437,10 @@ kcp-proxy-cpp/
 │
 ├── docs/                  # 文档
 │   ├── TESTING.md         # 测试指南
-│   └── ANDROID_INTEROP.md # Android互操作说明
+│   ├── ANDROID_INTEROP.md # Android互操作说明
+│   ├── PROTOCOL.md        # 协议与握手细节
+│   ├── TROUBLESHOOTING.md # 排障指南
+│   └── FINAL_REPORT.md    # Android 互操作专项报告
 │
 ├── scripts/               # 脚本（按职责分类）
 │   ├── deploy/            # 部署脚本
@@ -486,9 +496,9 @@ kcp-proxy-cpp/
 - `scripts/templates/` - 配置模板，服务端环境变量等
 
 **GUI客户端**：
-- `gui/electron/` - **主GUI**，基于Electron，支持Windows/Linux/macOS
-  - 现代化界面，系统托盘支持
-  - 系统托盘支持，实时日志显示
+- `gui/electron/` - **主GUI**，基于Electron，跨平台可运行；官方打包产物覆盖 Windows（Setup/Portable）与 Linux（AppImage）
+  - 纸感墨白界面，系统托盘支持
+  - 实时日志显示，连接测试内联反馈
 
 **构建与发布**：
 - `build/` - CMake构建目录，包含中间产物

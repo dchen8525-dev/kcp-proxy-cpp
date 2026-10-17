@@ -10,12 +10,13 @@ ctest --test-dir build -C Release --output-on-failure
 python tests/smoke/smoke_test.py
 ```
 
-`ctest` runs four tests:
+`ctest` runs five tests:
 
 - `kcp_proxy_smoke` — the packaging / deployment smoke tests (same script CI runs).
 - `kcp_proxy_test` — the unit suite below.
 - `kcp_proxy_e2e_tunnel` — an offline end-to-end tunnel test (see below).
 - `kcp_proxy_e2e_robustness` — the negative/robustness suite (see below).
+- `kcp_proxy_e2e_adversarial` — the adversarial suite (see below).
 
 ## End-to-end tunnel test
 
@@ -115,6 +116,46 @@ Six phases, all offline:
 The phases use `--allow-target` only to reach their own local echo servers; the
 regression that the guard stays on by default is pinned by `tunnel_e2e.py`.
 
+## Adversarial suite
+
+`tests/e2e/adversarial_e2e.py` covers the attack surface a hostile **local
+application** or a hostile **UDP neighbour** can reach — neither of the other
+two suites touches it:
+
+```powershell
+python tests/e2e/adversarial_e2e.py `
+  --server build/Release/kcp-proxy-server.exe `
+  --client build/Release/kcp-proxy-client.exe
+```
+
+Five phases, all offline:
+
+- **A. SOCKS5 protocol abuse** — the client's listener is the one port every
+  local process can reach: bad versions, non-zero RSV, bogus ATYPs, zero-length
+  and 255-byte domains, BIND / UDP ASSOCIATE, IPv6 loopback (SSRF on the v6
+  path), requests dribbled one byte at a time, and requests pipelined with
+  payload. Each must be answered correctly or refused cleanly, and both
+  processes must survive the whole set.
+- **B. Many-source UDP flood** — robustness phase B can only flood from one
+  loopback address, so only the per-address failure gate is exercised there.
+  Binding 800 distinct 127/8 sources is the only way to reach the **global**
+  auth-attempt budget (`MAX_AUTH_ATTEMPTS_PER_SEC`, 5000/s) and prove that it
+  engages, and that legitimate new sessions are served again once the
+  one-second window resets. (macOS configures only 127.0.0.1 on lo0, so the
+  phase skips there.)
+- **C. Client session cap** — 520 simultaneous local connections against a
+  client whose `MAX_CLIENT_SESSIONS` is 512: the excess must be refused, the
+  cap tickets must be released when the connections close, and a fresh
+  connection must work afterwards.
+- **D. Stalled target** — a CONNECT whose upstream TCP handshake can never
+  complete (the target's accept backlog is full, so the SYN is dropped) must
+  hit the server's `CONNECT_TIMEOUT_SEC` deadline, produce a clean
+  `HOST_UNREACHABLE` reply, and leave no session behind — not a hang.
+- **E. Restart / key rotation** — the server killed and restarted under the
+  same key must not disturb the client (new tunnels just work); a restart
+  under a different key must fail the handshake fast and loudly without
+  killing the client or spamming its log.
+
 ### Half-closed tunnels: bounded by a grace
 
 When the local app's read side reports EOF the client half-closes the tunnel
@@ -186,16 +227,18 @@ Current unit coverage includes:
 
 ## Manual
 
+> ⚠️ 下列命令里的 `<SECRET_KEY>` 是占位符，请替换为你自己的随机强密钥（≥16 字符）。仓库测试代码中的 `remote_test_key_123456` 是**公开演示密钥**，生产环境切勿使用。
+
 Start a server:
 
 ```powershell
-.\build\Release\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k remote_test_key_123456 -L INFO
+.\build\Release\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k <SECRET_KEY> -L INFO
 ```
 
 Start a client:
 
 ```powershell
-.\build\Release\kcp-proxy-client.exe -H 127.0.0.1 -l 1080 -s 127.0.0.1 -p 8388 -k remote_test_key_123456 -L INFO
+.\build\Release\kcp-proxy-client.exe -H 127.0.0.1 -l 1080 -s 127.0.0.1 -p 8388 -k <SECRET_KEY> -L INFO
 ```
 
 Verify through the local SOCKS5 proxy:

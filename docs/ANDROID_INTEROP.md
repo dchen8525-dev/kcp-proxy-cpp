@@ -27,7 +27,7 @@ When you start the C++ server, confirm this line appears before any traffic.
 From the repository root, after a successful build (see `TESTING.md`):
 
 ```powershell
-.\build\Release\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k remote_test_key_123456 -L INFO
+.\build\Release\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k <SECRET_KEY> -L INFO
 ```
 
 `build_vs.bat` also copies the binaries (and the OpenSSL DLLs they need) to
@@ -284,7 +284,8 @@ cat > /etc/systemd/system/kcp-proxy-test.service <<'UNIT'
 Description=KCP Proxy Server (test instance)
 After=network.target
 [Service]
-ExecStart=/root/kcp-test/src/build/kcp-proxy-server -H 0.0.0.0 -p 8389 -k remote_test_key_123456 -L INFO
+Environment=KCP_PROXY_KEY=<SECRET_KEY>
+ExecStart=/root/kcp-test/src/build/kcp-proxy-server -H 0.0.0.0 -p 8389 -L INFO
 Restart=always
 RestartSec=3
 [Install]
@@ -293,6 +294,13 @@ UNIT
 systemctl daemon-reload && systemctl enable --now kcp-proxy-test
 journalctl -u kcp-proxy-test -f          # watch the logs
 ```
+
+Pass the key through `Environment=`, not `ExecStart=... -k ...`: on Linux a
+process command line is world-readable (`/proc/<pid>/cmdline`), so `-k` would
+leak the key to every local user for the whole session. `KCP_PROXY_KEY` is the
+server's supported env channel (same one the deb package's wrapper and the GUI
+use); `/proc/<pid>/environ` is readable only by the same uid and root. The
+server refuses to start if neither `-k` nor `KCP_PROXY_KEY` is present.
 
 `-DCMAKE_PREFIX_PATH` matters: with `VCPKG_MANIFEST_INSTALL=OFF` and a classic
 vcpkg install, the `asio` config file is not found without it.

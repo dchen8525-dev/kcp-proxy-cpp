@@ -4,9 +4,11 @@
 
 ## 特性
 
-- 现代化 Win11 风格界面
+- 纸感墨白（Porcelain）界面：米纸底、墨色文字、朱砂强调色
 - 系统托盘支持
 - 实时日志显示
+- 连接测试结果内联显示（概览页即时反馈）
+- 配置自动保存
 - 自动检测进程状态
 - 轻量级、跨平台
 
@@ -64,7 +66,7 @@ GUI 只使用**每日密钥**：北京日期 (YYYYMMDD) + 后缀。
 - 固定密钥（`-k`）仅在命令行客户端可用
 
 ### 按钮说明
-- **测试连接**: 解析域名并做一次真实 KCP 握手探测
+- **测试连接**: 解析域名并做一次真实 KCP 握手探测，结果直接内联显示在概览页（成功/失败/进行中三态）
 - **启动代理**: 启动 kcp-proxy-client 进程
 - **停止代理**: 停止代理进程
 
@@ -82,7 +84,7 @@ GUI 只使用**每日密钥**：北京日期 (YYYYMMDD) + 后缀。
 
 ## 开发技术栈
 
-- Electron 28+
+- Electron 44+
 - 原生 HTML/CSS/JavaScript（无框架依赖）
 - 内置轻量配置存储（`main.js` 的 `ConfigStore`，不再依赖 electron-store）
 - electron-builder（打包）
@@ -96,7 +98,9 @@ gui/electron/
 ├── index.html       # 主界面
 ├── renderer.js      # 渲染进程（界面交互）
 ├── styles.css       # 样式表
-├── assets/          # 图标等资源
+├── assets/          # 图标等资源（icon.png / icon.ico / icon.svg）
+├── test/            # node --test 测试
+├── scripts/         # check.js 等辅助脚本
 ├── package.json     # 项目配置
 └── README.md        # 本文件
 ```

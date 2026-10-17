@@ -61,8 +61,8 @@
 ## 6. C++ 本地 curl 端到端结果（C++ local curl result）
 
 ```
-build/Release/kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k remote_test_key_123456 -L INFO
-build/Release/kcp-proxy-client.exe -s 127.0.0.1 -p 8388 -H 127.0.0.1 -l 1080 -k remote_test_key_123456 -L INFO
+build/Release/kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k <SECRET_KEY> -L INFO
+build/Release/kcp-proxy-client.exe -s 127.0.0.1 -p 8388 -H 127.0.0.1 -l 1080 -k <SECRET_KEY> -L INFO
 curl -x socks5h://127.0.0.1:1080 http://neverssl.com
 → HTTP 200  size=3961
 ```

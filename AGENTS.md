@@ -6,7 +6,7 @@
 >
 > **C++ Project Status**:
 > - ✅ KCP dependency migrated to vcpkg (no longer a Git submodule)
-> - ✅ Version unified to 0.0.5 across all config files
+> - ✅ Version unified to 0.0.15 across all config files
 > - ✅ CI configuration updated (removed submodule references)
 > - ✅ Build scripts updated (removed submodule initialization)
 > - ✅ Documentation updated and sanitized
@@ -348,9 +348,11 @@ Logs remain readable.
 
 ### C++ local curl
 
+> ⚠️ 示例里的 `-k <SECRET_KEY>` 是占位符。**不要使用文档中写死的密钥**——`<SECRET_KEY>` 是公开测试密钥，生产必须换成你自己的随机强密钥（≥16 字符）。
+
 ```bat
-bin\windows\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k remote_test_key_123456 -L INFO
-bin\windows\kcp-proxy-client.exe -s 127.0.0.1 -p 8388 -H 127.0.0.1 -l 1080 -k remote_test_key_123456 -L INFO
+bin\windows\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k <SECRET_KEY> -L INFO
+bin\windows\kcp-proxy-client.exe -s 127.0.0.1 -p 8388 -H 127.0.0.1 -l 1080 -k <SECRET_KEY> -L INFO
 
 curl -x socks5h://127.0.0.1:1080 http://neverssl.com
 curl -x socks5h://127.0.0.1:1080 https://example.com
@@ -362,7 +364,7 @@ curl -x socks5h://127.0.0.1:1080 https://www.cloudflare.com
 C++ server:
 
 ```bat
-bin\windows\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k remote_test_key_123456 -L INFO
+bin\windows\kcp-proxy-server.exe -H 0.0.0.0 -p 8388 -k <SECRET_KEY> -L INFO
 ```
 
 Android emulator endpoint:
