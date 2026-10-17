@@ -6,8 +6,7 @@ const elements = {
   keySuffix: document.getElementById('keySuffix'),
   autoReconnect: document.getElementById('autoReconnect'),
   btnTest: document.getElementById('btn-test'),
-  btnStart: document.getElementById('btn-start'),
-  btnStop: document.getElementById('btn-stop'),
+  btnToggle: document.getElementById('btn-toggle'),
   btnMinimize: document.getElementById('btn-minimize'),
   btnMaximize: document.getElementById('btn-maximize'),
   btnClose: document.getElementById('btn-close'),
@@ -68,7 +67,7 @@ async function init() {
     if (version) elements.sideFoot.textContent = `v${version} · 纸感墨白`;
   } catch { /* version label is cosmetic — keep the HTML fallback */ }
 
-  appendLog('提示：填写完成后点击「启动代理」即可。', 'info');
+  appendLog('提示：填写完成后点击「启动连接」即可。', 'info');
 }
 
 // Populate form with saved config
@@ -138,9 +137,16 @@ function setupEventListeners() {
   // Save button
   elements.btnTest.addEventListener('click', testConnection);
 
-  // Start/Stop buttons
-  elements.btnStart.addEventListener('click', startProxy);
-  elements.btnStop.addEventListener('click', stopProxy);
+  // Toggle button: one control for both directions. The label/style follow
+  // the current state (see updateStatus), so a click always does the one
+  // thing the button advertises.
+  elements.btnToggle.addEventListener('click', () => {
+    if (isRunning) {
+      stopProxy();
+    } else {
+      startProxy();
+    }
+  });
 
   // Auto-save: every field persists as soon as it changes (text fields commit
   // on blur / Enter via the DOM 'change' event). No log line — auto-save runs
@@ -320,14 +326,21 @@ async function stopProxy() {
 // Update UI status
 function updateStatus(running) {
   isRunning = running;
-  elements.btnStart.disabled = running;
-  elements.btnStop.disabled = !running;
 
+  // The single toggle button is never disabled — its label and color carry
+  // the state: 朱砂 fill invites a start, 墨 fill marks the live session and
+  // offers the disconnect.
   if (running) {
+    elements.btnToggle.textContent = '断开连接';
+    elements.btnToggle.classList.remove('btn-fill');
+    elements.btnToggle.classList.add('btn-dark');
     elements.statusDot.classList.add('running');
     elements.statusText.textContent = '运行中';
     elements.trafficIndicator.hidden = false;
   } else {
+    elements.btnToggle.textContent = '启动连接';
+    elements.btnToggle.classList.remove('btn-dark');
+    elements.btnToggle.classList.add('btn-fill');
     elements.statusDot.classList.remove('running');
     elements.statusText.textContent = '未运行';
     elements.trafficIndicator.hidden = true;
