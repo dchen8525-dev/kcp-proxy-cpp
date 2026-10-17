@@ -218,6 +218,14 @@ SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
 KEY="${DATE_BEIJING}${SUFFIX}"
 
+# Hand the key over through the environment, NOT -k: a process command line is
+# world-readable on Linux (/proc/<pid>/cmdline, visible to every local user), so
+# -k would leak today's daily key and defeat the 0600 server.env below. The
+# server reads KCP_PROXY_KEY when -k is absent, and /proc/<pid>/environ is only
+# readable by the same uid (and root), never by other local users.
+export KCP_PROXY_KEY="$KEY"
+unset KEY
+
 # Never log the full key - only the date portion and suffix length.
 echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}"
 
@@ -232,14 +240,14 @@ if [ -n "$LOG_FILE" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
     fi
     {
         echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT} ==="
-        exec "$SERVER_BIN" -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+        exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
     } >> "$LOG_FILE" 2>&1
 fi
 
 if [ -n "$LOG_FILE" ]; then
     echo "WARNING: LOG_FILE=$LOG_FILE is not writable - logging to journald instead" >&2
 fi
-exec "$SERVER_BIN" -k "$KEY" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
 """
 
 SERVER_ENV = f"""\

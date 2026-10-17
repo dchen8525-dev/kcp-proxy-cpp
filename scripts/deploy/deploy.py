@@ -14,7 +14,8 @@ Usage:
 Examples:
     python3 scripts/deploy/deploy.py root@1.2.3.4
     python3 scripts/deploy/deploy.py ubuntu@example.com -P 2222 -i ~/.ssh/id_ed25519
-    python3 scripts/deploy/deploy.py root@1.2.3.4 --suffix 'MyS3cret!'
+    python3 scripts/deploy/deploy.py root@1.2.3.4 --prompt-suffix   # hidden interactive input
+    KCP_PROXY_DEPLOY_SUFFIX='MyStrongSuffix' python3 scripts/deploy/deploy.py root@1.2.3.4  # env var
     python3 scripts/deploy/deploy.py root@1.2.3.4 --uninstall
     python3 scripts/deploy/deploy.py root@1.2.3.4 --dry-run  # verify package without connecting
 """
@@ -165,6 +166,16 @@ def setup_askpass(tmpdir, password):
         helper = Path(tmpdir) / "askpass.bat"
         # CRLF line endings required for cmd.exe batch parsing
         helper.write_text(f'@echo off\r\ntype "{pw}"\r\n', encoding="ascii")
+        # Defense-in-depth: restrict the password file to the current user.
+        # icacls is always present on Windows; failure is non-fatal because the
+        # file lives in %TEMP% and is removed when the temp dir is cleaned up.
+        try:
+            username = os.environ.get("USERNAME", "%USERNAME%")
+            subprocess.run(
+                ["icacls", str(pw), "/inheritance:r", "/grant:r", f"{username}:R"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except Exception:
+            pass
     else:
         helper = Path(tmpdir) / "askpass.sh"
         helper.write_text(f'#!/bin/sh\ncat "{pw}"\n', encoding="ascii")
@@ -200,8 +211,13 @@ def main():
     parser.add_argument("-P", "--port", type=int, help="SSH port (default 22)")
     parser.add_argument("-i", "--identity", help="SSH identity (private key) file")
     parser.add_argument("--suffix",
-                        help="key suffix stored on the server; omit to keep the "
-                             "existing one (or the built-in default on first install)")
+                        help="key suffix stored on the server. WARNING: values passed "
+                             "here appear in shell history and `ps` on shared hosts — "
+                             "prefer KCP_PROXY_DEPLOY_SUFFIX or --prompt-suffix. Omit to "
+                             "keep the existing one (or built-in default on first install)")
+    parser.add_argument("--prompt-suffix", action="store_true",
+                        help="prompt for the suffix interactively (hidden input, kept "
+                             "out of shell history and the process list)")
     parser.add_argument("--uninstall", action="store_true",
                         help="remove the service and all files from the server")
     parser.add_argument("--dry-run", action="store_true",
@@ -216,6 +232,12 @@ def main():
 
     # Dry-run is entirely local: do not inspect SSH or prompt for credentials.
     defaults = load_common_defaults()
+    if args.suffix is None and args.prompt_suffix:
+        # Hidden input — the suffix is a key component, so avoid leaving it
+        # in shell history or the process list like --suffix does.
+        args.suffix = getpass.getpass("Key suffix (hidden input): ")
+    if args.suffix is None:
+        args.suffix = os.environ.get("KCP_PROXY_DEPLOY_SUFFIX")
     if args.suffix:
         validate_suffix(args.suffix)
 

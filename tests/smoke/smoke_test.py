@@ -165,6 +165,32 @@ def test_gui_never_puts_the_key_on_the_command_line():
             "the client must read KCP_PROXY_KEY from the environment")
 
 
+def test_server_wrappers_never_put_the_key_on_the_command_line():
+    # The server is a long-lived daemon, so its command line is exposed in
+    # /proc/<pid>/cmdline to every local user on Linux for the whole session.
+    # The install/package wrappers must therefore derive the daily key and hand
+    # it over through KCP_PROXY_KEY, never -k <key>, or they leak today's key
+    # and defeat the 0600 server.env.
+    install = read("scripts/deploy/install-service.sh")
+    require('-k "$KEY"' not in install,
+            "install-service.sh must not pass the key on the server command line")
+    require('export KCP_PROXY_KEY="$KEY"' in install,
+            "install-service.sh must hand the key to the server via KCP_PROXY_KEY")
+
+    package = read("scripts/package/package.py")
+    require('-k "$KEY"' not in package,
+            "package.py's embedded WRAPPER_SH must not pass the key on the "
+            "server command line")
+    require('export KCP_PROXY_KEY="$KEY"' in package,
+            "package.py's WRAPPER_SH must hand the key to the server via "
+            "KCP_PROXY_KEY")
+
+    # The two wrappers must agree on the handoff, or a stray -k reintroduces
+    # the leak through whichever copy actually ships.
+    require('KCP_PROXY_KEY="$KEY"' in install and 'KCP_PROXY_KEY="$KEY"' in package,
+            "both server wrappers must use the same KCP_PROXY_KEY handoff")
+
+
 # --------------------------------------------------------------------------- #
 # the GUI's client-binary search path
 # --------------------------------------------------------------------------- #
@@ -503,6 +529,7 @@ TESTS = [
     test_no_committed_secrets,
     test_deploy_safety,
     test_gui_never_puts_the_key_on_the_command_line,
+    test_server_wrappers_never_put_the_key_on_the_command_line,
     test_gui_finds_the_dev_build,
     test_gui_maps_darwin_to_the_macos_bin_dir,
     test_nsis_installer_shows_details,
