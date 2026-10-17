@@ -152,9 +152,17 @@ FunctionEnd
   !insertmacro TRACE "checkAppRunning: powershell-available=$IsPowerShellAvailable INSTDIR=[$INSTDIR]"
 
   # current process id, so KILL_PROCESS can exclude ourselves (the stock path
-  # gets it from ${GetProcessInfo}, whose helper is installer-namespace only)
-  System::Call 'kernel32::GetCurrentProcess() i.R0'
-  System::Call 'Kernel32::GetProcessId(i R0) i.pid'
+  # gets it from ${GetProcessInfo}, whose helper is installer-namespace only).
+  # NOTE: the System plugin's output destination must be a PLAIN register
+  # (`i.R2`) or the stack (`i.s`). The dotted form (`.R2`) silently writes
+  # nothing, and a bare name (`i.pid`) is worse: empirically it lands in
+  # $INSTDIR -- the field log showed INSTDIR=[8652], the uninstaller's own
+  # pid, so RMDir /r targeted a nonexistent relative path while the removal
+  # check passed trivially. Verified 2026-10-17 with makensis micro-probes.
+  System::Call 'kernel32::GetCurrentProcess() i.R1'
+  System::Call 'Kernel32::GetProcessId(i R1) i.R2'
+  StrCpy $pid $R2
+  !insertmacro TRACE "current pid=$pid"
 
   ${if} ${isUpdated}
     # allow app to exit without explicit kill
@@ -182,11 +190,12 @@ FunctionEnd
     # without its before-quit reaper running) may still hold
     # $INSTDIR\resources. Kill it too -- no prompt: it is a background
     # process with no window, and the user already asked for the uninstall.
-        ${if} $R0 == 0
-      DetailPrint "$(appClosing)"
-
-      Call un.killAppProcesses
-    ${endIf}
+    # NOTE: this must run UNCONDITIONALLY in this branch. `$R0 != 0` here
+    # (that is why the ${else} was taken), so guarding the call with
+    # `${if} $R0 == 0` makes it dead code -- the exact typo class as the
+    # ${else}/!ifmacrodef mixup from the first incident.
+    DetailPrint "$(appClosing)"
+    Call un.killAppProcesses
   ${endIf}
 !macroend
 

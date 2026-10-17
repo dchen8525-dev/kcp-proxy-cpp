@@ -24,6 +24,15 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# The key-refresh schedule. The daily key is YYYYMMDD in Beijing time (UTC+8,
+# no DST), while a bare OnCalendar= is evaluated in the host's timezone, so the
+# ticks are pinned to UTC: Beijing 00:00/06:00/12:00/18:00 == UTC
+# 16:00/22:00/04:00/10:00. 04,10,16,22 is that set sorted.
+#
+# "UTC" as an OnCalendar suffix needs systemd >= 228; a full IANA name would
+# need 252 and would leave the timer with no next elapse on older hosts.
+BEIJING_TIMER_UTC = "*-*-* 04,10,16,22:00:00 UTC"
+
 
 def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
@@ -314,6 +323,57 @@ def test_service_scripts():
             "install-service.sh must verify the timer has a next elapse")
     require("OnCalendar=" in install,
             "the refresh timer must use a calendar schedule, not OnBootSec")
+
+    # The key is the Beijing date but a bare OnCalendar= is evaluated in the
+    # host's timezone, so the schedule has to be pinned to UTC. A regression to
+    # the host-local form ("0/6:00:00") passes every other check here -- the
+    # timer still arms, it just fires up to ~14h away from the date change, so
+    # clients fail DECRYPT_FAILED long after Beijing midnight. Assert the exact
+    # expression in all three copies that must agree.
+    #
+    # Beijing 00:00/06:00/12:00/18:00 == UTC 16:00/22:00/04:00/10:00.
+    for path in ("scripts/templates/kcp-proxy-server-key-refresh.timer",
+                 "scripts/deploy/install-service.sh",
+                 "scripts/package/package.py"):
+        require(BEIJING_TIMER_UTC in read(path),
+                f"{path} must schedule the key refresh at Beijing time "
+                f"via the UTC expression {BEIJING_TIMER_UTC!r}")
+    require(BEIJING_TIMER_UTC not in read("scripts/deploy/install-service.sh")
+            or "systemd-analyze calendar" in install,
+            "the UTC schedule needs a systemd-analyze probe, or systemd < 228 "
+            "silently leaves the timer unarmed")
+
+    require(BEIJING_TIMER_UTC not in read("scripts/deploy/install-service.sh")
+            or "systemd-analyze calendar" in install,
+            "the UTC schedule needs a systemd-analyze probe, or systemd < 228 "
+            "silently leaves the timer unarmed")
+
+    # ... and the probe must be able to fall back, or the UTC expression is a
+    # hard dependency on systemd >= 228 rather than a preference.
+    for path in ("scripts/deploy/install-service.sh", "scripts/package/package.py"):
+        text = read(path)
+        require("systemd-analyze calendar" in text,
+                f"{path} must probe whether the UTC OnCalendar suffix parses")
+        require("date +%z" in text,
+                f"{path} must derive the local fallback from the host's UTC offset")
+
+    # Both fallback copies run under POSIX sh in the deb postinst, where bashisms
+    # abort the whole install: $((10#...)) and ${var:off:len} are both bash-only.
+    # Whole-line comments are skipped -- they legitimately name the bashisms --
+    # but code lines must be scanned whole: stripping a trailing "# comment"
+    # would cut "$(( 10#oh ..." down to "$(( 10" and hide the very syntax the
+    # check exists to catch.
+    for path in ("scripts/deploy/install-service.sh", "scripts/package/package.py"):
+        code = "\n".join(
+            line for line in read(path).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        require("10#" not in code,
+                f"{path} must not use the bash-only $((10#..)) base prefix in "
+                f"the timer fallback (the deb postinst runs under dash)")
+        require("${_first:" not in code and "${first:" not in code,
+                f"{path} must not use bash substring expansion in the timer "
+                f"fallback (the deb postinst runs under dash)")
 
     uninstall = read("scripts/deploy/uninstall-service.sh")
     require("--purge" in uninstall, "uninstall-service.sh must support --purge")
@@ -625,6 +685,22 @@ def test_uninstaller_refuses_empty_installdir():
             "the empty-$INSTDIR branch must Abort the section")
 
 
+def _strip_nsis_comment(line: str) -> str:
+    """Drop a trailing NSIS line comment (# or ;) from one line, honouring
+    double quotes so tokens inside strings ("gui not running; checking...")
+    survive. Without this, a comment merely MENTIONING `!ifdef` desynchronises
+    the conditional pairing counts below (a false positive that blocks CI)."""
+    out = []
+    in_str = False
+    for ch in line:
+        if ch == '"':
+            in_str = not in_str
+        if not in_str and ch in "#;":
+            break
+        out.append(ch)
+    return "".join(out)
+
+
 def test_uninstaller_file_removal_is_reachable():
     """Root cause of the 2026-10-17 incident: the patched uninstaller carried
     `${else}` where the stock template has `!else`. The NSIS preprocessor does
@@ -640,9 +716,10 @@ def test_uninstaller_file_removal_is_reachable():
         pp_depth = 0   # preprocessor !if...def / !endif nesting
         rt_depth = 0   # runtime ${If}...${EndIf} nesting
         for lineno, line in enumerate(text.split("\n"), 1):
-            stripped = line.strip()
-            pp_depth += len(re.findall(r"!if(macro)?(n)?def\b", line))
-            pp_depth -= len(re.findall(r"!endif\b", line))
+            code = _strip_nsis_comment(line)
+            stripped = code.strip()
+            pp_depth += len(re.findall(r"!if(macro)?(n)?def\b", code))
+            pp_depth -= len(re.findall(r"!endif\b", code))
             # A runtime ${else} is only legal while a runtime ${If...} is
             # open. With no runtime if open it can only be a mistyped
             # preprocessor else -- the incident pattern.
@@ -652,8 +729,8 @@ def test_uninstaller_file_removal_is_reachable():
                         "${{If}} -- this is the incident typo: inside a "
                         "!if...def block it makes the else-branch dead code")
             rt_depth += len(re.findall(
-                r"\$\{[iI]f(?:[nN]ot)?\b", line))
-            rt_depth -= len(re.findall(r"\$\{[eE]nd[iI]f\b", line))
+                r"\$\{[iI]f(?:[nN]ot)?\b", code))
+            rt_depth -= len(re.findall(r"\$\{[eE]nd[iI]f\b", code))
         require(pp_depth == 0,
                 f"{name} has unbalanced preprocessor conditionals "
                 f"(depth {pp_depth})")
@@ -663,6 +740,46 @@ def test_uninstaller_file_removal_is_reachable():
             "the stock customRemoveFiles hook must stay wired")
     require("RMDir /r $INSTDIR" in nsh,
             "the install directory removal must stay in the script")
+
+
+def test_uninstaller_pid_fetch_cannot_clobber_installdir():
+    """2026-10-17 second incident: `System::Call
+    'Kernel32::GetProcessId(i R0) i.pid'` used a bare NAME as the output
+    destination. That is not a variable reference: empirically (makensis
+    micro-probe, verified against the field trace log) the System plugin
+    writes the return value into $INSTDIR and leaves $pid empty -- so the
+    uninstaller ran `RMDir /r 8652` (its own pid) and the removal check
+    passed trivially while the real directory stayed on disk. Pin the safe
+    forms: the pid must be fetched into a plain register and copied."""
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    require("StrCpy $pid $R" in nsh,
+            "the current pid must be copied from a register into $pid")
+    # The dotted output form (.R0) is equally broken: it silently writes
+    # nothing, so a refactor to it would leave $pid empty and taskkill's
+    # "PID ne " filter malformed.
+    require(re.search(r"System::Call '[^']*\)\s*\.\w", nsh) is None,
+            "System::Call must not use the dotted output form (writes "
+            "nothing); use a plain register (i.R2) or the stack (i.s)")
+    require("i.pid" not in nsh,
+            "the bare-name output destination i.pid must never come back "
+            "(it clobbers $INSTDIR with the pid)")
+
+
+def test_uninstaller_orphan_client_kill_is_unconditional():
+    """The GUI-not-running branch is taken exactly when $R0 != 0, so guarding
+    the orphaned-client kill with `${if} $R0 == 0` makes it dead code -- an
+    orphaned client then survives every uninstall with the GUI already gone,
+    which is the one scenario the check exists for."""
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    branch = nsh.find("gui not running; checking for an orphaned client")
+    require(branch != -1, "the orphan-client trace marker must stay")
+    tail = nsh[branch:nsh.find("${endIf}", branch)]
+    require("Call un.killAppProcesses" in tail,
+            "the orphaned client must be killed in the GUI-not-running branch")
+    require("${if} $R0 == 0" not in tail,
+            "the orphaned-client kill must NOT be guarded by ${if} $R0 == 0 "
+            "-- inside the ${else} branch that condition is always false "
+            "(dead code)")
 
 
 def test_suffix_validation_agrees():
@@ -732,6 +849,27 @@ def test_archive_members():
                         f"{archive.name}: traversing member {name!r}")
 
 
+def test_beijing_timer_schedule_converts_at_runtime():
+    """Execute the UTC-offset fallback in both copies and check the arithmetic.
+
+    The static checks above prove the schedule is written in UTC; this one
+    proves the fallback actually lands on Beijing 00/06/12/18 from an arbitrary
+    host offset, under both bash and dash. A conversion bug would otherwise only
+    surface as "clients fail DECRYPT_FAILED for hours" on a non-Beijing host.
+    """
+    check = ROOT / "tests" / "smoke" / "beijing_timer_schedule_check.py"
+    require(check.is_file(), "missing tests/smoke/beijing_timer_schedule_check.py")
+    proc = subprocess.run(
+        [sys.executable, str(check)], capture_output=True, text=True, cwd=str(ROOT)
+    )
+    require(
+        proc.returncode == 0,
+        "the Beijing-time schedule conversion failed at runtime:\n"
+        + proc.stdout
+        + proc.stderr,
+    )
+
+
 TESTS = [
     test_packaging_script,
     test_no_committed_secrets,
@@ -743,6 +881,7 @@ TESTS = [
     test_nsis_installer_shows_details,
     test_deploy_dry_run,
     test_service_scripts,
+    test_beijing_timer_schedule_converts_at_runtime,
     test_udp_buffer_ceiling_agrees,
     test_vcpkg_pins_agree,
     test_versions_agree,
