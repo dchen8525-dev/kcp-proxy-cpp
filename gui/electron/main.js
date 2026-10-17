@@ -4,7 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const dns = require('dns');
 const net = require('net');
-const { generateKey: buildKey, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, resolveAppIconPath } = require('./utils');
+const { generateKey: buildKey, getBeijingDate, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, resolveAppIconPath } = require('./utils');
 
 // Auto-updater (electron-updater) — loaded lazily to keep dev/preview simple.
 let autoUpdater = null;
@@ -100,6 +100,8 @@ const store = new ConfigStore({
   serverPort: '8388',
   localPort: '1080',
   keySuffix: '',
+  autoConnect: false, // Start the proxy automatically when the app opens
+  allowLan: false, // Bind SOCKS to 0.0.0.0 instead of 127.0.0.1 only
   autoReconnect: true, // Auto reconnect on disconnect
   reconnectDelay: 3000, // Delay before reconnect (ms)
   maxReconnectAttempts: 10, // Max reconnect attempts (0 = unlimited)
@@ -388,6 +390,15 @@ async function startProxy(opts = {}) {
     }
   }
 
+  // Launch-time override from the renderer's settings form: the page only
+  // persists on 保存设置, but 启动连接 must start what is on screen. The
+  // override applies to THIS launch only — nothing is written to the store,
+  // so a restart/auto-connect still uses the last SAVED config.
+  const override = (opts.config && typeof opts.config === 'object')
+    ? opts.config : null;
+  const pick = (key) => (override && override[key] != null)
+    ? String(override[key]).trim() : store.get(key);
+
   const clientPath = getClientPath();
   if (!clientPath) {
     const msg = `未找到 ${process.platform === 'win32' ? 'kcp-proxy-client.exe' : 'kcp-proxy-client'}`;
@@ -399,9 +410,10 @@ async function startProxy(opts = {}) {
     return;
   }
 
-  const serverHost = store.get('serverHost');
-  const serverPort = store.get('serverPort');
-  const localPort = store.get('localPort');
+  const serverHost = pick('serverHost');
+  const serverPort = pick('serverPort');
+  const localPort = pick('localPort');
+  const keySuffix = pick('keySuffix');
 
   // Single validation pass over all launch parameters (shared with unit tests)
   const validationError = validateLaunchConfig({
@@ -409,7 +421,7 @@ async function startProxy(opts = {}) {
     serverPort,
     localPort,
     keyMode: 'daily',
-    keySuffix: store.get('keySuffix')
+    keySuffix
   });
   if (validationError) {
     sendLog(validationError, 'error');
@@ -420,12 +432,14 @@ async function startProxy(opts = {}) {
     return;
   }
 
-  const key = generateKey();
+  const key = buildKey('daily', { suffix: keySuffix });
+  const allowLan = store.get('allowLan') === true;
+  const listenHost = allowLan ? '0.0.0.0' : '127.0.0.1';
 
   // The key travels via KCP_PROXY_KEY in the environment, NOT argv: the
   // command line of a process is visible to every local user (Task Manager /
   // wmic), while the environment is readable only by the same user.
-  const args = buildClientArgs({ serverHost, serverPort, localPort });
+  const args = buildClientArgs({ serverHost, serverPort, localPort, allowLan });
 
   try {
     const proc = spawn(clientPath, args, {
@@ -437,7 +451,7 @@ async function startProxy(opts = {}) {
 
     isRunning = true;
     updateStatus(true);
-    sendLog(`已启动: ${clientPath} server=${serverHost}:${serverPort} socks5=127.0.0.1:${localPort} key_mode=daily key_len=${key.length}`, 'info');
+    sendLog(`已启动: ${clientPath} server=${serverHost}:${serverPort} socks5=${listenHost}:${localPort} key_mode=daily key_len=${key.length}`, 'info');
 
     // Capture stdout (client rarely uses it — everything goes to stderr)
     const pushStdoutLine = createLogLineStream((line) => sendLog(line, 'info'));
@@ -726,7 +740,7 @@ ipcMain.handle('validate-config', (event, config) =>
 // The only keys the renderer may persist (see renderer.js saveSettings). A
 // whitelist costs nothing now and stops an unknown or hostile key from being
 // written into the config file if the renderer is ever compromised.
-const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoReconnect'];
+const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoConnect', 'allowLan', 'autoReconnect'];
 
 ipcMain.handle('save-config', (event, config) => {
   if (!config || typeof config !== 'object') return false;
@@ -737,8 +751,8 @@ ipcMain.handle('save-config', (event, config) => {
   return true;
 });
 
-ipcMain.handle('start-proxy', async () => {
-  await startProxy();
+ipcMain.handle('start-proxy', async (event, config) => {
+  await startProxy({ config });
   return isRunning;
 });
 
@@ -754,6 +768,11 @@ ipcMain.handle('get-status', () => isRunning);
 // that would drift on every release; this keeps the label truthful.
 ipcMain.handle('get-app-version', () => app.getVersion());
 
+// Today's key date (Beijing) for the overview panel. Computed here, from
+// utils.js — the same function the key generator uses — so the displayed date
+// can never drift from the one actually minting today's key.
+ipcMain.handle('get-key-date', () => getBeijingDate());
+
 // Test connection to the server. The server listens on UDP, so a TCP connect
 // proves nothing (it would RST against a perfectly healthy server, or false-
 // succeed if something else happens to listen on that TCP port). Instead:
@@ -768,7 +787,7 @@ ipcMain.handle('get-app-version', () => app.getVersion());
 // The probe binds the local SOCKS5 listener to a free ephemeral port so it
 // never collides with a running proxy. Killing the probe afterwards leaves one
 // idle session on the server, reaped by its 60s idle sweep.
-function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
+function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = generateKey()) {
   return getFreePort().then((listenPort) => new Promise((resolve) => {
     let settled = false;
     let timer = null;
@@ -796,7 +815,7 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000) {
       }), {
         cwd: path.dirname(clientPath),
         stdio: ['ignore', 'ignore', 'pipe'],
-        env: buildClientEnv(generateKey())
+        env: buildClientEnv(key)
       });
       // Publish the handle BEFORE anything can await, so before-quit can always
       // find and reap this child.
@@ -872,33 +891,38 @@ function getFreePort() {
   });
 }
 
-ipcMain.handle('test-connection', async (event, host, port) => {
+ipcMain.handle('test-connection', async (event, host, port, keySuffix) => {
   if (connectivityTestInFlight) {
     return { ok: false, message: '已有连接测试正在进行，请稍候' };
   }
   connectivityTestInFlight = true;
   try {
-    return await runConnectivityTest(host, port);
+    return await runConnectivityTest(host, port, keySuffix);
   } finally {
     connectivityTestInFlight = false;
   }
 });
 
 // The actual probe work, guarded by the connectivityTestInFlight lock so only
-// one test-connection can run concurrently.
-async function runConnectivityTest(host, port) {
+// one test-connection can run concurrently. keySuffixOverride carries the
+// settings form's value so the probe mints the same key the user sees — the
+// saved config is not consulted unless the field is untouched.
+async function runConnectivityTest(host, port, keySuffixOverride) {
   const h = (host || store.get('serverHost') || '').trim();
   // The RAW value the user asked to test, not parseInt() of it: the launch path
   // validates the string through isValidPort, so coercing here let "8388x" test
   // green while 启动代理 then refused the very same config.
   const rawPort = port || store.get('serverPort');
+  const keySuffix = (keySuffixOverride != null && String(keySuffixOverride).trim() !== '')
+    ? String(keySuffixOverride).trim()
+    : store.get('keySuffix');
 
   const validationError = validateLaunchConfig({
     serverHost: h,
     serverPort: rawPort,
     localPort: store.get('localPort'),
     keyMode: 'daily',
-    keySuffix: store.get('keySuffix')
+    keySuffix
   });
   if (validationError) {
     return { ok: false, message: validationError };
@@ -922,7 +946,8 @@ async function runConnectivityTest(host, port) {
     return { ok: false, message: `域名解析成功 (${h} → ${address})，但未找到客户端程序，无法测试 UDP 握手` };
   }
 
-  return probeKcpHandshake(clientPath, h, p);
+  return probeKcpHandshake(clientPath, h, p, 10000,
+    buildKey('daily', { suffix: keySuffix }));
 }
 
 ipcMain.on('window-minimize', () => {
@@ -1088,6 +1113,14 @@ app.whenReady().then(() => {
   updateStatus(false);
   setupAutoUpdater();
   removeLegacyAutoStartEntry();
+
+  // 打开应用时自动连接: the user explicitly opted in, so this runs with the
+  // normal (user-initiated) semantics — a bad config surfaces its dialog
+  // right away instead of failing silently in the background.
+  if (store.get('autoConnect') === true) {
+    sendLog('已开启自动连接，正在启动代理...', 'info');
+    startProxy();
+  }
 });
 
 app.on('window-all-closed', () => {

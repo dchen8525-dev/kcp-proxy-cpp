@@ -41,6 +41,29 @@ test('buildClientArgs emits exactly the connect parameters', () => {
   ]);
 });
 
+test('buildClientArgs defaults to loopback unless allowLan is set', () => {
+  // allowLan must be an explicit opt-in: falsy/absent -> 127.0.0.1, so a
+  // missing config key can never silently expose the proxy to the LAN.
+  for (const allowLan of [undefined, false, 0, '']) {
+    const args = buildClientArgs({
+      serverHost: 'h', serverPort: '8388', localPort: '1080', allowLan
+    });
+    assert.strictEqual(args[args.indexOf('-H') + 1], '127.0.0.1',
+      `allowLan=${JSON.stringify(allowLan)} must still bind loopback`);
+  }
+
+  const lan = buildClientArgs({
+    serverHost: 'h', serverPort: '8388', localPort: '1080', allowLan: true
+  });
+  assert.deepStrictEqual(lan, [
+    '-s', 'h',
+    '-p', '8388',
+    '-H', '0.0.0.0',
+    '-l', '1080',
+    '-L', 'info'
+  ]);
+});
+
 test('buildClientArgs never carries the key on the command line', () => {
   // A `key` is passed in on purpose: buildClientArgs takes none today, so this
   // pins that adding one cannot start forwarding the secret without failing

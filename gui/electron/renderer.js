@@ -4,9 +4,13 @@ const elements = {
   serverPort: document.getElementById('serverPort'),
   localPort: document.getElementById('localPort'),
   keySuffix: document.getElementById('keySuffix'),
+  autoConnect: document.getElementById('autoConnect'),
+  allowLan: document.getElementById('allowLan'),
   autoReconnect: document.getElementById('autoReconnect'),
   btnTest: document.getElementById('btn-test'),
   btnToggle: document.getElementById('btn-toggle'),
+  btnSave: document.getElementById('btn-save'),
+  saveResult: document.getElementById('save-result'),
   btnMinimize: document.getElementById('btn-minimize'),
   btnMaximize: document.getElementById('btn-maximize'),
   btnClose: document.getElementById('btn-close'),
@@ -20,6 +24,8 @@ const elements = {
   logContainer: document.getElementById('log-container'),
   ovSocks: document.getElementById('ov-socks'),
   ovUpstream: document.getElementById('ov-upstream'),
+  ovBind: document.getElementById('ov-bind'),
+  ovKeyDate: document.getElementById('ov-keydate'),
   testResult: document.getElementById('test-result'),
   sideFoot: document.getElementById('side-foot')
 };
@@ -67,6 +73,15 @@ async function init() {
     if (version) elements.sideFoot.textContent = `v${version} · 纸感墨白`;
   } catch { /* version label is cosmetic — keep the HTML fallback */ }
 
+  // Today's key date for the overview row. Computed in the main process from
+  // utils.js (the same function minting the key), fetched once per launch —
+  // the value only changes at Beijing midnight, and the app restarting is a
+  // natural (if belated) refresh for that edge case.
+  try {
+    const keyDate = await window.electronAPI.getKeyDate();
+    if (keyDate) elements.ovKeyDate.textContent = keyDate;
+  } catch { /* keep the HTML placeholder */ }
+
   appendLog('提示：填写完成后点击「启动连接」即可。', 'info');
 }
 
@@ -76,14 +91,20 @@ function populateForm(config) {
   elements.serverPort.value = config.serverPort || '8388';
   elements.localPort.value = config.localPort || '1080';
   elements.keySuffix.value = config.keySuffix || '';
+  elements.autoConnect.checked = config.autoConnect === true;
+  elements.allowLan.checked = config.allowLan === true;
   elements.autoReconnect.checked = config.autoReconnect !== false;
   refreshOverview();
 }
 
-// Keep the overview's read-only summary in sync with the form values.
+// Keep the overview's read-only summary in sync with the form values. The
+// SOCKS address and 绑定地址 row mirror the actual listen host: 0.0.0.0 when
+// LAN sharing is on (the client binds all interfaces), 127.0.0.1 otherwise.
 function refreshOverview() {
   const localPort = elements.localPort.value.trim() || '1080';
-  elements.ovSocks.textContent = `socks5://127.0.0.1:${localPort}`;
+  const listenHost = elements.allowLan.checked ? '0.0.0.0' : '127.0.0.1';
+  elements.ovSocks.textContent = `socks5://${listenHost}:${localPort}`;
+  elements.ovBind.textContent = listenHost;
 
   const host = elements.serverHost.value.trim();
   const serverPort = elements.serverPort.value.trim() || '8388';
@@ -148,13 +169,18 @@ function setupEventListeners() {
     }
   });
 
-  // Auto-save: every field persists as soon as it changes (text fields commit
-  // on blur / Enter via the DOM 'change' event). No log line — auto-save runs
-  // too often to spam the panel.
+  // Auto-save is gone: the settings page only persists on 保存设置. The
+  // change listeners remain so the overview's read-only summary (SOCKS
+  // address, bind host, upstream) tracks the form live — without writing
+  // anything to disk.
   for (const id of ['serverHost', 'serverPort', 'localPort', 'keySuffix']) {
-    elements[id].addEventListener('change', saveSettings);
+    elements[id].addEventListener('change', refreshOverview);
   }
-  elements.autoReconnect.addEventListener('change', saveSettings);
+  elements.autoConnect.addEventListener('change', refreshOverview);
+  elements.allowLan.addEventListener('change', refreshOverview);
+  elements.autoReconnect.addEventListener('change', refreshOverview);
+
+  elements.btnSave.addEventListener('click', saveSettings);
 
   // Log panel: expanded by default, the title toggles it
   const toggleLog = () => elements.logCard.classList.toggle('collapsed');
@@ -197,29 +223,48 @@ function setupIPCHandlers() {
   });
 }
 
-// Save settings (auto-save: called on every field change, stays silent).
-// Never rejects. It is wired directly to the fields' 'change' event, where a
-// rejection would surface as an unhandled rejection with nothing for the user
-// to act on; callers that await it (startProxy/testConnection) must not be
-// aborted by a failed write either.
-async function saveSettings() {
-  const newConfig = {
+// Read the form as one snapshot. The form is the launch source of truth
+// (启动连接/测试连接 use it verbatim); the saved config is only what a
+// 保存设置 click persisted.
+function readForm() {
+  return {
     serverHost: elements.serverHost.value.trim(),
     serverPort: elements.serverPort.value.trim() || '8388',
     localPort: elements.localPort.value.trim() || '1080',
     keySuffix: elements.keySuffix.value.trim(),
+    autoConnect: elements.autoConnect.checked,
+    allowLan: elements.allowLan.checked,
     autoReconnect: elements.autoReconnect.checked
   };
+}
 
-  // Adopt the form values first: they are what the next launch validates, and
-  // persisting them is best-effort, so a failed write must not leave `config`
-  // describing the previous values.
+// Save settings — bound ONLY to the 保存设置 button (no auto-save). Never
+// rejects; every outcome lands in #save-result next to the button.
+async function saveSettings() {
+  const newConfig = readForm();
+
+  // Adopt the form values as the saved snapshot first: persisting is
+  // best-effort, and a failed write must not leave `config` stale.
   config = newConfig;
   refreshOverview();
+
+  const result = elements.saveResult;
   try {
     await window.electronAPI.saveConfig(newConfig);
+    if (result) {
+      result.textContent = '已保存';
+      result.dataset.state = 'success';
+      result.hidden = false;
+      clearTimeout(saveSettings._timer);
+      saveSettings._timer = setTimeout(() => { result.hidden = true; }, 2000);
+    }
   } catch (err) {
     console.error('saveConfig failed:', err);
+    if (result) {
+      result.textContent = `保存失败: ${err.message}`;
+      result.dataset.state = 'error';
+      result.hidden = false;
+    }
   }
 }
 
@@ -232,16 +277,12 @@ async function saveSettings() {
 // #test-result (aria-live), right next to the button, in the mockup's
 // restrained ink-on-paper voice.
 async function testConnection() {
-  // The probe reads the values in `config`, so persist the form first — but a
-  // failed save must not silently kill the test (the user asked to test what
-  // is on screen, not to verify the disk). Never rejects.
-  try {
-    await saveSettings();
-  } catch (err) {
-    appendLog(`设置保存失败（仍按当前表单测试）: ${err.message}`, 'error');
-  }
+  // The probe runs against the FORM values: what is on screen is what gets
+  // tested. Nothing is persisted — the saved config only changes on 保存设置.
+  const host = elements.serverHost.value.trim();
+  const port = elements.serverPort.value.trim() || '8388';
+  const keySuffix = elements.keySuffix.value.trim();
 
-  const host = config.serverHost;
   if (!host) {
     showTestResult('error', '请先填写服务器地址');
     appendLog('请填写服务器地址后再测试', 'error');
@@ -250,11 +291,11 @@ async function testConnection() {
 
   elements.btnTest.disabled = true;
   elements.btnTest.textContent = '测试中...';
-  showTestResult('pending', `正在测试 ${host}:${config.serverPort} ...`);
-  appendLog(`测试连接 ${host}:${config.serverPort} ...`, 'info');
+  showTestResult('pending', `正在测试 ${host}:${port} ...`);
+  appendLog(`测试连接 ${host}:${port} ...`, 'info');
 
   try {
-    const result = await window.electronAPI.testConnection(host, config.serverPort);
+    const result = await window.electronAPI.testConnection(host, port, keySuffix);
     if (result.ok) {
       showTestResult('success', result.message);
       appendLog(`✓ ${result.message}`, 'info');
@@ -286,17 +327,21 @@ function showTestResult(state, message) {
 
 // Start proxy
 async function startProxy() {
-  await saveSettings();
+  // Launch with the FORM values: what is on screen is what starts. The values
+  // ride along as a launch-time override — they are NOT persisted here; the
+  // disk copy only changes on 保存设置. (Otherwise "启动连接" would silently
+  // save unsaved edits, defeating the explicit-save button.)
+  const form = readForm();
 
   // Single validation pass, run in the main process against the same utils.js
   // the launch itself uses (the preload cannot require local files under the
   // sandbox, and a second copy of these rules would be free to drift).
   const validationError = await window.electronAPI.validateConfig({
-    serverHost: config.serverHost,
-    serverPort: config.serverPort,
-    localPort: config.localPort,
+    serverHost: form.serverHost,
+    serverPort: form.serverPort,
+    localPort: form.localPort,
     keyMode: 'daily',
-    keySuffix: config.keySuffix
+    keySuffix: form.keySuffix
   });
   if (validationError) {
     appendLog(validationError, 'error');
@@ -305,7 +350,7 @@ async function startProxy() {
 
   appendLog('正在启动代理...', 'info');
   try {
-    await window.electronAPI.startProxy();
+    await window.electronAPI.startProxy(form);
   } catch (err) {
     // IPC failures (e.g. the client binary is missing) must surface in the
     // UI instead of becoming an unhandled rejection with a dead button.
@@ -328,19 +373,21 @@ function updateStatus(running) {
   isRunning = running;
 
   // The single toggle button is never disabled — its label and color carry
-  // the state: 朱砂 fill invites a start, 墨 fill marks the live session and
-  // offers the disconnect.
+  // the state: 松绿 fill invites a start (green = go), 朱砂 fill marks the
+  // live session and offers the disconnect (red = stop). Cinnabar stays the
+  // primary/warning color elsewhere (保存设置); it only appears here once a
+  // session is actually live.
   if (running) {
     elements.btnToggle.textContent = '断开连接';
-    elements.btnToggle.classList.remove('btn-fill');
-    elements.btnToggle.classList.add('btn-dark');
+    elements.btnToggle.classList.remove('btn-pine');
+    elements.btnToggle.classList.add('btn-fill');
     elements.statusDot.classList.add('running');
     elements.statusText.textContent = '运行中';
     elements.trafficIndicator.hidden = false;
   } else {
     elements.btnToggle.textContent = '启动连接';
-    elements.btnToggle.classList.remove('btn-dark');
-    elements.btnToggle.classList.add('btn-fill');
+    elements.btnToggle.classList.remove('btn-fill');
+    elements.btnToggle.classList.add('btn-pine');
     elements.statusDot.classList.remove('running');
     elements.statusText.textContent = '未运行';
     elements.trafficIndicator.hidden = true;

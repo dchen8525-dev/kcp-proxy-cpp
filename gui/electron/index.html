@@ -53,12 +53,13 @@
           <div class="status-sub">SOCKS5 over KCP 加密隧道 · 每日密钥自动轮换</div>
           <hr class="rule"/>
           <dl class="kv">
-            <div><dt>本地 SOCKS5</dt><dd><code id="ov-socks">socks5://127.0.0.1:1080</code></dd></div>
-            <div><dt>上游服务器</dt><dd><code id="ov-upstream">—</code></dd></div>
-            <div><dt>密钥模式</dt><dd><code>每日密钥（北京日期 + 后缀）</code></dd></div>
+            <div><dt>本地 SOCKS5</dt><dd><code id="ov-socks">socks5://127.0.0.1:1080</code><span class="kv-desc">浏览器与程序接入代理的入口地址</span></dd></div>
+            <div><dt>上游服务器</dt><dd><code id="ov-upstream">—</code><span class="kv-desc">KCP 加密隧道对端（地址:端口）</span></dd></div>
+            <div><dt>绑定地址</dt><dd><code id="ov-bind">127.0.0.1</code><span class="kv-desc">127.0.0.1 仅本机；0.0.0.0 允许局域网</span></dd></div>
+            <div><dt>今日密钥日期</dt><dd><code id="ov-keydate">—</code><span class="kv-desc">完整密钥 = 北京日期 + 密钥后缀，每日自动轮换</span></dd></div>
           </dl>
           <div class="actions">
-            <button class="btn btn-fill" id="btn-toggle">启动连接</button>
+            <button class="btn btn-pine" id="btn-toggle">启动连接</button>
             <button class="btn btn-line" id="btn-test">测试连接</button>
             <span class="test-result" id="test-result" aria-live="polite"></span>
             <span class="traffic-indicator" id="traffic-indicator" hidden>
@@ -71,7 +72,7 @@
         <!-- 连接设置 -->
         <section class="view" id="v-conf" hidden>
           <h2 class="view-title">连接设置</h2>
-          <div class="view-sub">修改后自动保存，重连生效。</div>
+          <div class="view-sub">点击「保存设置」后修改才会保存；启动连接按当前表单执行。</div>
           <div class="grid2">
             <div class="fld"><label for="serverHost">服务器地址 (IP/域名)</label><input type="text" id="serverHost" placeholder="例如: example.com" spellcheck="false"/></div>
             <div class="fld"><label for="serverPort">服务器端口</label><input type="text" id="serverPort" placeholder="8388" inputmode="numeric"/></div>
@@ -79,9 +80,15 @@
             <div class="fld"><label for="keySuffix">密钥后缀</label><input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线" spellcheck="false"/></div>
           </div>
           <div class="checks">
+            <label class="checkbox-label"><input type="checkbox" id="autoConnect"/><span class="checkbox-custom"></span><span>打开应用时自动连接</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="allowLan"/><span class="checkbox-custom"></span><span>允许局域网使用（默认仅 127.0.0.1）</span></label>
             <label class="checkbox-label"><input type="checkbox" id="autoReconnect"/><span class="checkbox-custom"></span><span>断线重连</span></label>
           </div>
-          <div class="note">完整密钥 = 北京日期 (YYYYMMDD) + 后缀。固定密钥（<code>-k</code>）仅在命令行客户端可用。</div>
+          <div class="actions">
+            <button class="btn btn-fill" id="btn-save">保存设置</button>
+            <span class="test-result" id="save-result" aria-live="polite"></span>
+          </div>
+          <div class="note">完整密钥 = 北京日期 (YYYYMMDD) + 密钥后缀，每日自动轮换，客户端与服务端需一致。</div>
         </section>
 
         <!-- 运行日志 -->

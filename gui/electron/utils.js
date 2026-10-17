@@ -67,11 +67,13 @@ function validateLaunchConfig(cfg) {
 // deliberately ABSENT from these args: it travels through KCP_PROXY_KEY in
 // the environment (see buildClientEnv) because a process command line is
 // visible to every local user, while its environment is not.
-function buildClientArgs({ serverHost, serverPort, localPort }) {
+// allowLan binds the SOCKS listener to 0.0.0.0 instead of loopback only —
+// the default stays 127.0.0.1 so a fresh install never exposes the proxy.
+function buildClientArgs({ serverHost, serverPort, localPort, allowLan }) {
   return [
     '-s', String(serverHost),
     '-p', String(serverPort),
-    '-H', '127.0.0.1',
+    '-H', allowLan ? '0.0.0.0' : '127.0.0.1',
     '-l', String(localPort),
     '-L', 'info'
   ];

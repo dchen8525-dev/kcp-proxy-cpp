@@ -28,12 +28,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   validateConfig: (config) => ipcRenderer.invoke('validate-config', config),
   // Packaged app version (drives the sidebar footer label).
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  // Today's key date (Beijing, YYYYMMDD) for the overview panel.
+  getKeyDate: () => ipcRenderer.invoke('get-key-date'),
 
-  // Proxy control
-  startProxy: () => ipcRenderer.invoke('start-proxy'),
+  // Proxy control. startProxy accepts an optional launch-time config
+  // override (the settings form) — used for THIS launch only, never persisted.
+  startProxy: (config) => ipcRenderer.invoke('start-proxy', config),
   stopProxy: () => ipcRenderer.invoke('stop-proxy'),
   getStatus: () => ipcRenderer.invoke('get-status'),
-  testConnection: (host, port) => ipcRenderer.invoke('test-connection', host, port),
+  testConnection: (host, port, keySuffix) =>
+    ipcRenderer.invoke('test-connection', host, port, keySuffix),
 
   // Window control
   minimizeWindow: () => ipcRenderer.send('window-minimize'),
