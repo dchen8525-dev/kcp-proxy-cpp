@@ -15,11 +15,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import re
 import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -805,6 +807,133 @@ def test_suffix_validation_agrees():
                 f"suffix {value!r} must be rejected")
 
 
+def test_deb_postinst_generates_suffix_and_resets_failed():
+    """First-install deb experience: the shipped server.env carries an empty
+    SUFFIX (the package is public -- embedding one would leak key material)
+    and the wrapper refuses to start without it. The postinst must therefore
+    (a) generate a random suffix before restarting, or every fresh
+    `apt install` fails five times into a start-limit latch, and (b) reset
+    the failed-unit state before restarting, or an earlier crash loop
+    refuses the very restart that was supposed to fix the configuration.
+    Field incident 2026-10-17: the user's manual restart hit start-limit-hit
+    and looked like 'the deb is broken' while the service was actually fine.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "package"))
+    import package  # noqa: E402
+
+    postinst = package.DEB_POSTINST
+
+    # Static ordering: generate suffix -> reset-failed -> restart. Any restart
+    # that can run before the suffix exists re-creates the 0.0.19 incident.
+    gen_at = postinst.find("/dev/urandom")
+    reset_at = postinst.find("systemctl reset-failed")
+    restart_at = postinst.rfind('systemctl restart "$SERVICE_NAME"')
+    require(gen_at != -1,
+            "postinst must generate a random suffix via /dev/urandom when "
+            "the shipped server.env has an empty SUFFIX")
+    require(reset_at != -1,
+            "postinst must systemctl reset-failed before restarting, or a "
+            "start-limit latch from earlier failures refuses the restart")
+    require(gen_at < reset_at < restart_at,
+            "postinst ordering must be: generate suffix -> reset-failed -> "
+            "restart (restart_at is the LAST restart; an earlier one is fatal)")
+
+    # The generated suffix must actually land in server.env, and the file must
+    # stay 0600 -- it holds the long-lived half of the daily key.
+    require('sed -i "s|^SUFFIX=.*' in postinst,
+            "postinst must write the generated suffix into the existing "
+            "server.env via sed (a full-file rewrite would clobber PORT/HOST)")
+    require("chmod 600" in postinst,
+            "postinst must keep server.env at 0600 after writing the suffix")
+
+    # Runtime: execute the rendered generation block under a real POSIX shell.
+    # Static reading is exactly how the i.pid trap survived review.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import beijing_timer_schedule_check as bj
+
+    i = postinst.index('        cur_suffix=""')
+    j = postinst.index("systemctl reset-failed", i)
+    block = postinst[i:j]
+
+    shell = bj.resolve_shell("bash")
+    if shell:
+        tmp = Path(tempfile.mkdtemp())
+        env_file = tmp / "server.env"
+        # Render: the f-string already substituted the real /etc paths; point
+        # them at the sandbox. Longer path first or the dir rewrite would
+        # corrupt the file path.
+        block = block.replace("/etc/kcp-proxy/server.env", str(env_file).replace("\\", "/"))
+        block = block.replace("/etc/kcp-proxy", str(tmp).replace("\\", "/"))
+
+        def run(block_text, sh=shell):
+            script = tmp / "probe.sh"
+            script.write_bytes(block_text.encode("utf-8"))
+            return subprocess.run([sh, bj.to_posix(script)],
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+
+        # Case A: shipped conffile with empty SUFFIX -> gets a 24-char suffix,
+        # other lines preserved.
+        env_file.write_bytes(
+            b"SUFFIX=\nPORT=8388\nHOST=0.0.0.0\nLOG_FILE=/var/log/kcp-proxy/server.log\n")
+        proc = run(block)
+        require(proc.returncode == 0,
+                f"suffix generation must succeed, got exit {proc.returncode}: "
+                f"{proc.stderr.strip()[:200]}")
+        got = dict(
+            line.split("=", 1) for line in
+            env_file.read_text(encoding="utf-8").strip().splitlines()
+            if "=" in line and not line.startswith("#"))
+        require(re.fullmatch(r"[0-9a-f]{24}", got.get("SUFFIX", "")) is not None,
+                f"generated suffix must be 24 hex chars, got {got.get('SUFFIX')!r}")
+        require(got.get("PORT") == "8388" and got.get("HOST") == "0.0.0.0",
+                "suffix generation must not clobber the other env lines")
+        require(got["SUFFIX"] != "0" * 24, "generated suffix must not be trivial")
+
+        # Case B: an already-configured suffix is never overwritten.
+        env_file.write_bytes(b"SUFFIX=mysecret123\nPORT=9000\n")
+        run(block)
+        content = env_file.read_text(encoding="utf-8")
+        require("SUFFIX=mysecret123" in content and "PORT=9000" in content,
+                "postinst must leave a configured SUFFIX untouched")
+
+        # Case C: missing conffile (dpkg conffile prompt declined, etc.) ->
+        # the file is created, not a silent no-op.
+        env_file.unlink()
+        run(block)
+        require(env_file.exists()
+                and re.fullmatch(r"SUFFIX=[0-9a-f]{24}\n",
+                                 env_file.read_text(encoding="utf-8")) is not None,
+                "postinst must create server.env when it is missing")
+
+        # The real postinst runs under dash on Debian (bashisms already bit
+        # this repo once), so case A must also pass there when dash exists.
+        dash = bj.resolve_shell("dash")
+        if dash and dash != shell:
+            env_file.write_bytes(b"SUFFIX=\nPORT=8388\n")
+            proc_dash = run(block, sh=dash)
+            require(proc_dash.returncode == 0,
+                    f"suffix generation must succeed under dash, got exit "
+                    f"{proc_dash.returncode}: {proc_dash.stderr.strip()[:200]}")
+            require("SUFFIX=" in env_file.read_text(encoding="utf-8"),
+                    "dash run must produce a SUFFIX line")
+
+        # Case D: mode must be 0600 after generation (key material lives here).
+        if os.name == "nt":
+            # MSYS maps the POSIX bits onto Windows ACLs; stat() mode here is
+            # not evidence of anything. The chmod 600 static check above and
+            # the ubuntu CI run carry this contract.
+            pass
+        else:
+            mode = os.stat(env_file).st_mode & 0o777
+            require(mode == 0o600,
+                    f"server.env must be 0600 after generation, got {oct(mode)}")
+    else:
+        # No POSIX shell at all: the static ordering checks above still ran,
+        # and the runtime half is covered on the ubuntu smoke job.
+        print("SKIP runtime part: no POSIX shell found")
+
+
 # --------------------------------------------------------------------------- #
 # CI wiring
 # --------------------------------------------------------------------------- #
@@ -893,6 +1022,7 @@ TESTS = [
     test_uninstaller_refuses_empty_installdir,
     test_uninstaller_file_removal_is_reachable,
     test_suffix_validation_agrees,
+    test_deb_postinst_generates_suffix_and_resets_failed,
     test_ci_runs_this_suite_and_the_whitespace_check,
     test_archive_members,
 ]

@@ -413,6 +413,42 @@ case "$1" in
 
         systemctl daemon-reload
         systemctl enable "$SERVICE_NAME" >/dev/null
+
+        # A first install ships SUFFIX= empty (the package is public -- an
+        # embedded suffix would leak the key material) and the wrapper refuses
+        # to start without it. The old unconditional restart here burned the
+        # StartLimitBurst=5 budget on five guaranteed SUFFIX-not-set failures
+        # and latched start-limit-hit right when the user finished editing
+        # server.env and tried to restart by hand. Generate a machine-local
+        # random suffix instead so a fresh `apt install` comes up on the very
+        # first restart; an already-configured suffix is left untouched.
+        cur_suffix=""
+        if [ -f {ENV_FILE} ]; then
+            cur_suffix=$(grep -E '^SUFFIX=' {ENV_FILE} | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
+        fi
+        if [ -z "$cur_suffix" ]; then
+            # 64 random bytes -> 128 hex chars -> keep 24. od+tr is POSIX;
+            # /dev/urandom exists on every Linux host this deb targets.
+            gen_suffix=$(head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \\n' | cut -c1-24)
+            if [ -n "$gen_suffix" ]; then
+                mkdir -p {ENV_DIR}
+                if [ -f {ENV_FILE} ]; then
+                    sed -i "s|^SUFFIX=.*|SUFFIX=$gen_suffix|" {ENV_FILE}
+                else
+                    printf 'SUFFIX=%s\\n' "$gen_suffix" > {ENV_FILE}
+                fi
+                chmod 600 {ENV_FILE}
+                echo "kcp-proxy-server: no SUFFIX configured -- generated a random" >&2
+                echo "  one in {ENV_FILE}. Full daily key = Beijing date (YYYYMMDD)" >&2
+                echo "  + that suffix. Read it with:" >&2
+                echo "    grep '^SUFFIX=' {ENV_FILE}" >&2
+            fi
+        fi
+
+        # Clear a crash-loop latch from an earlier failed boot attempt: without
+        # reset-failed a burst of pre-fix failures would refuse the very
+        # restart that was supposed to fix the configuration.
+        systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
         systemctl restart "$SERVICE_NAME"
 
         systemctl enable --now "$TIMER_UNIT"
