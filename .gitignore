@@ -70,6 +70,9 @@ update_service.py
 # Electron GUI
 gui/electron/dist/
 gui/electron/node_modules/
+# Ad-hoc electron-builder output dirs (-c.directories.output=<name>), used for
+# local install/uninstall e2e runs. Never part of a release.
+gui/electron/dist-*/
 
 # Release packages (keep only in releases)
 *.zip

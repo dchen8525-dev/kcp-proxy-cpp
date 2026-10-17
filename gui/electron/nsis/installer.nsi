@@ -90,6 +90,14 @@ LangString detailRegistry ${LANG_ENGLISH} "Writing registry entries..."
 LangString detailShortcuts ${LANG_SIMPCHINESE} "正在创建快捷方式..."
 LangString detailShortcuts ${LANG_ENGLISH} "Creating shortcuts..."
 
+# Leftover warnings for the uninstaller's removal check (see
+# uninstaller_details.nsh): RMDir /r silently skips locked files, so the
+# uninstall section verifies and reports instead of claiming success.
+LangString uninstallIncomplete ${LANG_SIMPCHINESE} "卸载未完全完成：以下目录中的部分文件仍被占用，请关闭相关进程后手动删除该目录。$\r$\n"
+LangString uninstallIncomplete ${LANG_ENGLISH} "Uninstall incomplete: some files in the directory below are still in use. Close the processes using them and delete the directory manually.$\r$\n"
+LangString uninstallNoDir ${LANG_SIMPCHINESE} "无法确定安装目录，未删除任何文件。请通过「设置 > 应用」执行卸载。"
+LangString uninstallNoDir ${LANG_ENGLISH} "The install directory could not be determined, so no files were deleted. Please uninstall via Settings > Apps."
+
 !ifmacrodef customHeader
   !insertmacro customHeader
 !endif

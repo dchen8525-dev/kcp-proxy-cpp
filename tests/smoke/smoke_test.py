@@ -545,6 +545,126 @@ def test_gui_builder_and_tray_icons_wired():
             "main.js must not carry the retired programmatic status-icon code")
 
 
+# --------------------------------------------------------------------------- #
+# uninstaller (the 2026-10-17 "reported success, deleted nothing" incident)
+# --------------------------------------------------------------------------- #
+def _client_executable_name() -> str:
+    """The installed file name of the proxy client, straight from the builder
+    config -- so renaming the binary fails this suite instead of silently
+    un-protecting it."""
+    win = json.loads(read("gui/electron/electron-builder.win.json"))
+    names = {Path(entry["to"]).name
+             for entry in win.get("extraResources", [])}
+    require("kcp-proxy-client.exe" in names,
+            f"the proxy client must ship via win extraResources, got {names}")
+    return "kcp-proxy-client.exe"
+
+
+def test_uninstaller_kills_the_client_process():
+    """The GUI spawns kcp-proxy-client.exe as a child (image at
+    $INSTDIR\\resources). Force-killing the GUI (taskkill /F) bypasses the
+    app's own before-quit reaper, and a crashed GUI leaves the client orphaned
+    the same way -- either path keeps $INSTDIR\\resources locked and RMDir /r
+    then silently skips those files: "uninstall succeeded" with the whole
+    directory left behind. The stock check only knew ${APP_EXECUTABLE_FILENAME}."""
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    client = _client_executable_name()
+    for macro in ("FIND_PROCESS", "KILL_PROCESS"):
+        require(f'!insertmacro {macro} "{client}"' in nsh,
+                f"uninstaller_details.nsh must {macro.replace('_', ' ')} "
+                f"the client process, not only the GUI exe")
+
+
+def test_uninstaller_kills_gui_before_client():
+    """Order matters: the GUI respawns the client the moment it dies
+    (auto-reconnect), so the client may only be terminated once the GUI is
+    gone."""
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    gui = nsh.find('!insertmacro KILL_PROCESS "${APP_EXECUTABLE_FILENAME}"')
+    client = nsh.find(f'!insertmacro KILL_PROCESS '
+                      f'"{_client_executable_name()}"')
+    require(gui != -1, "GUI kill missing from uninstaller_details.nsh")
+    require(client != -1, "client kill missing from uninstaller_details.nsh")
+    require(gui < client,
+            "the client must be killed only after the GUI (the GUI's "
+            "reconnect logic respawns it)")
+
+
+def test_uninstaller_verifies_removal():
+    """RMDir /r silently skips files that are still locked, so the section
+    must check afterwards, retry the kill once, and surface leftovers instead
+    of claiming success."""
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    require(nsh.count("Call un.killAppProcesses") >= 2,
+            "the uninstall section must retry the kill after a failed RMDir")
+    require('IfFileExists "$INSTDIR\\*.*"' in nsh,
+            "the uninstall section must verify $INSTDIR is really gone")
+    require("RMDir /r $INSTDIR" in nsh,
+            "the uninstall section must still remove the install directory")
+
+    nsi = read("gui/electron/nsis/installer.nsi")
+    for name in ("uninstallIncomplete", "uninstallNoDir"):
+        require(f"LangString {name}" in nsi,
+                f"installer.nsi must define the bilingual {name} warning")
+    require("$(uninstallIncomplete)" in nsh,
+            "uninstaller_details.nsh must surface the leftover warning")
+
+
+def test_uninstaller_refuses_empty_installdir():
+    """An empty $INSTDIR turns RMDir /r into a silent no-op while the rest of
+    the section (registry, shortcuts) still runs -- "success" with everything
+    left behind. Refuse loudly instead."""
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    require('${if} $INSTDIR == ""' in nsh,
+            "the uninstall section must detect an unresolvable $INSTDIR")
+    require("$(uninstallNoDir)" in nsh,
+            "the empty-$INSTDIR branch must report the bilingual error")
+    # The refusal must abort the section, not fall through to a silent success.
+    idx = nsh.find('${if} $INSTDIR == ""')
+    require("Abort" in nsh[idx:idx + 500],
+            "the empty-$INSTDIR branch must Abort the section")
+
+
+def test_uninstaller_file_removal_is_reachable():
+    """Root cause of the 2026-10-17 incident: the patched uninstaller carried
+    `${else}` where the stock template has `!else`. The NSIS preprocessor does
+    not know `${else}` (a runtime LogicLib token), so `!ifmacrodef
+    customRemoveFiles` -- and customRemoveFiles is never defined -- jumped
+    straight to `!endif`, making the whole else-branch dead code. RMDir /r
+    $INSTDIR never ran, yet the section continued to the registry and
+    shortcut cleanup: "卸载成功" with every file still on disk. Pin the
+    preprocessor pairing so the removal block can never go dead again."""
+    for name in ("uninstaller_details.nsh", "installSection_details.nsh",
+                 "installer.nsh", "installer.nsi"):
+        text = read(f"gui/electron/nsis/{name}")
+        pp_depth = 0   # preprocessor !if...def / !endif nesting
+        rt_depth = 0   # runtime ${If}...${EndIf} nesting
+        for lineno, line in enumerate(text.split("\n"), 1):
+            stripped = line.strip()
+            pp_depth += len(re.findall(r"!if(macro)?(n)?def\b", line))
+            pp_depth -= len(re.findall(r"!endif\b", line))
+            # A runtime ${else} is only legal while a runtime ${If...} is
+            # open. With no runtime if open it can only be a mistyped
+            # preprocessor else -- the incident pattern.
+            if stripped == "${else}":
+                require(rt_depth > 0,
+                        f"{name}:{lineno}: ${{else}} with no open runtime "
+                        "${{If}} -- this is the incident typo: inside a "
+                        "!if...def block it makes the else-branch dead code")
+            rt_depth += len(re.findall(
+                r"\$\{[iI]f(?:[nN]ot)?\b", line))
+            rt_depth -= len(re.findall(r"\$\{[eE]nd[iI]f\b", line))
+        require(pp_depth == 0,
+                f"{name} has unbalanced preprocessor conditionals "
+                f"(depth {pp_depth})")
+
+    nsh = read("gui/electron/nsis/uninstaller_details.nsh")
+    require("!ifmacrodef customRemoveFiles" in nsh,
+            "the stock customRemoveFiles hook must stay wired")
+    require("RMDir /r $INSTDIR" in nsh,
+            "the install directory removal must stay in the script")
+
+
 def test_suffix_validation_agrees():
     """The shell and Python halves of the suffix rule must not drift: the
     installer validates it on the server, deploy.py validates it before upload."""
@@ -628,6 +748,11 @@ TESTS = [
     test_versions_agree,
     test_gui_icon_assets_are_valid,
     test_gui_builder_and_tray_icons_wired,
+    test_uninstaller_kills_the_client_process,
+    test_uninstaller_kills_gui_before_client,
+    test_uninstaller_verifies_removal,
+    test_uninstaller_refuses_empty_installdir,
+    test_uninstaller_file_removal_is_reachable,
     test_suffix_validation_agrees,
     test_ci_runs_this_suite_and_the_whitespace_check,
     test_archive_members,
