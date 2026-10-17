@@ -888,8 +888,29 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
             line.split("=", 1) for line in
             env_file.read_text(encoding="utf-8").strip().splitlines()
             if "=" in line and not line.startswith("#"))
-        require(re.fullmatch(r"[0-9a-f]{24}", got.get("SUFFIX", "")) is not None,
-                f"generated suffix must be 24 hex chars, got {got.get('SUFFIX')!r}")
+        if re.fullmatch(r"[0-9a-f]{24}", got.get("SUFFIX", "")) is None:
+            # Evidence first: run each pipeline stage in isolation so the
+            # failure message names the broken tool instead of just the
+            # symptom (the macos runner needed two rounds of this).
+            diag = tmp / "diag.sh"
+            diag.write_bytes((
+                'for t in head tr od sed mv grep cut; do command -v "$t" >/dev/null '
+                '&& echo "tool $t: ok" || echo "tool $t: MISSING"; done\n'
+                'g1=$(head -c 2048 /dev/urandom | tr -dc "a-f0-9" | head -c 24)\n'
+                'echo "tr_pipeline_len=${#g1}"\n'
+                'g2=$(od -An -N 32 -t x1 /dev/urandom 2>/dev/null | tr -d " \\n" | cut -c1-24)\n'
+                'echo "od_pipeline_len=${#g2}"\n'
+                'sed "s|^SUFFIX=.*|SUFFIX=DEADBEEF|" "$1" > "$1.diag" && '
+                'mv -f "$1.diag" "$1" && echo "sed_mv: ok" || echo "sed_mv: FAILED rc=$?"\n'
+            ).encode("utf-8"))
+            d = subprocess.run([shell, bj.to_posix(diag), str(env_file).replace("\\", "/")],
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            require(False,
+                    f"generated suffix must be 24 hex chars, got "
+                    f"{got.get('SUFFIX')!r}; file={env_file.read_text(encoding='utf-8')!r}; "
+                    f"block stdout={proc.stdout!r} stderr={proc.stderr!r}; "
+                    f"diag:\n{d.stdout}{d.stderr}")
         require(got.get("PORT") == "8388" and got.get("HOST") == "0.0.0.0",
                 "suffix generation must not clobber the other env lines")
         require(got["SUFFIX"] != "0" * 24, "generated suffix must not be trivial")
@@ -919,8 +940,13 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
             require(proc_dash.returncode == 0,
                     f"suffix generation must succeed under dash, got exit "
                     f"{proc_dash.returncode}: {proc_dash.stderr.strip()[:200]}")
-            require("SUFFIX=" in env_file.read_text(encoding="utf-8"),
-                    "dash run must produce a SUFFIX line")
+            got_dash = dict(
+                line.split("=", 1) for line in
+                env_file.read_text(encoding="utf-8").strip().splitlines()
+                if "=" in line and not line.startswith("#"))
+            require(re.fullmatch(r"[0-9a-f]{24}", got_dash.get("SUFFIX", "")) is not None,
+                    f"dash run must produce a 24-hex suffix, got "
+                    f"{got_dash.get('SUFFIX')!r}")
 
         # Case D: mode must be 0600 after generation (key material lives here).
         if os.name == "nt":

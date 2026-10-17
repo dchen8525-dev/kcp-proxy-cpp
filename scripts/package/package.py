@@ -428,13 +428,21 @@ case "$1" in
             cur_suffix=$(grep -E '^SUFFIX=' "$env_file" | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
         fi
         if [ -z "$cur_suffix" ]; then
-            # 2048 random bytes squeezed down to their hex digits (~128 chars
-            # survive on average), keep 24. tr -dc + head -c behave identically
-            # on GNU and BSD userland; the od option spelling and in-place sed
-            # do NOT (BSD sed in-place mode eats the next argument as the
-            # backup suffix and silently modifies nothing -- that is how the
-            # first 0.0.20 CI run failed on macos).
+            # Random 24 hex chars with a fallback chain: the primary pipeline
+            # is the canonical GNU/BSD-safe idiom, od is the backup, and if
+            # both come up empty the postinst says so LOUDLY instead of
+            # restarting a wrapper that is guaranteed to fail SUFFIX-not-set
+            # (the exact failure mode this block exists to prevent).
             gen_suffix=$(head -c 2048 /dev/urandom | tr -dc 'a-f0-9' | head -c 24)
+            if [ -z "$gen_suffix" ]; then
+                gen_suffix=$(od -An -N 32 -t x1 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-24)
+            fi
+            if [ -z "$gen_suffix" ]; then
+                echo "kcp-proxy-server: WARNING failed to generate a random" >&2
+                echo "  suffix (head/tr/od all unavailable or /dev/urandom" >&2
+                echo "  unreadable); the service will refuse to start until" >&2
+                echo "  SUFFIX is set in {ENV_FILE} by hand." >&2
+            fi
             if [ -n "$gen_suffix" ]; then
                 mkdir -p {ENV_DIR}
                 if [ -f "$env_file" ]; then
