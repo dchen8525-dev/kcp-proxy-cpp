@@ -160,6 +160,12 @@ sudo systemctl status kcp-proxy-server
 - 日志文件：`/var/log/kcp-proxy/server.log`（stdout+stderr 追加写入；超过 10 MiB 时在下次重启时轮转为 `.1`，仅保留一代。可在 `server.env` 中修改 `LOG_FILE` 路径，置空则只输出到 journald）
 - 日志查看：`journalctl -u kcp-proxy-server -f`（启动横幅等 systemd 输出），或 `tail -f /var/log/kcp-proxy/server.log`
 - 默认密钥：Beijing Date (YYYYMMDD) + suffix
+- 密钥轮换：systemd timer `kcp-proxy-server-key-refresh.timer` 在**北京时区** 00:00/06:00/12:00/18:00
+  重启服务端。调度表达式固定为 UTC（`OnCalendar=*-*-* 04,10,16,22:00:00 UTC`，即北京
+  00:00/06:00/12:00/18:00），因此**与服务器本地时区无关**：裸 `OnCalendar=` 会按主机时区解析，
+  在非 UTC+8 的机器上午夜触发点可能偏离北京日期切换近 14 小时。北京固定 UTC+8 且无夏令时，故
+  UTC 形式是精确的。若主机的 systemd 低于 228（不支持 `UTC` 后缀），安装脚本会自动换算成本地
+  墙钟时间并给出提示。日期变更后客户端也需重启，否则仍持有前一天的密钥。
 - 内核 UDP 缓冲上限：`/etc/sysctl.d/99-kcp-proxy.conf`（见下）
 
 #### 内核 UDP 缓冲上限（重要）

@@ -338,9 +338,10 @@ def main():
         print()
         print("NOTE: the key is re-derived from the Beijing date on every")
         print("service (re)start, and a systemd timer restarts the service at")
-        print("00:00/06:00/12:00/18:00 local time. A client process started")
-        print("before midnight keeps the previous day's key, so restart the")
-        print("client too once the date changes.")
+        print("00:00/06:00/12:00/18:00 Beijing time (the schedule is pinned to")
+        print("UTC, so the host's own timezone does not matter). A client")
+        print("process started before midnight keeps the previous day's key,")
+        print("so restart the client too once the date changes.")
         print("=" * 60)
 
 

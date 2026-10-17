@@ -367,11 +367,76 @@ case "$1" in
             fi
         fi
 
+        # The shipped timer ticks at Beijing 00:00/06:00/12:00/18:00 expressed in
+        # UTC, so it follows the key's date change on any host. A UTC suffix in
+        # OnCalendar= needs systemd >= 228 (2016); older systemd cannot parse it
+        # and the unit would load with no next elapse -- the key would then freeze
+        # silently until someone restarts by hand. Rewrite the schedule into
+        # host-local wall time in that case (Beijing is UTC+8 exactly, no DST).
+        TIMER_UNIT=kcp-proxy-server-key-refresh.timer
+        TIMER_PATH=/etc/systemd/system/$TIMER_UNIT
+        if systemd-analyze calendar '*-*-* 04,10,16,22:00:00 UTC' >/dev/null 2>&1; then
+            :
+        else
+            off=$(date +%z)
+            sign=1; case "$off" in -*) sign=-1 ;; esac
+            off=${{off#-}}; off=${{off#+}}
+            # Strip leading zeros by hand: $((10#...)) is a bashism and this
+            # postinst runs under dash on Debian.
+            oh=${{off%??}}; om=${{off#??}}
+            while [ "${{#oh}}" -gt 1 ] && [ "${{oh#0}}" != "$oh" ]; do oh=${{oh#0}}; done
+            while [ "${{#om}}" -gt 1 ] && [ "${{om#0}}" != "$om" ]; do om=${{om#0}}; done
+            off_min=$(( sign * (oh * 60 + om) ))
+            times=
+            for b in 0 360 720 1080; do
+                l=$(( (b - 480 + off_min) % 1440 )); [ "$l" -lt 0 ] && l=$(( l + 1440 ))
+                times="$times$(printf '%02d:%02d' "$(( l / 60 ))" "$(( l % 60 ))") "
+            done
+            times=$(printf '%s' "$times" | tr ' ' '\\n' | sort -u | tr '\\n' ' ')
+            first=$(printf '%s' "$times" | cut -d' ' -f1)
+            mi=$(printf '%s' "$first" | cut -d: -f2)
+            n=$(printf '%s' "$times" | wc -w)
+            # printf '%02d' always yields two digits, so "00" is whole-minute zero.
+            if [ "$mi" = "00" ] && [ "$n" -eq 4 ]; then
+                hs=$(printf '%s' "$times" | tr ' ' '\\n' | cut -d: -f1 | sort -n | paste -sd, -)
+                sched="*-*-* ${{hs}}:00:00"
+            else
+                # Sub-hour local offset: OnCalendar holds one time of day, so keep
+                # only the instant that matters -- Beijing midnight.
+                sched="*-*-* ${{first}}:00"
+            fi
+            echo "kcp-proxy-server: systemd cannot parse a UTC OnCalendar" >&2
+            echo "  schedule (needs >= 228); using host-local '$sched' instead." >&2
+            echo "  Re-install after a host timezone/UTC-offset change." >&2
+            sed -i "s|^OnCalendar=.*|OnCalendar=$sched|" "$TIMER_PATH"
+        fi
+
         systemctl daemon-reload
         systemctl enable "$SERVICE_NAME" >/dev/null
         systemctl restart "$SERVICE_NAME"
 
-        systemctl enable --now kcp-proxy-server-key-refresh.timer
+        systemctl enable --now "$TIMER_UNIT"
+
+        # Armed is not enough: the next tick must be within 6h + AccuracySec of
+        # now, or the key can go stale across a Beijing date change. A schedule
+        # that parsed but resolved to the wrong instants would pass a mere
+        # existence check, so verify the gap, not just the field.
+        nxt=$(systemctl show "$TIMER_UNIT" -p NextElapseUSecRealtime --value 2>/dev/null || true)
+        if [ -z "$nxt" ]; then
+            echo "kcp-proxy-server: WARNING $TIMER_UNIT has no next scheduled" >&2
+            echo "  run; the daily key will NOT rotate and clients will fail" >&2
+            echo "  DECRYPT_FAILED after the next Beijing date change." >&2
+        else
+            epoch=$(date -d "$nxt" +%s 2>/dev/null || echo '')
+            if [ -n "$epoch" ]; then
+                gap=$(( (epoch - $(date +%s)) / 3600 ))
+                if [ "$gap" -gt 6 ]; then
+                    echo "kcp-proxy-server: WARNING $TIMER_UNIT next run is" >&2
+                    echo "  ${{gap}}h away; the key can stay stale across a Beijing" >&2
+                    echo "  date change. Check: systemctl list-timers $TIMER_UNIT" >&2
+                fi
+            fi
+        fi
         ;;
 esac
 exit 0

@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 local)
+Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 Beijing time)
 
 [Timer]
 # Calendar schedule, deliberately NOT OnBootSec/OnUnitActiveSec. A monotonic
@@ -8,9 +8,24 @@ Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 local)
 # "active (elapsed)" with no next trigger. The server then keeps whatever
 # Beijing-date key it started with, so every client fails DECRYPT_FAILED until
 # someone restarts the service by hand.
-# 0/6:00 = 00:00, 06:00, 12:00, 18:00 local, so the key follows the Beijing
-# date change within a second instead of up to six hours later.
-OnCalendar=*-*-* 0/6:00:00
+#
+# The daily key is YYYYMMDD in Beijing time (UTC+8, no DST, ever), but systemd
+# evaluates a bare OnCalendar= in the *host's* local timezone. On a host that
+# is not UTC+8 the 00:00 tick lands up to ~14h away from the Beijing date
+# change, so clients see DECRYPT_FAILED for hours after midnight Beijing time.
+#
+# Fix: express the schedule in UTC, which is host-independent and DST-proof.
+# Beijing 00:00/06:00/12:00/18:00 == UTC 16:00/22:00/04:00/10:00; 04,10,16,22
+# is that set sorted (order within the day is irrelevant to systemd).
+#
+# "UTC" as a timezone suffix is supported since systemd 228 (2016) -- NEWS
+# "CHANGES WITH 228" -- whereas a full IANA name such as Asia/Shanghai would
+# need systemd 252 and would silently fail to parse on anything older, leaving
+# the timer with no next elapse: exactly the frozen-key failure this timer
+# exists to prevent. scripts/deploy/install-service.sh probes the expression
+# with `systemd-analyze calendar` and falls back to a converted local-time
+# schedule on hosts too old for the suffix.
+OnCalendar=*-*-* 04,10,16,22:00:00 UTC
 Persistent=true
 
 [Install]

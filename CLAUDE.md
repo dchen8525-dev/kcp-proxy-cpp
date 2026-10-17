@@ -67,13 +67,26 @@ Key is derived via HKDF-SHA256 into AES-128-GCM keys (see README 协议与加密
   The server and client compare requested vs. effective size at startup and log a WARNING when clamped
   (`describe_buffer_clamp` in `socket_buffer.hpp`).
 - Key = Beijing date (YYYYMMDD) + suffix, re-derived on each service (re)start. A systemd timer
-  (`kcp-proxy-server-key-refresh.timer`, `OnCalendar=*-*-* 0/6:00:00`) restarts the service at
-  00:00/06:00/12:00/18:00 local time so the key follows the Beijing date change within seconds; clients
-  must restart after the key changes.
+  (`kcp-proxy-server-key-refresh.timer`) restarts the service at 00:00/06:00/12:00/18:00 **Beijing**
+  time so the key follows the Beijing date change within seconds; clients must restart after the key
+  changes.
+  The schedule is pinned to **UTC** (`OnCalendar=*-*-* 04,10,16,22:00:00 UTC` = Beijing
+  00:00/06:00/12:00/18:00), not left in host-local time: a bare `OnCalendar=` is evaluated in the
+  host's timezone, so on a non-UTC+8 host the midnight tick lands up to ~14h away from the date
+  change. Beijing is UTC+8 with no DST, so the UTC form is exact and host-independent. `UTC` as an
+  `OnCalendar` suffix needs systemd **>= 228** (a full IANA name like `Asia/Shanghai` would need 252
+  and would leave the timer with no next elapse on older hosts), so both installers probe it with
+  `systemd-analyze calendar` and fall back to converting the Beijing instants into host-local wall
+  time via `date +%z`. That fallback is mirrored in `install-service.sh` (bash) and the deb postinst
+  (**dash**, `/bin/sh`): keep the two byte-for-byte equivalent in logic and free of bashisms
+  (`$((10#..))`, `${var:off:len}`) — a bashism there aborts the whole dpkg install.
+  `tests/smoke/beijing_timer_schedule_check.py` executes both copies under `bash` and `dash` against
+  stubbed UTC offsets; `test_service_scripts` pins the exact expression in all three sources.
   Never express this schedule with `OnBootSec=`/`OnUnitActiveSec=`: systemd drops a monotonic elapse
   that is already past when the timer is (re)started, leaving the timer `active (elapsed)` with no next
   trigger, which silently freezes the server's key and makes every client fail `DECRYPT_FAILED`.
-  `install-service.sh` fails the install if the timer has no next elapse.
+  `install-service.sh` fails the install if the timer has no next elapse **or** if that elapse is more
+  than 6h away (a schedule that parsed but resolved to the wrong instants would otherwise pass).
   Uninstall removes the timer units (a legacy `# kcp-proxy-server` cron entry is purged only with `--purge`).
 
 ## Architecture

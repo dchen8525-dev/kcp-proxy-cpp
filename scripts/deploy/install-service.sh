@@ -321,9 +321,62 @@ echo "Enabling and starting $SERVICE_NAME ..."
 systemctl enable "$SERVICE_NAME" >/dev/null
 systemctl restart "$SERVICE_NAME"
 
-# ---------- systemd timer: refresh the daily key at 00/06/12/18 local ----------
+# ---------- systemd timer: refresh the daily key at 00/06/12/18 Beijing time ----------
+# The key is YYYYMMDD in Beijing time (UTC+8, no DST, ever), while a bare
+# OnCalendar= is evaluated in the *host's* local timezone. On a host that is not
+# UTC+8 the midnight tick lands hours away from the Beijing date change and
+# clients fail DECRYPT_FAILED well after Beijing midnight. So the schedule is
+# written in UTC: Beijing 00:00/06:00/12:00/18:00 == UTC 16:00/22:00/04:00/10:00.
+# "UTC" as a timezone suffix needs systemd 228 (2016). Older systemd (CentOS 7
+# = 219, for one) cannot parse it and would leave the timer with no next elapse
+# -- the silent frozen key this timer exists to prevent -- so probe first and
+# fall back to converting the Beijing instants into host-local wall time.
 TIMER_SERVICE="kcp-proxy-server-key-refresh.service"
 TIMER_UNIT="kcp-proxy-server-key-refresh.timer"
+TIMER_SCHEDULE='*-*-* 04,10,16,22:00:00 UTC'
+
+if systemd-analyze calendar "$TIMER_SCHEDULE" >/dev/null 2>&1; then
+    TIMER_TZ_NOTE="UTC (host-independent)"
+else
+    # Convert the four Beijing instants into host-local wall time using the
+    # current UTC offset. Beijing = UTC+8 exactly, so this is offset arithmetic,
+    # not a second opinion about the calendar.
+    _off=$(date +%z)                       # e.g. +0800 / -0430
+    _sign=1; case "$_off" in -*) _sign=-1 ;; esac
+    _off=${_off#-}; _off=${_off#+}
+    # Strip leading zeros by hand: the $((10#...)) base prefix is a bashism and
+    # this block is mirrored verbatim into the deb postinst, which runs under dash.
+    _oh=${_off%??}; _om=${_off#??}
+    while [ "${#_oh}" -gt 1 ] && [ "${_oh#0}" != "$_oh" ]; do _oh=${_oh#0}; done
+    while [ "${#_om}" -gt 1 ] && [ "${_om#0}" != "$_om" ]; do _om=${_om#0}; done
+    _off_min=$(( _sign * (_oh * 60 + _om) ))
+    _times=""
+    for _b in 0 360 720 1080; do
+        _l=$(( (_b - 480 + _off_min) % 1440 )); [ "$_l" -lt 0 ] && _l=$(( _l + 1440 ))
+        _times="$_times$(printf '%02d:%02d' "$(( _l / 60 ))" "$(( _l % 60 ))") "
+    done
+    _times=$(printf '%s' "$_times" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    _first=$(printf '%s' "$_times" | cut -d' ' -f1)
+    _mi=$(printf '%s' "$_first" | cut -d: -f2)
+    _n=$(printf '%s' "$_times" | wc -w)
+    # printf '%02d' always yields two digits, so "00" is the whole-minute zero.
+    if [ "$_mi" = "00" ] && [ "$_n" -eq 4 ]; then
+        # Whole-hour local offset: keep all four instants as an hour list.
+        _hs=$(printf '%s' "$_times" | tr ' ' '\n' | cut -d: -f1 | sort -n | paste -sd, -)
+        TIMER_SCHEDULE="*-*-* ${_hs}:00:00"
+    else
+        # Sub-hour local offset: OnCalendar holds a single time of day, so
+        # schedule the one that actually matters -- Beijing midnight, when the
+        # key changes -- and drop the redundant re-derives.
+        TIMER_SCHEDULE="*-*-* ${_first}:00"
+    fi
+    echo "NOTE: this systemd cannot parse a UTC OnCalendar schedule" >&2
+    echo "      (needs systemd >= 228); converted to host-local" >&2
+    echo "      '$TIMER_SCHEDULE'. If the host changes its UTC offset" >&2
+    echo "      (timezone or DST), re-run this installer." >&2
+    TIMER_TZ_NOTE="host-local fallback (systemd < 228)"
+fi
+
 cat > "/etc/systemd/system/$TIMER_SERVICE" << 'EOF'
 [Unit]
 Description=Refresh KCP proxy daily key
@@ -333,9 +386,9 @@ After=kcp-proxy-server.service
 Type=oneshot
 ExecStart=/bin/systemctl restart kcp-proxy-server.service
 EOF
-cat > "/etc/systemd/system/$TIMER_UNIT" << 'EOF'
+cat > "/etc/systemd/system/$TIMER_UNIT" << EOF
 [Unit]
-Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 local)
+Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 Beijing time)
 
 [Timer]
 # Calendar schedule, deliberately NOT OnBootSec/OnUnitActiveSec. A monotonic
@@ -344,9 +397,11 @@ Description=Refresh KCP proxy daily key (restart server at 00/06/12/18 local)
 # "active (elapsed)" with no next trigger. The server then keeps whatever
 # Beijing-date key it started with, so every client fails DECRYPT_FAILED until
 # someone restarts the service by hand.
-# 0/6:00 = 00:00, 06:00, 12:00, 18:00 local, so the key follows the Beijing
-# date change within a second instead of up to six hours later.
-OnCalendar=*-*-* 0/6:00:00
+#
+# Written in UTC (schedule below) so the ticks track the Beijing date change on
+# any host: Beijing 00:00/06:00/12:00/18:00 == UTC 16:00/22:00/04:00/10:00.
+# See the probing block above for the pre-228 local-time fallback.
+OnCalendar=$TIMER_SCHEDULE
 Persistent=true
 
 [Install]
@@ -365,11 +420,26 @@ if [ -z "$TIMER_NEXT" ]; then
     exit 1
 fi
 
+# Arming is not enough -- the next tick must also be close enough to Beijing
+# midnight, which is the whole point of the schedule. A schedule that parsed but
+# resolved to the wrong instants would survive the check above and freeze the key
+# for up to a day. Allow 6h + AccuracySec (1min default) before giving up.
+TIMER_NEXT_EPOCH=$(date -d "$TIMER_NEXT" +%s 2>/dev/null || echo "")
+if [ -n "$TIMER_NEXT_EPOCH" ]; then
+    TIMER_GAP_H=$(( (TIMER_NEXT_EPOCH - $(date +%s)) / 3600 ))
+    if [ "$TIMER_GAP_H" -gt 6 ]; then
+        echo "ERROR: $TIMER_UNIT next run is ${TIMER_GAP_H}h away; the key can stay" >&2
+        echo "       stale across a Beijing date change. Schedule: $TIMER_SCHEDULE" >&2
+        exit 1
+    fi
+fi
+
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
 echo
 echo "Service installed and started."
 echo "  Key today: ${DATE_BEIJING}<suffix>  (suffix length ${#SUFFIX}, re-derived on each restart)"
 echo "  Config:    $ENV_FILE"
+echo "  Refresh:   $TIMER_SCHEDULE  [$TIMER_TZ_NOTE]"
 echo
 echo "Commands:"
 echo "  Status:  systemctl status $SERVICE_NAME"
@@ -382,8 +452,9 @@ echo "  Stop:    systemctl stop $SERVICE_NAME"
 echo "  Restart: systemctl restart $SERVICE_NAME"
 echo
 echo "Note: the key is re-derived from the Beijing date on every (re)start."
-echo "A systemd timer restarts the service at 00:00/06:00/12:00/18:00 local"
-echo "time, so the server key follows the Beijing date change within seconds."
+echo "A systemd timer restarts the service at 00:00/06:00/12:00/18:00 Beijing"
+echo "time regardless of the host's own timezone, so the server key follows the"
+echo "Beijing date change within seconds."
 echo "A client process started before midnight still holds the previous day's"
 echo "key, so restart the client as well after the date changes."
 echo
