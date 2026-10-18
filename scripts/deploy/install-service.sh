@@ -351,9 +351,17 @@ else
     while [ "${#_om}" -gt 1 ] && [ "${_om#0}" != "$_om" ]; do _om=${_om#0}; done
     _off_min=$(( _sign * (_oh * 60 + _om) ))
     _times=""
+    _midnight=""
     for _b in 0 360 720 1080; do
         _l=$(( (_b - 480 + _off_min) % 1440 )); [ "$_l" -lt 0 ] && _l=$(( _l + 1440 ))
-        _times="$_times$(printf '%02d:%02d' "$(( _l / 60 ))" "$(( _l % 60 ))") "
+        _t=$(printf '%02d:%02d' "$(( _l / 60 ))" "$(( _l % 60 ))")
+        # _b=0 is Beijing midnight: keep its conversion for the sub-hour case
+        # below. The earliest wall-clock time of the four is NOT necessarily
+        # the date-change tick (on a UTC+5:45 host the earliest, 03:45, is
+        # Beijing 06:00 -- scheduling that one leaves the key stale for 6h
+        # after every Beijing midnight).
+        if [ "$_b" -eq 0 ]; then _midnight="$_t"; fi
+        _times="$_times$_t "
     done
     _times=$(printf '%s' "$_times" | tr ' ' '\n' | sort -u | tr '\n' ' ')
     _first=$(printf '%s' "$_times" | cut -d' ' -f1)
@@ -367,8 +375,9 @@ else
     else
         # Sub-hour local offset: OnCalendar holds a single time of day, so
         # schedule the one that actually matters -- Beijing midnight, when the
-        # key changes -- and drop the redundant re-derives.
-        TIMER_SCHEDULE="*-*-* ${_first}:00"
+        # key changes (the _b=0 conversion above, NOT the earliest wall-clock
+        # time of the four) -- and drop the redundant re-derives.
+        TIMER_SCHEDULE="*-*-* ${_midnight}:00"
     fi
     echo "NOTE: this systemd cannot parse a UTC OnCalendar schedule" >&2
     echo "      (needs systemd >= 228); converted to host-local" >&2

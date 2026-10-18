@@ -182,7 +182,21 @@ CASES = [
     ("-0800", -480),   # US Pacific
     ("+1400", 840),    # NZ
     ("-1100", -660),   # Pacific island
+    # Sub-hour offsets take the single-tick branch. That tick must be Beijing
+    # midnight's conversion -- the earliest wall-clock time of the four is a
+    # different instant (+0545: earliest local 03:45 is Beijing 06:00), and
+    # scheduling it leaves the key stale for hours after every date change.
+    ("+0545", 345),    # Nepal
+    ("-0330", -210),   # Newfoundland
 ]
+
+
+def expected_local_minutes(offset_min):
+    """Whole-hour hosts keep all four daily ticks; a sub-hour host's single
+    OnCalendar entry must be Beijing midnight's own conversion (b=0)."""
+    if offset_min % 60 == 0:
+        return expected_local_hours(offset_min)
+    return {(0 - 480 + offset_min) % 1440}
 
 
 def extract_rendered_postinst():
@@ -246,7 +260,7 @@ def main():
                 failures.append(f"{label} offset {off}: unparseable schedule {sched!r} "
                                 f"(stdout {proc.stdout!r})")
                 continue
-            want = expected_local_hours(off_min)
+            want = expected_local_minutes(off_min)
             if got != want:
                 failures.append(
                     f"{label} offset {off}: schedule {sched!r} -> local minutes {sorted(got)}, "

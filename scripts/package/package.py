@@ -388,9 +388,17 @@ case "$1" in
             while [ "${{#om}}" -gt 1 ] && [ "${{om#0}}" != "$om" ]; do om=${{om#0}}; done
             off_min=$(( sign * (oh * 60 + om) ))
             times=
+            midnight=
             for b in 0 360 720 1080; do
                 l=$(( (b - 480 + off_min) % 1440 )); [ "$l" -lt 0 ] && l=$(( l + 1440 ))
-                times="$times$(printf '%02d:%02d' "$(( l / 60 ))" "$(( l % 60 ))") "
+                t=$(printf '%02d:%02d' "$(( l / 60 ))" "$(( l % 60 ))")
+                # b=0 is Beijing midnight: keep its conversion for the sub-hour
+                # case below. The earliest wall-clock time of the four is NOT
+                # necessarily the date-change tick (on a UTC+5:45 host the
+                # earliest, 03:45, is Beijing 06:00 -- scheduling that one
+                # leaves the key stale for 6h after every Beijing midnight).
+                if [ "$b" -eq 0 ]; then midnight="$t"; fi
+                times="$times$t "
             done
             times=$(printf '%s' "$times" | tr ' ' '\\n' | sort -u | tr '\\n' ' ')
             first=$(printf '%s' "$times" | cut -d' ' -f1)
@@ -402,8 +410,9 @@ case "$1" in
                 sched="*-*-* ${{hs}}:00:00"
             else
                 # Sub-hour local offset: OnCalendar holds one time of day, so keep
-                # only the instant that matters -- Beijing midnight.
-                sched="*-*-* ${{first}}:00"
+                # only the instant that matters -- Beijing midnight (the b=0
+                # conversion above, NOT the earliest wall-clock time of the four).
+                sched="*-*-* ${{midnight}}:00"
             fi
             echo "kcp-proxy-server: systemd cannot parse a UTC OnCalendar" >&2
             echo "  schedule (needs >= 228); using host-local '$sched' instead." >&2
