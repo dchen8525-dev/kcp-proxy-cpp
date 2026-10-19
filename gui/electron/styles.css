@@ -526,37 +526,6 @@ h2.view-title {
   flex-direction: column;
 }
 
-.log-toggle {
-  cursor: pointer;
-  user-select: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 14px;
-  font-family: var(--serif);
-  font-size: 14px;
-  color: var(--ink);
-  border-bottom: 1px solid var(--line);
-}
-
-.log-chevron {
-  font-size: 11px;
-  color: var(--ink-3);
-  transition: transform .15s;
-}
-
-.log-card.collapsed {
-  flex: 0 0 auto;
-}
-
-.log-card.collapsed .log-container {
-  display: none;
-}
-
-.log-card.collapsed .log-chevron {
-  transform: rotate(-90deg);
-}
-
 .log-container {
   height: calc(100vh - 260px);
   min-height: 240px;

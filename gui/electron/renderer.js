@@ -20,7 +20,6 @@ const elements = {
   trafficUp: document.querySelector('.traffic-up'),
   trafficDown: document.querySelector('.traffic-down'),
   logCard: document.getElementById('log-card'),
-  logToggle: document.getElementById('log-toggle'),
   logContainer: document.getElementById('log-container'),
   ovSocks: document.getElementById('ov-socks'),
   ovUpstream: document.getElementById('ov-upstream'),
@@ -125,6 +124,9 @@ function setupNav() {
     a.classList.add('on');
     a.setAttribute('aria-current', 'page');
     views.forEach((v) => { v.hidden = v.id !== a.dataset.v; });
+    // Logs appended while the view was hidden couldn't scroll (display:none
+    // has scrollHeight 0), so landing on the log view must jump to the tail.
+    if (a.dataset.v === 'v-log') scrollLogToTail();
   };
 
   links.forEach((a) => {
@@ -181,17 +183,14 @@ function setupEventListeners() {
   elements.autoReconnect.addEventListener('change', refreshOverview);
 
   elements.btnSave.addEventListener('click', saveSettings);
+}
 
-  // Log panel: expanded by default, the title toggles it
-  const toggleLog = () => elements.logCard.classList.toggle('collapsed');
-  elements.logToggle.addEventListener('click', toggleLog);
-  // log-toggle carries role="button" + tabindex, so Enter/Space must toggle too.
-  elements.logToggle.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      toggleLog();
-    }
-  });
+// Scroll the log to its tail. Called both from appendLog and when the log
+// view becomes visible: while the view is hidden (display:none) the
+// container has scrollHeight 0, so appends that happened on other tabs
+// leave the scroll position at the top — a fresh view must jump to the end.
+function scrollLogToTail() {
+  elements.logContainer.scrollTop = elements.logContainer.scrollHeight;
 }
 
 // Setup IPC handlers
@@ -416,8 +415,9 @@ function appendLog(message, level = 'info') {
 
   elements.logContainer.appendChild(entry);
 
-  // Auto-scroll to bottom
-  elements.logContainer.scrollTop = elements.logContainer.scrollHeight;
+  // Auto-scroll to bottom — only while visible; a hidden container has no
+  // layout, and the view-switch handler catches up on return to the tab.
+  if (elements.logContainer.offsetParent !== null) scrollLogToTail();
 
   // Limit log entries
   const maxEntries = 1000;
