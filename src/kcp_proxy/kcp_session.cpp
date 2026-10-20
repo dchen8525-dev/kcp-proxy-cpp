@@ -58,6 +58,11 @@ void KCPSession::stop() {
         // crypto counter mismatch with client's new session.
         send_callback_ = nullptr;
 
+        // Drop a parked tcp->kcp loop: its hook holds the target socket and the
+        // read buffer, and a stale hook could restart a loop on a stopped
+        // session. The target socket itself is closed by close_connection().
+        unpark_write();
+
         // Clear pending flags to prevent race conditions when session is
         // reused or when checking stale sessions in the map.
         state_flags_.fetch_and(static_cast<uint8_t>(
@@ -133,6 +138,11 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
     LOG_DEBUG("kcp_session", fmt::format("{}: ikcp_input ok, peek_after={} wait_send={}",
               session_id_, kcp_.peek_size(), kcp_.wait_send()));
     try_fulfill_read();
+    // ikcp_input() is where the peer's ACKs are consumed, and consuming an ACK
+    // is the only thing that frees send-window space. Resume a parked tcp->kcp
+    // loop right here rather than waiting for the next tick: that is what keeps
+    // the window full instead of refilling it every 10ms.
+    maybe_resume_write();
 }
 
 void KCPSession::inject_decrypted(std::vector<uint8_t> decrypted, std::function<void()> after) {
@@ -157,6 +167,7 @@ void KCPSession::on_inject_decrypted(std::vector<uint8_t> decrypted) {
     }
     LOG_DEBUG("kcp_session", fmt::format("{}: inject ok, peek_after={}", session_id_, kcp_.peek_size()));
     try_fulfill_read();
+    maybe_resume_write();
 }
 
 bool KCPSession::is_alive() const {
@@ -183,6 +194,11 @@ void KCPSession::on_update_tick() {
     if (pending_read_handler_) {
         try_fulfill_read();
     }
+    // Safety net for a parked write loop: the receive path normally resumes it
+    // the instant an ACK frees space, but a window that drains without any
+    // further inbound datagram (e.g. the last ACK of a burst) would otherwise
+    // leave the loop asleep. 10ms is the worst-case refill latency.
+    maybe_resume_write();
 
     // Application-layer keepalive: a live but idle tunnel would otherwise be
     // reaped by the peer's idle sweep (KCP_TIMEOUT_SEC). Sending a heartbeat

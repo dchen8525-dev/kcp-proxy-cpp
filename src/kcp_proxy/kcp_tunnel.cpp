@@ -95,6 +95,39 @@ void KcpTunnel::do_send_fin() {
     LOG_INFO(log_module_, log_msg("FIN sent (half-close)"));
 }
 
+void KcpTunnel::park_write(std::function<void()> resume) {
+    // Called on the strand by the forwarding loop that just found the send queue
+    // full. Replacing an existing hook is correct: at most one loop writes into
+    // KCP per tunnel, so a second park can only be a re-park of the same loop
+    // after a resume that found the queue full again.
+    write_resume_cb_ = std::move(resume);
+    LOG_DEBUG(log_module_, log_msg("write loop parked, wait_send=" +
+                                   std::to_string(kcp_.wait_send())));
+}
+
+void KcpTunnel::unpark_write() {
+    if (!write_resume_cb_) return;
+    write_resume_cb_ = nullptr;
+    LOG_DEBUG(log_module_, log_msg("write loop unparked (teardown)"));
+}
+
+void KcpTunnel::maybe_resume_write() {
+    if (!write_resume_cb_) return;
+    // Still too full to accept another message: stay parked. The check is
+    // against the low watermark, not the park threshold, so a wakeup always
+    // admits at least KCP_BACKPRESSURE_BURST_MSGS messages' worth of room.
+    if (kcp_.wait_send() > KCP_BACKPRESSURE_RESUME_THRESHOLD) return;
+
+    // Take-and-clear BEFORE invoking: the resumed loop usually parks again
+    // immediately (the queue refills in a few messages), and it must be able to
+    // install a fresh hook rather than have this call clobber it afterwards.
+    auto resume = std::move(write_resume_cb_);
+    write_resume_cb_ = nullptr;
+    LOG_DEBUG(log_module_, log_msg("write loop resumed, wait_send=" +
+                                   std::to_string(kcp_.wait_send())));
+    resume();
+}
+
 std::string KcpTunnel::stats_summary() const {
     const auto& m = metrics_;
     return log_msg(fmt::format(

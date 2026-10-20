@@ -312,6 +312,12 @@ void KCPClientSession::on_close() {
         udp_socket_->close(ignored);
     }
 
+    // Drop a parked client->kcp loop before the pending read is completed below:
+    // its hook holds the local TCP socket and the read buffer, and must never be
+    // able to restart the loop on a closed session. The local socket is closed
+    // by forward_kcp_to_client's aborted-read path.
+    unpark_write();
+
     complete_pending_read(asio::error::operation_aborted);
 
     LOG_INFO("kcp_client", "closed");
@@ -344,6 +350,11 @@ void KCPClientSession::on_update_tick() {
     kcp_.update(now_kcp_ms());
     kcp_.flush();
     if (pending_read_handler_) try_fulfill_read();
+
+    // Safety net for a parked client->kcp write loop (see
+    // KcpTunnel::maybe_resume_write); the receive path normally resumes it
+    // immediately when an ACK frees window space.
+    maybe_resume_write();
 
     // Application-layer keepalive (see KcpTunnel::maybe_send_keepalive).
     maybe_send_keepalive();
@@ -460,6 +471,10 @@ void KCPClientSession::on_receive(byte_view packet) {
     }
     LOG_DEBUG("kcp_client", "ikcp_input ok, peek=" + std::to_string(kcp_.peek_size()));
     try_fulfill_read();
+    // ACKs consumed by ikcp_input() are what free send-window space; resuming a
+    // parked client->kcp loop here keeps the upload window full instead of
+    // refilling it on the 10ms tick (see KcpTunnel::park_write).
+    maybe_resume_write();
 }
 
 void KCPClientSession::handle_kcp_output(byte_view data) {

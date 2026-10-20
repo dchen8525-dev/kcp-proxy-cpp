@@ -162,8 +162,8 @@ unavailable, the reply uses `0.0.0.0:0`; it does not echo the target address.
 - `interval = 10ms`
 - `fast resend = 5`
 - `nc = 1`
-- send window `256`
-- receive window `512`
+- send window `1024`
+- receive window `1024`
 - MTU `1400`
 - update interval `10ms`
 - session timeout `60s`
@@ -171,7 +171,7 @@ unavailable, the reply uses `0.0.0.0:0`; it does not echo the target address.
 Server startup logs the same values as:
 
 ```text
-KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=256 rcvWnd=512 timeout=60s
+KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=1024 rcvWnd=1024 timeout=60s
 ```
 
 ## Failure Stages

@@ -12,13 +12,19 @@ Android App (Chrome / WebView)
       -> raw TCP to the real target
 ```
 
-Both ends must use the **same KCP parameters** or `ikcp` silently discards the
-peer's packets. The C++ server and client both print the canonical line at
-startup, rendered from `config.hpp`, and the Android peer prints the same values:
+`conv` **must** match on both ends or `ikcp` silently discards the peer's
+packets, and `mtu` must match because it sizes every datagram. The C++ server
+and client both print the canonical line at startup, rendered from `config.hpp`,
+and the Android peer prints its own values:
 
 ```text
-KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=256 rcvWnd=512 timeout=60s
+KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=1024 rcvWnd=1024 timeout=60s
 ```
+
+Only `conv` and `mtu` have to agree between the two ends. `nodelay`, `interval`,
+`resend` and `nc` are purely local send behaviour, and each side advertises its
+own `rcvWnd`, so a peer running different window sizes still interoperates --
+the smaller window simply wins for the direction it governs.
 
 When you start the C++ server, confirm this line appears before any traffic.
 
@@ -82,7 +88,7 @@ lifecycle stays at `INFO`; packet-level detail is `DEBUG` only.
 
 ```text
 [INFO] server: listening on 0.0.0.0:8388
-[INFO] server: KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=256 rcvWnd=512 timeout=60s
+[INFO] server: KCP config conv=1 mtu=1400 nodelay=1 interval=10 resend=5 nc=1 sndWnd=1024 rcvWnd=1024 timeout=60s
 [INFO] server: new session: <peer-ip>:<port> (total: 1)
 [INFO] server: <peer-ip>:<port>: KCP handshake confirmed (V2, half-close enabled)
 [INFO] server: <peer-ip>:<port>: SOCKS5 connect target cmd=1 atyp=1 host=<dst> port=80

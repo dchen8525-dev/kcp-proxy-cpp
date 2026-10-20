@@ -1199,6 +1199,22 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                              ": connected to target " + request.host + ":" +
                              std::to_string(request.port));
 
+                    // Nagle would hold a short write (a small response tail, or
+                    // the SOCKS5 reply path) until the previous segment is
+                    // ACKed, adding ~RTT/2 of latency to exactly the kind of
+                    // latency-sensitive traffic a proxy carries. The tunnel
+                    // already batches, so coalescing here buys nothing.
+                    {
+                        std::error_code nodelay_ec;
+                        tcp_socket->set_option(
+                            asio::ip::tcp::no_delay(true), nodelay_ec);
+                        if (nodelay_ec) {
+                            LOG_DEBUG("server", session->session_id() +
+                                      ": failed to set TCP_NODELAY: " +
+                                      nodelay_ec.message());
+                        }
+                    }
+
                     std::string bind_host;
                     uint16_t bind_port = 0;
                     std::error_code local_ec;
@@ -1369,25 +1385,28 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
     }
 
     // Backpressure: if KCP's send queue is already past the threshold, the
-    // network can't keep up with what we're feeding in. Pause TCP reads and
-    // re-arm via a short delay so we don't tight-loop. Safe to read wait_send
-    // here because we are on the strand.
+    // network can't keep up with what we're feeding in. Park the loop here and
+    // let the session resume it the moment ACKs free window space (see
+    // KcpTunnel::park_write) -- sleeping on a fixed timer and reading one buffer
+    // per wakeup is what pinned every tunnel to ~3 Mbps on a 190ms path.
+    // Safe to read wait_send here because we are on the strand.
     if (session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD) {
         LOG_DEBUG("server", session_id + ": backpressure (wait_send=" +
                   std::to_string(session->wait_send()) +
-                  " >= threshold=" + std::to_string(KCP_BACKPRESSURE_THRESHOLD) + "), delaying read");
-        // Timer bound to the session strand so the retry callback serializes with
-        // the strand handlers that read session state (is_running/wait_send), and
-        // so stop()/io stop aborts it via operation_aborted instead of letting it
-        // fire on a replaced/stopped session. The handler still re-checks
-        // is_running() to cover the replaced-session case.
-        auto retry = std::make_shared<asio::steady_timer>(session->strand());
-        retry->expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS * 4));
-        auto self = shared_from_this();
-        retry->async_wait([self, session_id = std::move(session_id), session,
-                           tcp_socket, buf, retry](const std::error_code& ec) mutable {
-            if (ec) return;
-            self->forward_tcp_to_kcp(std::move(session_id), session, tcp_socket, buf);
+                  " >= threshold=" + std::to_string(KCP_BACKPRESSURE_THRESHOLD) + "), parking read");
+        // The hook is stored INSIDE the session, so it must hold neither the
+        // session nor the server strongly: either would be a reference cycle
+        // (session -> hook -> session, and server -> sessions_ -> session ->
+        // hook -> server). Weak refs make an already-torn-down owner simply
+        // abandon the loop, which is exactly what a closed tunnel wants.
+        std::weak_ptr<KCPSession> weak_session = session;
+        std::weak_ptr<KCPServer> weak_self = shared_from_this();
+        std::string sid = session_id;
+        session->park_write([weak_self, sid, weak_session, tcp_socket, buf]() {
+            auto s = weak_session.lock();
+            auto server = weak_self.lock();
+            if (!s || !server) return;
+            server->forward_tcp_to_kcp(sid, s, tcp_socket, buf);
         });
         return;
     }

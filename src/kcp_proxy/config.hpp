@@ -11,8 +11,19 @@ namespace kcp_proxy {
 // use the same value or ikcp silently discards the peer's packets.
 constexpr uint32_t KCP_CONV = 1;
 constexpr int KCP_INTERVAL_MS = 10;
-constexpr int KCP_SNDWND = 256;
-constexpr int KCP_RCVWND = 512;
+// Window sizes are in SEGMENTS, so the throughput a single tunnel can sustain is
+// roughly sndWnd * (KCP_MTU - KCP_SEGMENT_OVERHEAD) / RTT. The old 256/512 pair
+// covered only ~14 Mbps at a 190ms RTT (a China -> US-west round trip), and a
+// measurement on that path showed the window -- not the link -- as the ceiling:
+// the VPS itself sustains >1 Gbps, while one tunnel stalled at a few Mbps.
+// 1024 segments gives ~1024 * 1376B / 190ms = 59 Mbps of headroom, which clears
+// the ~30 Mbps a residential international path actually delivers, and still
+// leaves the ramp-down to the path's own capacity. Memory is only consumed by
+// segments actually queued (a saturated tunnel is ~1.4 MB per direction), and
+// unauthenticated peers can never allocate a session at all, so the bound scales
+// with MAX_CONCURRENT_SESSIONS only for peers that hold the shared key.
+constexpr int KCP_SNDWND = 1024;
+constexpr int KCP_RCVWND = 1024;
 constexpr int KCP_MTU = 1400;
 // ikcp_nodelay() tuning. Named constants (instead of literals at the call
 // site) so the startup log and the live ikcp state can never drift apart —
@@ -159,6 +170,28 @@ constexpr int KCP_MAX_SEGMENTS_PER_MSG =
                      (KCP_MTU - KCP_SEGMENT_OVERHEAD));
 constexpr int KCP_BACKPRESSURE_THRESHOLD =
     KCP_SNDWND - KCP_MAX_SEGMENTS_PER_MSG - 8;
+
+// Hysteresis band for resuming a parked write loop, in whole messages.
+// When KCP's send queue is full the tcp->kcp loop parks (see
+// KcpTunnel::park_write) and is woken again as soon as the peer's ACKs have
+// freed enough room for this many messages. It must be at least 1 so one wakeup
+// can always make progress, and small enough that the wakeup lands soon after
+// the window starts draining -- a large band would idle the window while it
+// waits for room that is already there.
+constexpr int KCP_BACKPRESSURE_BURST_MSGS = 4;
+// Resume watermark. Parking above it and resuming below it keeps the loop from
+// oscillating one segment at a time (which would cost a strand dispatch per
+// message) while still refilling the window within a few segments of the
+// drain point. Kept strictly below KCP_BACKPRESSURE_THRESHOLD and above zero
+// for every legal window size.
+constexpr int KCP_BACKPRESSURE_RESUME_THRESHOLD =
+    KCP_BACKPRESSURE_THRESHOLD -
+    KCP_BACKPRESSURE_BURST_MSGS * KCP_MAX_SEGMENTS_PER_MSG;
+
+static_assert(KCP_BACKPRESSURE_RESUME_THRESHOLD > 0,
+              "KCP_SNDWND too small for the backpressure hysteresis band");
+static_assert(KCP_BACKPRESSURE_RESUME_THRESHOLD < KCP_BACKPRESSURE_THRESHOLD,
+              "resume watermark must sit below the park threshold");
 
 // Crypto configuration
 constexpr size_t NONCE_SIZE = 12;

@@ -78,6 +78,29 @@ public:
     int wait_send() const { return kcp_.wait_send(); }
     int peek_size() const { return kcp_.peek_size(); }
 
+    // ---------------------- write-path backpressure -------------------------
+    // KCP's send queue is bounded, so the tcp->kcp forwarding loops must stop
+    // reading from their TCP socket once wait_send() reaches
+    // KCP_BACKPRESSURE_THRESHOLD. How they wait is what determines throughput:
+    // polling on a fixed timer and reading ONE buffer per wakeup caps a tunnel
+    // at FWD_BUF_SIZE / timer, independent of the path and of the KCP window.
+    // Measured on a 190ms-RTT link: 4*KCP_INTERVAL_MS (40ms) per 16KB read held
+    // every tunnel to ~3 Mbps while the same path carried 29 Mbps over plain
+    // TCP. So the loop parks here instead and is resumed the moment KCP's queue
+    // has actually drained -- i.e. when the peer's ACKs arrive (on_receive) or,
+    // at the latest, on the next update tick -- which makes the window, not the
+    // timer, the only remaining limiter.
+    //
+    // `resume` runs on the strand. Registering it replaces any previous one, so
+    // a loop that parks twice before being resumed still holds exactly one hook.
+    void park_write(std::function<void()> resume);
+    // Drop a parked hook without running it. Called from every teardown path:
+    // the hook holds the owner's buffers and (on the client) the local socket,
+    // and a stale hook must never be able to restart a dead loop. The socket
+    // itself is closed by the session's own teardown, not from here.
+    void unpark_write();
+    bool write_parked() const { return static_cast<bool>(write_resume_cb_); }
+
     // Performance metrics
     const SessionMetrics& metrics() const { return metrics_; }
 
@@ -168,6 +191,11 @@ protected:
     // was requested and none has been queued yet, and gated on the window
     // having room so a drained-but-unACKed window cannot flood the tick.
     void retry_pending_fin();
+    // Fire a parked write-loop hook once KCP's send queue has drained below
+    // KCP_BACKPRESSURE_RESUME_THRESHOLD. Must run on the strand; called from the
+    // receive path right after ikcp_input() (where the peer's ACKs actually
+    // land) and from the update tick as the safety net.
+    void maybe_resume_write();
     // The actual send/flush of the once-per-tunnel FIN, shared by send_fin()
     // and retry_pending_fin(). Must run on the strand.
     void do_send_fin();
@@ -216,6 +244,12 @@ protected:
     // peer has gone away would keep itself alive forever and evade the server's
     // idle sweep. The cadence is throttled by this clock instead.
     std::atomic<int64_t> last_keepalive_us_{0};
+
+    // Parked write-loop resume hook (empty when no loop is parked). Strand-only:
+    // registered and consumed exclusively from strand-bound code, so it needs no
+    // lock -- and it must stay a plain member because it is a std::function, not
+    // an atomic-friendly type.
+    std::function<void()> write_resume_cb_;
 
     // Logger module ("kcp_session" / "kcp_client") and line tag (the server's
     // session id, empty for the client). Together they reproduce each side's

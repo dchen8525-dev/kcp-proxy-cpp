@@ -1014,10 +1014,30 @@ def phase_half_close(server_exe, client_exe, log_dir):
 # --------------------------------------------------------------------------- #
 # phase E: a large response whose target closes must not be truncated
 # --------------------------------------------------------------------------- #
-# A megabyte: far more than one KCP window (KCP_SNDWND * KCP_MTU ~ 350KB), so
-# the target's close lands in the middle of a multi-segment, backpressured
-# transfer instead of on a single small response.
-BIG_RESPONSE_BYTES = 1024 * 1024
+# A couple of megabytes: more than one KCP send window (KCP_SNDWND * (KCP_MTU -
+# KCP_SEGMENT_OVERHEAD) = 1024 * 1376 = ~1.4MB), so the target's close lands in
+# the middle of a multi-segment, backpressured transfer instead of on a single
+# small response. This has to stay ABOVE the window -- at the old 256-segment
+# window 1 MiB was enough, but 1 MiB now fits inside a single window and would no
+# longer exercise the drained-teardown path this phase exists to cover.
+# Kept at 2 MiB rather than larger on purpose: this suite runs back-to-back with
+# the adversarial flood test, which self-checks that it can outrun the 5000/s
+# auth budget, and a heavier response here leaves enough CPU contention behind to
+# make that self-check fail on a slow host.
+# Sized to just exceed one KCP send window, not to be "big":
+#   KCP_SNDWND * (KCP_MTU - KCP_SEGMENT_OVERHEAD) = 1024 * 1376 = 1,409,024 B.
+# 1.5 MiB (1,572,864 B) is ~12% above that, so the target's close necessarily
+# lands after the window filled and the tcp->kcp loop parked -- which is exactly
+# the path this phase exists to cover. The previous 1 MiB was chosen against the
+# 256-segment window (~350KB) and now fits INSIDE a single window, which would
+# silently stop exercising the drained-teardown case.
+#
+# Do not raise this without also checking the adversarial flood test: that phase
+# self-asserts it can outrun the 5000/s auth budget, and heavier traffic here
+# leaves enough contention behind on a Windows host to push its measured send
+# rate under that line (measured: 1.5 MiB -> pass, 2 MiB and 4 MiB -> fail with
+# "the blast reached only ~5000 datagrams/s ... the host is too slow").
+BIG_RESPONSE_BYTES = 1536 * 1024
 
 
 class BigResponseThenCloseTarget:

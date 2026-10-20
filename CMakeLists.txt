@@ -156,15 +156,20 @@ set_tests_properties(kcp_proxy_test PROPERTIES TIMEOUT 300)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     # Static packaging / deployment smoke tests. No build outputs needed: every
-    # check reads tracked sources, so it runs in under a second and belongs in
-    # the same gate as the binaries -- CI runs it too, and registering it here
-    # keeps `ctest` locally equivalent to CI.
+    # check reads tracked sources, so it is fast on Linux and in CI -- registering
+    # it here keeps `ctest` locally equivalent to CI.
     add_test(
         NAME kcp_proxy_smoke
         COMMAND ${Python3_EXECUTABLE}
             ${PROJECT_ROOT}/tests/smoke/smoke_test.py
     )
-    set_tests_properties(kcp_proxy_smoke PROPERTIES TIMEOUT 60)
+    # The Beijing-schedule case shells out to bash to execute the real conversion
+    # block. Under MSYS2/Git Bash on Windows that single case measured ~72s (each
+    # subprocess spawn pays full MSYS startup, and /dev/urandom reads are slow),
+    # so the old 60s budget timed out a suite that passes 25/25. The limit is a
+    # hang detector here, not a performance assertion -- keep it well clear of
+    # the observed Windows cost so the gate reports real failures.
+    set_tests_properties(kcp_proxy_smoke PROPERTIES TIMEOUT 300)
 
     add_test(
         NAME kcp_proxy_e2e_tunnel

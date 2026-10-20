@@ -592,9 +592,13 @@ void test_kcp_config_line() {
     // of shipping as a mysterious handshake failure.
     const std::string line = kcp_config_line();
 
+    // Baseline revised from sndWnd=256 rcvWnd=512: a 256-segment window covers
+    // only ~14 Mbps at the 190ms RTT of a China -> US-west path, and measurement
+    // on that path showed the window (not the link, which sustains >1 Gbps at
+    // the VPS) as the per-tunnel ceiling. See the comment on KCP_SNDWND.
     expect_true(line ==
                     "KCP config conv=1 mtu=1400 nodelay=1 interval=10 "
-                    "resend=5 nc=1 sndWnd=256 rcvWnd=512 timeout=60s",
+                    "resend=5 nc=1 sndWnd=1024 rcvWnd=1024 timeout=60s",
                 "kcp_config_line canonical baseline changed");
 
     // Each field must track its constant, so a constant change propagates to

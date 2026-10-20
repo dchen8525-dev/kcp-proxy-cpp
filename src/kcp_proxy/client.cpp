@@ -273,6 +273,18 @@ void KCPProxyClient::do_update_tick(const std::error_code& ec) {
 void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socket) {
     auto client = std::make_shared<asio::ip::tcp::socket>(std::move(client_socket));
 
+    // Nagle would delay the small, latency-critical writes this loopback side
+    // carries (the SOCKS5 method/reply bytes, and the tail of any response the
+    // tunnel hands over in a short message) until the previous segment is ACKed.
+    // The local app is on loopback, so there is no bandwidth to save.
+    {
+        std::error_code nodelay_ec;
+        client->set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
+        if (nodelay_ec) {
+            LOG_DEBUG("client", "failed to set TCP_NODELAY: " + sock_err(nodelay_ec));
+        }
+    }
+
     // Session-cap guard. The ticket is attached to the KCP session via
     // set_keepalive(), so the counter drops exactly when the session object
     // is destroyed — no matter which teardown path ran (handshake failure,
@@ -806,34 +818,45 @@ void KCPProxyClient::forward_client_to_kcp(
     LOG_DEBUG("client", "forward_client_to_kcp: starting async_read_some");
 
     // Backpressure: if KCP's send queue is already past the threshold, the
-    // network can't keep up with what we're feeding in. Pause TCP reads and
-    // re-arm via a short delay so we don't tight-loop. This mirrors the
-    // server's forward_tcp_to_kcp and prevents the KCP send buffer from
-    // overflowing (which would otherwise tear down the session).
+    // network can't keep up with what we're feeding in — park the loop and let
+    // the session resume it as soon as ACKs free window space (see
+    // KcpTunnel::park_write). Mirrors the server's forward_tcp_to_kcp; the fixed
+    // timer this replaces capped every tunnel at one FWD_BUF_SIZE read per
+    // 4*KCP_INTERVAL_MS, i.e. ~3 Mbps regardless of the path.
     if (session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD) {
         LOG_DEBUG("client", "forward_client_to_kcp: backpressure (wait_send=" +
                   std::to_string(session->wait_send()) +
                   " >= threshold=" + std::to_string(KCP_BACKPRESSURE_THRESHOLD) +
-                  "), delaying read");
-        // Timer bound to the session strand: the back-pressure retry callback
-        // then serializes with every other strand handler that touches KCP/session
-        // state (is_connected, wait_send), and on shutdown it is completed with
-        // operation_aborted instead of lingering on the raw io_context.
-        auto retry = std::make_shared<asio::steady_timer>(session->strand());
-        retry->expires_after(std::chrono::milliseconds(KCP_INTERVAL_MS * 4));
-        auto self = shared_from_this();
-        retry->async_wait([self, client_socket, session, buf, guard, retry](const std::error_code& ec) mutable {
-            if (ec) return;
-            if (!session->is_connected()) {
-                // The session died while we were backing off. Returning silently
-                // left the local TCP socket open (the app only notices on its
-                // next write) and the tunnel stalled until the app closed it.
-                // Shut the local side down explicitly, like every other teardown.
+                  "), parking read");
+        // Weak refs only: the hook lives in the session and must not create a
+        // cycle back to it (or to the client object that owns it).
+        std::weak_ptr<KCPClientSession> weak_session = session;
+        std::weak_ptr<KCPProxyClient> weak_self = shared_from_this();
+        session->park_write([weak_self, weak_session, client_socket, buf, guard]() {
+            auto s = weak_session.lock();
+            auto self = weak_self.lock();
+            if (!s || !self) {
+                // Either the session was destroyed or the client is shutting
+                // down, so nothing will ever drive this loop again. Close the
+                // local socket here instead of dropping the last reference to
+                // it: an unclosed socket leaves the app blocked on a tunnel
+                // that no longer exists, and it only finds out on its next
+                // write. This mirrors the check the fixed-timer version had.
                 std::error_code ignored;
                 client_socket->close(ignored);
                 return;
             }
-            self->forward_client_to_kcp(client_socket, session, buf, guard);
+            if (!s->is_connected()) {
+                // Session died while parked (idle timeout, server restart,
+                // handshake failure). Same reasoning as above: the app must
+                // see its socket close rather than hang until it writes.
+                LOG_DEBUG("client", "forward_client_to_kcp: resumed on a dead "
+                                    "session, closing local socket");
+                std::error_code ignored;
+                client_socket->close(ignored);
+                return;
+            }
+            self->forward_client_to_kcp(client_socket, s, buf, guard);
         });
         return;
     }

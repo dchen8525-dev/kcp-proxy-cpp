@@ -280,7 +280,8 @@ Use the server command from `docs/TESTING.md`; no repository script is required 
 
 Both sides must log the same real KCP settings.
 
-Expected baseline:
+C++ baseline (revised: the old 256/512 window capped a single tunnel at ~14 Mbps
+on a 190ms RTT and was measured as the actual bottleneck -- see `KCP_SNDWND`):
 
 ```text
 conv=1
@@ -289,10 +290,14 @@ nodelay=1
 interval=10
 resend=5
 nc=1
-sndWnd=256
-rcvWnd=512
+sndWnd=1024
+rcvWnd=1024
 timeout=60s
 ```
+
+Only `conv` and `mtu` must match across the two ends; `nodelay`/`interval`/
+`resend`/`nc` are local send behaviour and `rcvWnd` is advertised per side, so
+the Android peer may legitimately log different window values.
 
 ### Fix
 
