@@ -53,9 +53,9 @@ test('generateKey empty modes produce empty string', () => {
 test('formatBytes humanizes byte counts', () => {
   assert.strictEqual(formatBytes(0), '0 B');
   assert.strictEqual(formatBytes(512), '512 B');
-  assert.strictEqual(formatBytes(1024), '1.0 KB');
-  assert.strictEqual(formatBytes(5 * 1024 * 1024), '5.0 MB');
-  assert.strictEqual(formatBytes(3.5 * 1024 * 1024 * 1024), '3.5 GB');
+  assert.strictEqual(formatBytes(1024), '1.00 KB');
+  assert.strictEqual(formatBytes(5 * 1024 * 1024), '5.00 MB');
+  assert.strictEqual(formatBytes(3.5 * 1024 * 1024 * 1024), '3.50 GB');
   assert.strictEqual(formatBytes(undefined), '0 B');
 });
 
