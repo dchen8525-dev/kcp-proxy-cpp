@@ -386,13 +386,15 @@ code {
 }
 
 /* ── Traffic indicator ── */
+/* Sits on its own row directly below the actions (启动/测试按钮) — moved out
+   of the actions flex row so the live counters read as a status line. */
 .traffic-indicator {
   display: flex;
   gap: 16px;
   font-size: 12px;
   font-family: var(--mono);
   color: var(--ink-2);
-  margin-left: 4px;
+  margin-top: 14px;
 }
 
 .traffic-indicator[hidden] {

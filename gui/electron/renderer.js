@@ -293,19 +293,15 @@ async function testConnection() {
   showTestResult('pending', `正在测试 ${host}:${port} ...`);
   appendLog(`测试连接 ${host}:${port} ...`, 'info');
 
+  const startedAt = Date.now();
   try {
     const result = await window.electronAPI.testConnection(host, port, keySuffix);
-    if (result.ok) {
-      showTestResult('success', result.message);
-      appendLog(`✓ ${result.message}`, 'info');
-    } else {
-      showTestResult('error', result.message);
-      appendLog(`✗ ${result.message}`, 'error');
-    }
+    showTestResultAfterMinPending(result.ok ? 'success' : 'error', result.message, startedAt);
+    appendLog(`${result.ok ? '✓' : '✗'} ${result.message}`, result.ok ? 'info' : 'error');
   } catch (err) {
     // An IPC throw (bridge gone, handler crashed) — the button is the only
     // thing the user can act on, so it must not stay stuck on "测试中...".
-    showTestResult('error', `测试失败: ${err.message}`);
+    showTestResultAfterMinPending('error', `测试失败: ${err.message}`, startedAt);
     appendLog(`测试连接失败: ${err.message}`, 'error');
   } finally {
     // Always restore the button, even if the IPC call threw.
@@ -320,14 +316,23 @@ async function testConnection() {
 // persistent state (the real state lives in the 启动/断开 button and the log
 // view). Pending never auto-dismisses — it lasts exactly as long as the probe.
 const TEST_RESULT_VISIBLE_MS = 5000;
+const TEST_RESULT_MIN_PENDING_MS = 1000;
 let testResultTimer = null;
+let testResultDelayTimer = null;
 
 function showTestResult(state, message) {
   const el = elements.testResult;
   if (!el) return;
+  // A new outcome cancels BOTH timers: the dismiss timer of the previous
+  // result and the min-pending delay of a stale one (a second click during
+  // the delay must never let the old result overwrite the new pending line).
   if (testResultTimer) {
     clearTimeout(testResultTimer);
     testResultTimer = null;
+  }
+  if (testResultDelayTimer) {
+    clearTimeout(testResultDelayTimer);
+    testResultDelayTimer = null;
   }
   el.textContent = message;
   el.dataset.state = state;
@@ -339,6 +344,21 @@ function showTestResult(state, message) {
       el.textContent = '';
     }, TEST_RESULT_VISIBLE_MS);
   }
+}
+
+// The pending line must stay readable for at least 1s: a fast probe (instant
+// validation failure, nearby server) otherwise flashes "正在测试" for
+// milliseconds and the result pops in before the eye found the line.
+function showTestResultAfterMinPending(state, message, startedAt) {
+  const remainMs = Math.max(0, TEST_RESULT_MIN_PENDING_MS - (Date.now() - startedAt));
+  if (remainMs === 0) {
+    showTestResult(state, message);
+    return;
+  }
+  testResultDelayTimer = setTimeout(() => {
+    testResultDelayTimer = null;
+    showTestResult(state, message);
+  }, remainMs);
 }
 
 // Start proxy
