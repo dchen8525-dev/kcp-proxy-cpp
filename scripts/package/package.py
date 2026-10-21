@@ -437,22 +437,33 @@ case "$1" in
             cur_suffix=$(grep -E '^SUFFIX=' "$env_file" | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
         fi
         if [ -z "$cur_suffix" ]; then
-            # Random 24 hex chars with a fallback chain: the primary pipeline
-            # is the canonical GNU/BSD-safe idiom, od is the backup, and if
-            # both come up empty the postinst says so LOUDLY instead of
-            # restarting a wrapper that is guaranteed to fail SUFFIX-not-set
-            # (the exact failure mode this block exists to prevent).
-            gen_suffix=$(head -c 2048 /dev/urandom | tr -dc 'a-f0-9' | head -c 24)
-            if [ -z "$gen_suffix" ]; then
-                gen_suffix=$(od -An -N 32 -t x1 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-24)
-            fi
-            if [ -z "$gen_suffix" ]; then
+            # Random 24 hex chars with a retry loop + od fallback. A single
+            # pipeline pass has been observed to return a SHORT output on a
+            # loaded runner (CI 2026-10-21: dash got a 1-char suffix); a short
+            # suffix would mint a silently-wrong daily key, so keep pulling
+            # (bounded attempts) until there are 24 chars and truncate the
+            # excess. If even that comes up short the postinst says so LOUDLY
+            # instead of restarting a wrapper that is guaranteed to fail
+            # SUFFIX-not-set (the exact failure mode this block exists to
+            # prevent). POSIX-clean throughout: length expansion, arithmetic
+            # substitution, printf.
+            gen_suffix=""
+            try=0
+            while [ "${{#gen_suffix}}" -lt 24 ] && [ "$try" -lt 5 ]; do
+                try=$((try + 1))
+                gen_suffix="$gen_suffix$(head -c 2048 /dev/urandom | tr -dc 'a-f0-9' | head -c 24)"
+                if [ "${{#gen_suffix}}" -lt 24 ]; then
+                    gen_suffix="$gen_suffix$(od -An -N 32 -t x1 /dev/urandom 2>/dev/null | tr -d ' \\n' | cut -c1-24)"
+                fi
+            done
+            gen_suffix=$(printf '%s' "$gen_suffix" | cut -c1-24)
+            if [ "${{#gen_suffix}}" -lt 24 ]; then
                 echo "kcp-proxy-server: WARNING failed to generate a random" >&2
                 echo "  suffix (head/tr/od all unavailable or /dev/urandom" >&2
                 echo "  unreadable); the service will refuse to start until" >&2
                 echo "  SUFFIX is set in {ENV_FILE} by hand." >&2
             fi
-            if [ -n "$gen_suffix" ]; then
+            if [ "${{#gen_suffix}}" -eq 24 ]; then
                 mkdir -p {ENV_DIR}
                 if [ -f "$env_file" ]; then
                     # Rewrite via temp+mv: the only in-place form GNU and BSD

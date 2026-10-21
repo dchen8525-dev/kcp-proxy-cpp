@@ -859,6 +859,12 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
             "argument as the backup suffix and silently modifies nothing "
             "(the first 0.0.20 CI run failed on macos for exactly this)")
 
+    # A single pipeline pass has been observed to return a SHORT suffix on a
+    # loaded runner (CI 2026-10-21 macos dash got '4'); a short suffix would
+    # mint a silently-wrong daily key. Pin the retry-until-24 loop.
+    require('while [ "${#gen_suffix}" -lt 24 ]' in postinst,
+            "suffix generation must retry until 24 chars before writing")
+
     shell = bj.resolve_shell("bash")
     if shell:
         tmp = Path(tempfile.mkdtemp())
@@ -876,6 +882,22 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
                                   capture_output=True, text=True,
                                   encoding="utf-8", errors="replace")
 
+        # Shared diagnostic probe (CI 2026-10-21 macos: the dash case once
+        # produced a 1-char suffix; without this probe such a failure names
+        # no tool). Created up front so BOTH case A and the dash case can
+        # attach its output to their failure messages.
+        diag = tmp / "diag.sh"
+        diag.write_bytes((
+            'for t in head tr od sed mv grep cut; do command -v "$t" >/dev/null '
+            '&& echo "tool $t: ok" || echo "tool $t: MISSING"; done\n'
+            'g1=$(head -c 2048 /dev/urandom | tr -dc "a-f0-9" | head -c 24)\n'
+            'echo "tr_pipeline_len=${#g1}"\n'
+            'g2=$(od -An -N 32 -t x1 /dev/urandom 2>/dev/null | tr -d " \\n" | cut -c1-24)\n'
+            'echo "od_pipeline_len=${#g2}"\n'
+            'sed "s|^SUFFIX=.*|SUFFIX=DEADBEEF|" "$1" > "$1.diag" && '
+            'mv -f "$1.diag" "$1" && echo "sed_mv: ok" || echo "sed_mv: FAILED rc=$?"\n'
+        ).encode("utf-8"))
+
         # Case A: shipped conffile with empty SUFFIX -> gets a 24-char suffix,
         # other lines preserved.
         env_file.write_bytes(
@@ -892,17 +914,6 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
             # Evidence first: run each pipeline stage in isolation so the
             # failure message names the broken tool instead of just the
             # symptom (the macos runner needed two rounds of this).
-            diag = tmp / "diag.sh"
-            diag.write_bytes((
-                'for t in head tr od sed mv grep cut; do command -v "$t" >/dev/null '
-                '&& echo "tool $t: ok" || echo "tool $t: MISSING"; done\n'
-                'g1=$(head -c 2048 /dev/urandom | tr -dc "a-f0-9" | head -c 24)\n'
-                'echo "tr_pipeline_len=${#g1}"\n'
-                'g2=$(od -An -N 32 -t x1 /dev/urandom 2>/dev/null | tr -d " \\n" | cut -c1-24)\n'
-                'echo "od_pipeline_len=${#g2}"\n'
-                'sed "s|^SUFFIX=.*|SUFFIX=DEADBEEF|" "$1" > "$1.diag" && '
-                'mv -f "$1.diag" "$1" && echo "sed_mv: ok" || echo "sed_mv: FAILED rc=$?"\n'
-            ).encode("utf-8"))
             d = subprocess.run([shell, bj.to_posix(diag), str(env_file).replace("\\", "/")],
                                capture_output=True, text=True,
                                encoding="utf-8", errors="replace")
@@ -944,9 +955,17 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
                 line.split("=", 1) for line in
                 env_file.read_text(encoding="utf-8").strip().splitlines()
                 if "=" in line and not line.startswith("#"))
-            require(re.fullmatch(r"[0-9a-f]{24}", got_dash.get("SUFFIX", "")) is not None,
-                    f"dash run must produce a 24-hex suffix, got "
-                    f"{got_dash.get('SUFFIX')!r}")
+            if re.fullmatch(r"[0-9a-f]{24}", got_dash.get("SUFFIX", "")) is None:
+                # Same evidence-first rule as case A: name the broken tool,
+                # under the SAME shell that failed (CI 2026-10-21 macos).
+                d = subprocess.run([dash, bj.to_posix(diag), str(env_file).replace("\\", "/")],
+                                   capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace")
+                require(False,
+                        f"dash run must produce a 24-hex suffix, got "
+                        f"{got_dash.get('SUFFIX')!r}; file={env_file.read_text(encoding='utf-8')!r}; "
+                        f"block stdout={proc_dash.stdout!r} stderr={proc_dash.stderr!r}; "
+                        f"diag:\n{d.stdout}{d.stderr}")
 
         # Case D: mode must be 0600 after generation (key material lives here).
         if os.name == "nt":
