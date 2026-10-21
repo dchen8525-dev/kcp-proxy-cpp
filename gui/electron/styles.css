@@ -378,7 +378,7 @@ code {
 }
 
 .test-result[data-state="success"] {
-  color: var(--cinnabar);
+  color: var(--pine);
 }
 
 .test-result[data-state="error"] {

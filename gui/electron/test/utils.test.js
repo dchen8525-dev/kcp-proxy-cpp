@@ -7,6 +7,7 @@ const {
   getBeijingDate,
   generateKey,
   formatBytes,
+  formatBytesPerSec,
   isValidPort,
   validateLaunchConfig,
   resolveAppIconPath
@@ -57,6 +58,14 @@ test('formatBytes humanizes byte counts', () => {
   assert.strictEqual(formatBytes(5 * 1024 * 1024), '5.00 MB');
   assert.strictEqual(formatBytes(3.5 * 1024 * 1024 * 1024), '3.50 GB');
   assert.strictEqual(formatBytes(undefined), '0 B');
+});
+
+test('formatBytesPerSec humanizes rates and never goes negative', () => {
+  assert.strictEqual(formatBytesPerSec(0), '0 B/s');
+  assert.strictEqual(formatBytesPerSec(undefined), '0 B/s');
+  assert.strictEqual(formatBytesPerSec(-5), '0 B/s');
+  assert.strictEqual(formatBytesPerSec(1024), '1.00 KB/s');
+  assert.strictEqual(formatBytesPerSec(3.5 * 1024 * 1024), '3.50 MB/s');
 });
 
 test('isValidPort accepts 1..65535 only', () => {

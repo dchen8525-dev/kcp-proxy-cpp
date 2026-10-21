@@ -36,6 +36,13 @@ function formatBytes(bytes) {
   return value.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
 }
 
+// Humanize a rate (bytes per second) for the real-time traffic display.
+// Reuses formatBytes so unit boundaries and decimals can never drift apart.
+function formatBytesPerSec(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return '0 B/s';
+  return formatBytes(bytesPerSec) + '/s';
+}
+
 function isValidPort(value) {
   return /^\d+$/.test(String(value).trim()) && parseInt(value, 10) >= 1 && parseInt(value, 10) <= 65535;
 }
@@ -106,6 +113,7 @@ module.exports = {
   getBeijingDate,
   generateKey,
   formatBytes,
+  formatBytesPerSec,
   isValidPort,
   validateLaunchConfig,
   buildClientArgs,

@@ -316,12 +316,29 @@ async function testConnection() {
 
 // Inline outcome beside the 测试连接 button: one quiet line, ink on paper.
 // state is 'pending' | 'success' | 'error'; the message is shown verbatim.
+// Success/error auto-dismiss after 5s: it is a transient probe outcome, not
+// persistent state (the real state lives in the 启动/断开 button and the log
+// view). Pending never auto-dismisses — it lasts exactly as long as the probe.
+const TEST_RESULT_VISIBLE_MS = 5000;
+let testResultTimer = null;
+
 function showTestResult(state, message) {
   const el = elements.testResult;
   if (!el) return;
+  if (testResultTimer) {
+    clearTimeout(testResultTimer);
+    testResultTimer = null;
+  }
   el.textContent = message;
   el.dataset.state = state;
   el.hidden = false;
+  if (state !== 'pending') {
+    testResultTimer = setTimeout(() => {
+      testResultTimer = null;
+      el.hidden = true;
+      el.textContent = '';
+    }, TEST_RESULT_VISIBLE_MS);
+  }
 }
 
 // Start proxy
@@ -393,16 +410,17 @@ function updateStatus(running) {
     // Reset the counters, not just hide them: the client only emits a TRAFFIC
     // line when the numbers change, so a restart would otherwise re-show the
     // PREVIOUS run's totals and leave them there until new traffic arrives.
-    elements.trafficUp.textContent = '↑ 0 B';
-    elements.trafficDown.textContent = '↓ 0 B';
+    elements.trafficUp.textContent = '↑ 0 B · 0 B/s';
+    elements.trafficDown.textContent = '↓ 0 B · 0 B/s';
   }
 }
 
-// Update traffic display. The main process already humanized the counters
-// (utils.js lives there), so these arrive as display strings.
-function updateTraffic({ tx, rx }) {
-  elements.trafficUp.textContent = `↑ ${tx}`;
-  elements.trafficDown.textContent = `↓ ${rx}`;
+// Update traffic display. The main process already humanized both the
+// cumulative counters and the derived rates (utils.js lives there), so these
+// arrive as display strings: "↑ 12.34 KB · 1.25 KB/s".
+function updateTraffic({ tx, rx, txRate, rxRate }) {
+  elements.trafficUp.textContent = `↑ ${tx} · ${txRate}`;
+  elements.trafficDown.textContent = `↓ ${rx} · ${rxRate}`;
 }
 
 // Append log entry

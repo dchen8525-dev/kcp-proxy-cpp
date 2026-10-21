@@ -4,7 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const dns = require('dns');
 const net = require('net');
-const { generateKey: buildKey, getBeijingDate, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, resolveAppIconPath } = require('./utils');
+const { generateKey: buildKey, getBeijingDate, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, formatBytesPerSec, resolveAppIconPath } = require('./utils');
 
 // Auto-updater (electron-updater) — loaded lazily to keep dev/preview simple.
 let autoUpdater = null;
@@ -690,6 +690,33 @@ function createLogLineStream(onLine) {
   };
 }
 
+// Real-time traffic rate state. TRAFFIC lines carry CUMULATIVE counters and the
+// client only emits one when a counter changes, so the rate must be derived
+// here from consecutive samples — and driven back to zero by the watchdog
+// below once the stream goes quiet, or the display would freeze at the last
+// non-zero rate forever after traffic stops.
+const trafficState = { sample: null, txRate: 0, rxRate: 0 };
+
+function sendTrafficUpdate() {
+  mainWindow?.webContents.send('traffic-update', {
+    tx: formatBytes(trafficState.sample.tx),
+    rx: formatBytes(trafficState.sample.rx),
+    txRate: formatBytesPerSec(trafficState.txRate),
+    rxRate: formatBytesPerSec(trafficState.rxRate)
+  });
+}
+
+// Idle watchdog: the client stays silent while counters are unchanged, so a
+// lack of TRAFFIC lines for >5s (2.5x the emission period) means idle.
+setInterval(() => {
+  if (!isRunning || !trafficState.sample) return;
+  if (Date.now() - trafficState.sample.t <= 5000) return;
+  if (trafficState.txRate === 0 && trafficState.rxRate === 0) return;
+  trafficState.txRate = 0;
+  trafficState.rxRate = 0;
+  sendTrafficUpdate();
+}, 2000);
+
 // Process one line of client output:
 //   - TRAFFIC tx=<bytes> rx=<bytes> → live traffic counters only (not a log entry)
 //   - other lines → map the client's [INFO]/[WARNING]/[ERROR] tag to our levels,
@@ -701,12 +728,24 @@ function handleClientLine(line) {
   // Traffic stats (emitted every 2s) are for the counter, not the log panel.
   const trafficMatch = text.match(/TRAFFIC tx=(\d+) rx=(\d+)/);
   if (trafficMatch) {
-    // Humanized here, in the process that already owns utils.js, so the renderer
-    // needs no copy of the formatter (see the sandbox note in createWindow).
-    mainWindow?.webContents.send('traffic-update', {
-      tx: formatBytes(parseInt(trafficMatch[1], 10)),
-      rx: formatBytes(parseInt(trafficMatch[2], 10))
-    });
+    const tx = parseInt(trafficMatch[1], 10);
+    const rx = parseInt(trafficMatch[2], 10);
+    const now = Date.now();
+    const prev = trafficState.sample;
+    if (prev && tx >= prev.tx && rx >= prev.rx) {
+      // Normal sample: rate = counter delta over the real elapsed time (the
+      // emission interval is nominal 2s but only fires on change).
+      const sec = Math.max((now - prev.t) / 1000, 0.001);
+      trafficState.txRate = (tx - prev.tx) / sec;
+      trafficState.rxRate = (rx - prev.rx) / sec;
+    } else {
+      // First sample, or the client restarted and its counters reset — a
+      // negative delta would otherwise render as a nonsense negative rate.
+      trafficState.txRate = 0;
+      trafficState.rxRate = 0;
+    }
+    trafficState.sample = { tx, rx, t: now };
+    sendTrafficUpdate();
     return;
   }
 
@@ -821,12 +860,12 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = gene
       // find and reap this child.
       probeProcess = proc;
     } catch (err) {
-      finish({ ok: false, message: `启动测试进程失败: ${err.message}` });
+      finish({ ok: false, message: `无法启动测试进程: ${err.message}` });
       return;
     }
 
     timer = setTimeout(() => {
-      finish({ ok: false, message: `握手超时 (${host}:${port}，服务器不可达或密钥不匹配)` });
+      finish({ ok: false, message: '握手超时：服务器不可达或密钥不匹配' });
     }, timeoutMs);
 
     // Send a minimal SOCKS5 greeting + CONNECT to the probe client. The
@@ -857,23 +896,23 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = gene
         driveProbe();
       }
       if (line.includes('KCP handshake confirmed')) {
-        finish({ ok: true, message: `连接成功: KCP 握手确认 (${host}:${port})` });
+        finish({ ok: true, message: '连接成功' });
         return;
       }
       const resolveMatch = line.match(/resolve error: (.+)/);
       if (resolveMatch) {
-        finish({ ok: false, message: `域名解析失败: ${resolveMatch[1]} (${host})` });
+        finish({ ok: false, message: `域名解析失败: ${resolveMatch[1]}` });
         return;
       }
       if (line.includes('KCP handshake timeout') || line.includes('KCP handshake failed')) {
-        finish({ ok: false, message: `握手失败 (${host}:${port}，服务器不可达或密钥不匹配)` });
+        finish({ ok: false, message: '握手失败：服务器不可达或密钥不匹配' });
         return;
       }
     });
     proc.stderr.on('data', (data) => pushProbeLine(data));
 
-    proc.on('error', (err) => finish({ ok: false, message: `测试进程启动失败: ${err.message}` }));
-    proc.on('close', (code) => finish({ ok: false, message: `客户端进程异常退出 (代码 ${code})` }));
+    proc.on('error', (err) => finish({ ok: false, message: `无法启动测试进程: ${err.message}` }));
+    proc.on('close', (code) => finish({ ok: false, message: `测试进程退出 (代码 ${code})` }));
   }));
 }
 
@@ -893,7 +932,7 @@ function getFreePort() {
 
 ipcMain.handle('test-connection', async (event, host, port, keySuffix) => {
   if (connectivityTestInFlight) {
-    return { ok: false, message: '已有连接测试正在进行，请稍候' };
+    return { ok: false, message: '测试进行中，请稍候' };
   }
   connectivityTestInFlight = true;
   try {
@@ -930,12 +969,10 @@ async function runConnectivityTest(host, port, keySuffixOverride) {
   const p = parseInt(rawPort, 10);
 
   // 1) DNS / literal-IP check gives an immediate, precise failure reason.
-  let address;
   try {
-    const resolved = await dns.promises.lookup(h);
-    address = resolved.address;
+    await dns.promises.lookup(h);
   } catch (err) {
-    return { ok: false, message: `域名解析失败: ${err.message} (${h})` };
+    return { ok: false, message: `域名解析失败: ${err.code || err.message}` };
   }
 
   // 2) End-to-end KCP handshake probe (requires the client binary).
@@ -943,7 +980,7 @@ async function runConnectivityTest(host, port, keySuffixOverride) {
   if (!clientPath) {
     // DNS alone is not a passed connection test: without the client binary the
     // KCP handshake was never exercised, so this must not render as success.
-    return { ok: false, message: `域名解析成功 (${h} → ${address})，但未找到客户端程序，无法测试 UDP 握手` };
+    return { ok: false, message: '未找到客户端程序，无法测试' };
   }
 
   return probeKcpHandshake(clientPath, h, p, 10000,
