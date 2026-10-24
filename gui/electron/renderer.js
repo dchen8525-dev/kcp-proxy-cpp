@@ -30,6 +30,9 @@ const elements = {
   ovBind: document.getElementById('ov-bind'),
   ovKeyDate: document.getElementById('ov-keydate'),
   testResult: document.getElementById('test-result'),
+  fecEnabled: document.getElementById('fecEnabled'),
+  fecData: document.getElementById('fecData'),
+  fecParity: document.getElementById('fecParity'),
   sideFoot: document.getElementById('side-foot')
 };
 
@@ -97,6 +100,12 @@ function populateForm(config) {
   elements.autoConnect.checked = config.autoConnect === true;
   elements.allowLan.checked = config.allowLan === true;
   elements.autoReconnect.checked = config.autoReconnect !== false;
+  // FEC: disabled by default; the shard placeholders match the C++-side
+  // recommendation (kcp-go's 10:3) so enabling needs no typing.
+  elements.fecEnabled.checked = config.fecEnabled === true;
+  elements.fecData.value = config.fecData || '10';
+  elements.fecParity.value = config.fecParity || '3';
+  syncFecInputs();
   refreshOverview();
 }
 
@@ -185,8 +194,19 @@ function setupEventListeners() {
   elements.autoConnect.addEventListener('change', refreshOverview);
   elements.allowLan.addEventListener('change', refreshOverview);
   elements.autoReconnect.addEventListener('change', refreshOverview);
+  // FEC 分片输入只在启用时有效：关掉就禁用输入框，表单状态一眼可读。
+  elements.fecEnabled.addEventListener('change', syncFecInputs);
 
   elements.btnSave.addEventListener('click', saveSettings);
+}
+
+// Enable/disable the FEC shard inputs to mirror the FEC checkbox. Called from
+// the change listener and after populateForm so a loaded config renders the
+// inputs in the right state.
+function syncFecInputs() {
+  const enabled = elements.fecEnabled.checked;
+  elements.fecData.disabled = !enabled;
+  elements.fecParity.disabled = !enabled;
 }
 
 // Scroll the log to its tail. Called both from appendLog and when the log
@@ -237,7 +257,10 @@ function readForm() {
     keySuffix: elements.keySuffix.value.trim(),
     autoConnect: elements.autoConnect.checked,
     allowLan: elements.allowLan.checked,
-    autoReconnect: elements.autoReconnect.checked
+    autoReconnect: elements.autoReconnect.checked,
+    fecEnabled: elements.fecEnabled.checked,
+    fecData: elements.fecData.value.trim() || '10',
+    fecParity: elements.fecParity.value.trim() || '3'
   };
 }
 

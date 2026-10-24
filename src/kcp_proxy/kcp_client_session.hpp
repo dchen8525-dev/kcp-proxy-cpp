@@ -20,7 +20,8 @@ namespace kcp_proxy {
 class KCPClientSession : public KcpTunnel {
 public:
     KCPClientSession(asio::io_context& io, asio::ip::udp::endpoint server_addr,
-                     std::shared_ptr<Crypto> crypto, uint32_t conv = KCP_CONV);
+                     std::shared_ptr<Crypto> crypto, uint32_t conv = KCP_CONV,
+                     const FecConfig& fec = FecConfig{});
     ~KCPClientSession() override;
 
     // Async-friendly: connect dispatches onto the strand so the upper layer

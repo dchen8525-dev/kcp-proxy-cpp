@@ -42,8 +42,9 @@ LogThrottle& client_udp_send_error_log() {
 KCPClientSession::KCPClientSession(asio::io_context& io,
                                    asio::ip::udp::endpoint server_addr,
                                    std::shared_ptr<Crypto> crypto,
-                                   uint32_t conv)
-    : KcpTunnel(io, conv, std::move(crypto), "kcp_client", ""),
+                                   uint32_t conv,
+                                   const FecConfig& fec)
+    : KcpTunnel(io, conv, std::move(crypto), "kcp_client", "", fec),
       server_addr_(std::move(server_addr)),
       connect_timer_(strand()),
       receive_backoff_timer_(strand()) {
@@ -460,7 +461,7 @@ void KCPClientSession::on_receive(byte_view packet) {
     metrics_.bytes_received.fetch_add(decrypt_buf_.size(), std::memory_order_relaxed);
     LOG_DEBUG("kcp_client", "UDP recv " + std::to_string(packet.size()) +
               " encrypted -> " + std::to_string(decrypt_buf_.size()) + " decrypted");
-    int input_ret = kcp_.input(byte_view(decrypt_buf_.data(), decrypt_buf_.size()));
+    int input_ret = feed_kcp_input(decrypt_buf_.data(), decrypt_buf_.size());
     if (input_ret < 0) {
         // Throttled for the same reason as the server side: the server holds
         // the session key too, so a hostile (or merely corrupted) datagram can
@@ -469,7 +470,7 @@ void KCPClientSession::on_receive(byte_view packet) {
                                decrypt_buf_.size());
         return;
     }
-    LOG_DEBUG("kcp_client", "ikcp_input ok, peek=" + std::to_string(kcp_.peek_size()));
+    LOG_DEBUG("kcp_client", "kcp input ok, peek=" + std::to_string(kcp_.peek_size()));
     try_fulfill_read();
     // ACKs consumed by ikcp_input() are what free send-window space; resuming a
     // parked client->kcp loop here keeps the upload window full instead of

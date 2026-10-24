@@ -37,9 +37,10 @@ static std::string log_level_name() {
 }
 
 KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
-                     std::string host)
+                     std::string host, const FecConfig& fec)
     : io_(io), port_(port), host_(std::move(host)),
       key_(key),
+      fec_(fec),
       // The UDP socket owns its own strand: it is a single shared object, and
       // with -T > 1 both ends touch it from different threads (receives re-arm
       // on the io_context, sends are called from per-session strands). Binding
@@ -185,6 +186,7 @@ void KCPServer::start() {
              " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
              " log_level=" + log_level_name());
     LOG_INFO("server", kcp_config_line());
+    LOG_INFO("server", fec_config_line(fec_));
 
     do_receive();
 }
@@ -766,7 +768,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 if (tomb != salt_tombstones_.end() && tomb->second > now) {
                     rejection = RejectReason::ReplayedSalt;
                 } else {
-                    session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid);
+                    session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid, fec_);
                     // Record the tombstone only after the session exists: an
                     // insert that then lost make_shared() to an exception would
                     // blacklist a salt that was never accepted for the whole TTL.

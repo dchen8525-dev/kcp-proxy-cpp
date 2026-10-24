@@ -60,10 +60,11 @@ bool looks_like_http_request(uint8_t first, uint8_t second) {
 KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host,
                                 uint16_t server_port, std::string key,
                                 std::string listen_host, uint16_t listen_port,
-                                int half_close_grace_sec)
+                                int half_close_grace_sec, const FecConfig& fec)
     : io_(io), server_host_(std::move(server_host)), server_port_(server_port),
       key_(std::move(key)), listen_host_(std::move(listen_host)),
       listen_port_(listen_port), half_close_grace_sec_(half_close_grace_sec),
+      fec_(fec),
       tcp_acceptor_(io_), udp_resolver_(io_), traffic_timer_(io),
       update_tick_timer_(io), accept_retry_timer_(io) {
 }
@@ -195,6 +196,9 @@ void KCPProxyClient::do_resolve() {
             // confirm both ends of the tunnel negotiate with identical KCP
             // parameters (a mismatch manifests as a dead handshake).
             LOG_INFO("client", kcp_config_line());
+            // FEC has the same two-end contract: diff this line against the
+            // server's to spot a parameter mismatch before it eats a session.
+            LOG_INFO("client", fec_config_line(fec_));
 
             start_traffic_reporter();
             // Start the shared KCP update tick (one 10ms timer for all
@@ -346,7 +350,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT,
                                           Crypto::generate_session_salt());
         session = std::make_shared<KCPClientSession>(
-            io_, server_endpoint_, crypto);
+            io_, server_endpoint_, crypto, KCP_CONV, fec_);
     } catch (const std::exception& e) {
         LOG_ERROR("client", std::string("session setup failed, closing connection: ") +
                   e.what());

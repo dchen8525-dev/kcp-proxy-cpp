@@ -16,6 +16,10 @@ static void print_usage(const char* prog) {
               << "  -p, --server-port PORT Remote KCP server port (default: 8388)\n"
               << "  -k, --key KEY          Encryption key (min 16 chars; alternatively\n"
               << "                         set the KCP_PROXY_KEY environment variable)\n"
+              << "  -fec DATA:PARITY       Reed-Solomon FEC, e.g. -fec 10:3 (default: off).\n"
+              << "                         Repairs up to PARITY lost datagrams per group of\n"
+              << "                         DATA. MUST match the server's value exactly — the\n"
+              << "                         first datagram is already FEC-framed.\n"
               << "  -H, --listen-host HOST Local SOCKS5 bind address (default: 127.0.0.1)\n"
               << "  -l, --listen-port PORT Local SOCKS5 listen port (default: 1080)\n"
               << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n"
@@ -33,6 +37,7 @@ int main(int argc, char* argv[]) {
     uint16_t listen_port = 1080;
     int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC;
     std::string log_level = "INFO";
+    FecConfig fec;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -42,6 +47,16 @@ int main(int argc, char* argv[]) {
             if (!cli::get_port_arg(argc, argv, i, server_port)) return 1;
         } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
             key = cli::get_arg(argc, argv, i);
+        } else if ((arg == "-fec" || arg == "--fec") && i + 1 < argc) {
+            // Fail-closed parse (see parse_fec_config): anything but 0:0 or a
+            // valid shard pair refuses to start, so a typo can never open a
+            // tunnel whose framing silently mismatches the server's.
+            if (!parse_fec_config(cli::get_arg(argc, argv, i), fec)) {
+                std::cerr << "Error: --fec expects DATA:PARITY (e.g. 10:3), "
+                          << "with 1 <= PARITY <= DATA <= 255, or 0:0 to disable"
+                          << std::endl;
+                return 1;
+            }
         } else if ((arg == "-H" || arg == "--listen-host") && i + 1 < argc) {
             listen_host = cli::get_arg(argc, argv, i);
         } else if ((arg == "-l" || arg == "--listen-port") && i + 1 < argc) {
@@ -103,12 +118,13 @@ int main(int argc, char* argv[]) {
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
         auto client = std::make_shared<KCPProxyClient>(
             io, server_host, server_port, key, listen_host, listen_port,
-            half_close_grace_sec);
+            half_close_grace_sec, fec);
         cli::secure_wipe(key);
         client->start();
 
         LOG_INFO("main", "KCP proxy client started, SOCKS5 on " +
-                 listen_host + ":" + std::to_string(listen_port));
+                 listen_host + ":" + std::to_string(listen_port) +
+                 " fec=" + fec.to_string());
 
         cli::setup_signal_handler(io, [client]() { client->stop(); });
 

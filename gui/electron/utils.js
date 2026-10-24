@@ -48,12 +48,30 @@ function isValidPort(value) {
 }
 
 // Return an error message string, or null if the config is valid for a launch.
-// cfg: { serverHost, serverPort, localPort, keyMode, keySuffix, fixedKey, keyDate? }
+// cfg: { serverHost, serverPort, localPort, keyMode, keySuffix, fixedKey, keyDate?,
+//        fecEnabled?, fecData?, fecParity? }
 //   keyDate gives a fixed date for deterministic tests; otherwise today's Beijing date is used.
+// FEC validation mirrors the C++ parse_fec_config (config.hpp): when enabled the
+// pair must satisfy 1 <= PARITY <= DATA <= 255 so the redundancy ratio never
+// exceeds 100%; while disabled the fields are ignored entirely.
 function validateLaunchConfig(cfg) {
   if (!cfg.serverHost) return '请填写服务器地址';
   if (!isValidPort(cfg.serverPort)) return '服务器端口必须是 1-65535 之间的整数';
   if (!isValidPort(cfg.localPort)) return '本地 SOCKS 端口必须是 1-65535 之间的整数';
+
+  if (cfg.fecEnabled) {
+    // Digits-only first (same rule as the C++ parse): Number() would otherwise
+    // silently accept '0x10' or '10.0' and canonicalize them into the argv.
+    const dataRaw = String(cfg.fecData ?? '');
+    const parityRaw = String(cfg.fecParity ?? '');
+    const fecData = /^\d+$/.test(dataRaw) ? Number(dataRaw) : NaN;
+    const fecParity = /^\d+$/.test(parityRaw) ? Number(parityRaw) : NaN;
+    if (!Number.isInteger(fecData) || !Number.isInteger(fecParity) ||
+        fecData < 1 || fecParity < 1 || fecParity > fecData ||
+        fecData + fecParity > 256) {
+      return 'FEC 参数必须是 DATA:PARITY，满足 1 ≤ PARITY ≤ DATA ≤ 255（例如 10:3）';
+    }
+  }
 
   const key = generateKey(cfg.keyMode, {
     date: cfg.keyDate,
@@ -76,14 +94,22 @@ function validateLaunchConfig(cfg) {
 // visible to every local user, while its environment is not.
 // allowLan binds the SOCKS listener to 0.0.0.0 instead of loopback only —
 // the default stays 127.0.0.1 so a fresh install never exposes the proxy.
-function buildClientArgs({ serverHost, serverPort, localPort, allowLan }) {
-  return [
+// FEC rides as "-fec DATA:PARITY" ONLY when enabled: an absent flag is the
+// disabled form, keeping the argv (and the wire) byte-identical to pre-FEC
+// launches. Both peers must run identical values — there is no negotiation.
+function buildClientArgs({ serverHost, serverPort, localPort, allowLan,
+                           fecEnabled, fecData, fecParity }) {
+  const args = [
     '-s', String(serverHost),
     '-p', String(serverPort),
     '-H', allowLan ? '0.0.0.0' : '127.0.0.1',
     '-l', String(localPort),
     '-L', 'info'
   ];
+  if (fecEnabled) {
+    args.push('-fec', `${Number(fecData)}:${Number(fecParity)}`);
+  }
+  return args;
 }
 
 // Compose the spawn environment for the client: the secret rides in

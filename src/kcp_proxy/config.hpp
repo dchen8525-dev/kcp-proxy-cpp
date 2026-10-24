@@ -220,6 +220,81 @@ constexpr size_t REPLAY_WINDOW_BITS = 2048;
 constexpr uint8_t NONCE_DIR_CLIENT = 0x01;
 constexpr uint8_t NONCE_DIR_SERVER = 0x02;
 
+// ------------------------- Forward error correction -------------------------
+// Reed-Solomon FEC, kcp-go style: the sender groups `data_shards` consecutive
+// KCP datagrams into one shard set and emits `parity_shards` parity datagrams
+// for it; the receiver rebuilds up to `parity_shards` lost datagrams per set
+// once enough of the set has arrived. The FEC header (6B seqid+type) and the
+// 2-byte length field ride INSIDE the AEAD plaintext, in front of the KCP
+// datagram, while [salt16|nonce12] stay in cleartext — the same layering
+// kcp-go's sess.headerSize offset produces. 0:0 disables FEC entirely and
+// keeps the wire byte-identical to pre-FEC peers. There is NO negotiation:
+// the very first datagram (the handshake itself) is already FEC-framed, so
+// BOTH peers must run identical values — a mismatch surfaces as KCP input
+// failures on every datagram, made visible by the throttled
+// KCP_INPUT_FAILED log line.
+constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE;  // 28
+
+// Wire-size budget: the largest KCP datagram (KCP_MTU) FEC-framed becomes
+// FEC_CRYPTO_RESERVE + 8 (FEC header + length field) + KCP_MTU = 1436 bytes
+// of AEAD plaintext, i.e. 1436 + TAG_SIZE + FEC_CRYPTO_RESERVE = 1480 bytes
+// of UDP payload including salt+nonce — inside the 1472-byte payload budget
+// of a 1500 MTU path once IP(20)+UDP(8) headers are added. Parity datagrams
+// never exceed the largest data shard in their set, so this bounds both.
+constexpr size_t FEC_DATAGRAM_MAX = FEC_CRYPTO_RESERVE + 8 + KCP_MTU;
+constexpr size_t FEC_WIRE_DATAGRAM_MAX = FEC_DATAGRAM_MAX + TAG_SIZE;
+static_assert(FEC_WIRE_DATAGRAM_MAX + 28 /* IP + UDP headers */ <= 1500,
+              "FEC-framed datagrams would fragment on a 1500 MTU path");
+
+struct FecConfig {
+    int data_shards = 0;    // 0 = disabled
+    int parity_shards = 0;  // 0 = disabled
+
+    bool enabled() const { return data_shards > 0 && parity_shards > 0; }
+    // "10:3" when enabled, "off" otherwise — for logs and usage text.
+    std::string to_string() const {
+        return enabled() ? std::to_string(data_shards) + ":" +
+                               std::to_string(parity_shards)
+                         : "off";
+    }
+};
+
+// Parse "data:parity" (e.g. "10:3" or "0:0"). Fail-closed: accepts only 0:0
+// (disabled) or a configuration the kcp-cpp Reed-Solomon codec accepts
+// (data_shards >= 1, parity_shards >= 1, data+parity <= 256), with
+// parity <= data so the redundancy ratio never exceeds 100%.
+inline bool parse_fec_config(const std::string& text, FecConfig& out) {
+    const size_t colon = text.find(':');
+    if (colon == std::string::npos) return false;
+    const std::string data_part = text.substr(0, colon);
+    const std::string parity_part = text.substr(colon + 1);
+    // Strict digits-only on both sides (same rule as --threads): no sign, no
+    // trailing junk, no empty halves.
+    if (data_part.empty() || parity_part.empty() ||
+        data_part.find_first_not_of("0123456789") != std::string::npos ||
+        parity_part.find_first_not_of("0123456789") != std::string::npos ||
+        data_part.size() > 3 || parity_part.size() > 3) {
+        return false;
+    }
+    const long data = std::stol(data_part);
+    const long parity = std::stol(parity_part);
+    if (data == 0 && parity == 0) {
+        out = FecConfig{};  // disabled
+        return true;
+    }
+    if (data < 1 || parity < 1 || data + parity > 256 || parity > data) {
+        return false;
+    }
+    out = FecConfig{static_cast<int>(data), static_cast<int>(parity)};
+    return true;
+}
+
+// One-line FEC settings summary, rendered next to kcp_config_line() at
+// startup so a two-end parameter mismatch is visible in the logs.
+inline std::string fec_config_line(const FecConfig& fec) {
+    return "FEC config shards=" + fec.to_string();
+}
+
 // SOCKS5 constants
 constexpr uint8_t SOCKS5_VERSION = 0x05;
 constexpr uint8_t SOCKS5_AUTH_NONE = 0x00;

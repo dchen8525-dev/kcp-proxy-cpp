@@ -13,6 +13,16 @@
 #include <string>
 #include <vector>
 
+// Vendored kcp-cpp FEC codec (see third_party/kcp-cpp/VENDORED.md). Kept as
+// forward declarations: the members are unique_ptrs and KcpTunnel's destructor
+// is out-of-line, so the full fec.h is only needed in kcp_tunnel.cpp. (The
+// parity-packet member is declared as vector<vector<uint8_t>> — FecPacket is
+// an ALIAS for that type upstream, and aliases cannot be forward-declared.)
+namespace kcp::internal {
+class FecEncoder;
+class FecDecoder;
+}
+
 namespace kcp_proxy {
 
 // Performance metrics for monitoring
@@ -27,6 +37,11 @@ struct SessionMetrics {
     // encrypt_errors so an "encryption failure" alert is never a KCP-layer
     // backpressure event in disguise.
     std::atomic<uint64_t> send_errors{0};
+
+    // FEC: data shards the Reed-Solomon codec had to rebuild from parity (i.e.
+    // datagrams the network lost but FEC recovered). Zero forever when FEC is
+    // disabled. Counted only when the rebuilt datagram was accepted by KCP.
+    std::atomic<uint64_t> fec_repaired{0};
 
     // UDP datagram level (used for peer-to-peer loss localization): every
     // encrypted datagram handed to the peer counts as one TX, every datagram
@@ -141,7 +156,8 @@ public:
 
 protected:
     KcpTunnel(asio::io_context& io, uint32_t conv, std::shared_ptr<Crypto> crypto,
-              std::string log_module, std::string log_tag);
+              std::string log_module, std::string log_tag,
+              const FecConfig& fec = FecConfig{});
 
     // ------------------------- hooks for the concrete session ---------------
     // May the tunnel accept new application data? Checked off-strand, before a
@@ -159,6 +175,17 @@ protected:
     void on_send(byte_view data);
     void on_async_read_some(asio::mutable_buffer buffer,
                             std::function<void(std::error_code, size_t)> handler);
+    // FEC inbound gate: feeds ONE decrypted plaintext datagram into the tunnel.
+    // With FEC disabled this is kcp_.input() verbatim. With FEC enabled the
+    // datagram is a framed packet [fec_hdr(6)|len(2)|payload]: the native data
+    // shard goes straight into KCP (after the length field is validated), and
+    // every packet (data and parity) also runs through FecDecoder::Decode so
+    // shards the codec rebuilds are fed in too. Returns the kcp_.input() result
+    // of the native packet (0 or a negative ikcp-style error) so the caller's
+    // throttled rejection logging keeps working; rebuilt shards are logged and
+    // counted here.
+    // Strand-only (KCP and the FEC codec are strand-confined).
+    int feed_kcp_input(const uint8_t* data, size_t size);
     // Move whatever KCP has into the pending read, or complete it with an error.
     void try_fulfill_read();
     // Detach the pending read (if any) and complete it with `ec` on the strand.
@@ -203,6 +230,16 @@ protected:
     // "tag: text" when a tag is set (server sessions), just "text" otherwise.
     std::string log_msg(const std::string& text) const;
     const std::string& log_module() const { return log_module_; }
+
+    // FEC outbound gate: wraps one KCP output datagram. With FEC disabled this
+    // forwards to handle_kcp_output unchanged (byte-identical wire to pre-FEC
+    // peers). With FEC enabled the datagram is framed as
+    // [crypto reserve(28)][fec_hdr(6)][len(2)][payload], FecEncoder::Encode
+    // seals the header and buffers the payload, and every emitted packet —
+    // the data shard plus any parity shards of its set — goes through
+    // handle_kcp_output separately, each becoming its own encrypted datagram.
+    // Strand-only.
+    void on_kcp_datagram(byte_view data);
 
     asio::io_context& io_;
     asio::strand<asio::io_context::executor_type> strand_;
@@ -256,6 +293,17 @@ protected:
     // existing log lines exactly.
     std::string log_module_;
     std::string log_tag_;
+
+    // FEC codec (null when disabled — see FecConfig). One per session,
+    // strand-confined, mirroring kcp-go's one fecEncoder/fecDecoder per
+    // session. fec_send_buf_ / fec_parity_ are reused per output datagram;
+    // both handle_kcp_output implementations copy out of the view they are
+    // given (encrypt_into writes a fresh buffer), so the reuse is safe.
+    std::unique_ptr<kcp::internal::FecEncoder> fec_encoder_;
+    std::unique_ptr<kcp::internal::FecDecoder> fec_decoder_;
+    std::vector<uint8_t> fec_send_buf_;
+    // Same type as kcp::internal::FecPacket (an alias for vector<uint8_t>).
+    std::vector<std::vector<uint8_t>> fec_parity_;
 };
 
 } // namespace kcp_proxy

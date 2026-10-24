@@ -32,30 +32,24 @@ void log_kcp_input_rejected(std::string_view log_module, std::string_view tag,
                               " more suppressed this interval)" : ""));
 }
 
-KcpWrapper::KcpWrapper(uint32_t conv) {
-    kcp_ = ikcp_create(conv, this);
-    if (!kcp_) {
-        LOG_ERROR("kcp_wrapper", "ikcp_create failed for conv=" + std::to_string(conv));
-        throw std::runtime_error("ikcp_create failed");
-    }
+KcpWrapper::KcpWrapper(uint32_t conv)
+    : kcp_(std::make_unique<kcp::Kcp>(
+          conv,
+          // Output trampoline: kcp::Kcp hands us each datagram from
+          // Flush/Input; route it to the caller's byte_view callback.
+          [this](const std::uint8_t* buf, std::size_t len) { c_output(buf, len); },
+          // Clock: kcp::Kcp reads time only through this injection, so the
+          // explicit update(ms) below remains the single time source.
+          [this]() -> std::uint32_t { return current_ms_; })) {
     configure();
-    ikcp_setoutput(kcp_, &KcpWrapper::c_output);
     LOG_DEBUG("kcp_wrapper", "created conv=" + std::to_string(conv));
 }
 
 KcpWrapper::~KcpWrapper() {
-    if (kcp_) {
-        // Neutralize the C++ callback BEFORE release, but keep the output
-        // function pointer installed. If this ikcp build flushes during
-        // teardown (some forks call ikcp_flush from ikcp_release), a cleared
-        // output pointer would trip ikcp's assert(kcp->output)/null-call;
-        // the static c_output trampoline with an empty output_cb_ is a safe
-        // no-op in every case, so teardown can never re-enter a destroyed
-        // std::function nor a null output function.
-        output_cb_ = nullptr;
-        ikcp_release(kcp_);
-        kcp_ = nullptr;
-    }
+    // Neutralize the C++ callback BEFORE teardown. The kcp::Kcp destructor
+    // does not flush today, but clearing first means teardown can never
+    // re-enter a destroyed std::function even if that ever changes.
+    output_cb_ = nullptr;
 }
 
 void KcpWrapper::set_output_callback(OutputCallback cb) {
@@ -63,27 +57,26 @@ void KcpWrapper::set_output_callback(OutputCallback cb) {
 }
 
 int KcpWrapper::send(byte_view data) {
-    int ret = ikcp_send(kcp_, reinterpret_cast<const char*>(data.data()),
-                        static_cast<int>(data.size()));
+    int ret = kcp_->Send(data.data(), data.size());
     if (ret < 0) {
-        LOG_ERROR("kcp_wrapper", "ikcp_send failed: ret=" + std::to_string(ret) +
+        LOG_ERROR("kcp_wrapper", "kcp send failed: ret=" + std::to_string(ret) +
                   " size=" + std::to_string(data.size()) +
                   " waitsnd=" + std::to_string(wait_send()));
     } else {
-        LOG_DEBUG("kcp_wrapper", "ikcp_send ok: " + std::to_string(data.size()) +
+        LOG_DEBUG("kcp_wrapper", "kcp send ok: " + std::to_string(data.size()) +
                   " bytes, waitsnd=" + std::to_string(wait_send()));
     }
     return ret;
 }
 
 int KcpWrapper::recv(std::vector<uint8_t>& buffer) {
-    int size = ikcp_peeksize(kcp_);
+    int size = kcp_->PeekSize();
     if (size <= 0) {
         buffer.clear();
         return 0;
     }
     buffer.resize(static_cast<size_t>(size));
-    int got = ikcp_recv(kcp_, reinterpret_cast<char*>(buffer.data()), size);
+    int got = kcp_->Recv(buffer.data(), buffer.size());
     if (got < 0) {
         buffer.clear();
         return got;
@@ -95,7 +88,7 @@ int KcpWrapper::recv(std::vector<uint8_t>& buffer) {
 }
 
 int KcpWrapper::recv(uint8_t* data, size_t size) {
-    int msg_size = ikcp_peeksize(kcp_);
+    int msg_size = kcp_->PeekSize();
     if (msg_size <= 0) {
         return 0;
     }
@@ -107,68 +100,75 @@ int KcpWrapper::recv(uint8_t* data, size_t size) {
         return KCP_RECV_MSG_TOO_BIG;
     }
     // Fast path: the fixed buffer is large enough, no heap allocation.
-    return ikcp_recv(kcp_, reinterpret_cast<char*>(data), msg_size);
+    return kcp_->Recv(data, static_cast<size_t>(msg_size));
 }
 
 int KcpWrapper::input(byte_view data) {
-    int ret = ikcp_input(kcp_, reinterpret_cast<const char*>(data.data()),
-                         static_cast<int>(data.size()));
+    int ret = kcp_->Input(data.data(), data.size());
     if (ret < 0) {
         // Detail only, and at DEBUG: the throttled, once-per-datagram line is
         // the caller's (log_kcp_input_rejected), which already carries ret and
         // the size. Logging both made one rejected datagram cost two WARNINGs.
-        LOG_DEBUG("kcp_wrapper", "ikcp_input failed: ret=" + std::to_string(ret) +
+        LOG_DEBUG("kcp_wrapper", "kcp input failed: ret=" + std::to_string(ret) +
                   " size=" + std::to_string(data.size()));
     } else {
-        LOG_DEBUG("kcp_wrapper", "ikcp_input ok: " + std::to_string(data.size()) +
+        LOG_DEBUG("kcp_wrapper", "kcp input ok: " + std::to_string(data.size()) +
                   " bytes, peek=" + std::to_string(peek_size()));
     }
     return ret;
 }
 
 void KcpWrapper::update(uint32_t current_ms) {
-    ikcp_update(kcp_, current_ms);
+    // kcp::Kcp::Update() takes no timestamp; it reads the injected clock.
+    current_ms_ = current_ms;
+    updated_ = true;
+    kcp_->Update();
 }
 
 void KcpWrapper::flush() {
-    ikcp_flush(kcp_);
+    // Mirror ikcp_flush's `if (kcp->updated == 0) return;`: a flush before the
+    // first update would bypass kcp::Kcp's own updated_ gate (its Flush has
+    // none) and emit a datagram stamped ts=0, which the peer would feed into
+    // its RTT estimator. Today every caller updates first, so this only hardens
+    // the wrapper against a future caller.
+    if (!updated_) return;
+    kcp_->Flush(kcp::kFlushFull);
 }
 
 int KcpWrapper::peek_size() const {
-    return ikcp_peeksize(kcp_);
+    return kcp_->PeekSize();
 }
 
 int KcpWrapper::wait_send() const {
-    return ikcp_waitsnd(kcp_);
+    return kcp_->wait_snd();
 }
 
 void KcpWrapper::configure() {
-    ikcp_nodelay(kcp_, KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC);
-    ikcp_wndsize(kcp_, KCP_SNDWND, KCP_RCVWND);
-    ikcp_setmtu(kcp_, KCP_MTU);
+    kcp_->NoDelay(KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC);
+    kcp_->WndSize(KCP_SNDWND, KCP_RCVWND);
+    if (kcp_->SetMtu(KCP_MTU) < 0) {
+        // SetMtu only refuses when the value cannot even hold a wire header,
+        // which no compile-time constant of ours can trigger -- but a silent
+        // misconfiguration here would degrade every session, so surface it.
+        LOG_ERROR("kcp_wrapper", "kcp SetMtu refused mtu=" + std::to_string(KCP_MTU));
+    }
 }
 
-int KcpWrapper::c_output(const char* buf, int len, ikcpcb* /*kcp*/, void* user) {
-    auto* self = static_cast<KcpWrapper*>(user);
-    if (!self || !self->output_cb_ || len <= 0 || buf == nullptr) {
-        return 0;
+void KcpWrapper::c_output(const std::uint8_t* buf, std::size_t len) {
+    if (!output_cb_ || len == 0 || buf == nullptr) {
+        return;
     }
-    // Catch every C++ exception. Letting one escape into ikcp's C call frame
-    // is undefined behavior — and a single bad encrypt on the upper layer
-    // would otherwise crash the whole io_context.
+    // Catch every C++ exception. One bad encrypt on the upper layer must not
+    // unwind through kcp::Kcp's flush/input frames into the io_context.
     try {
-        self->output_cb_(byte_view(
-            reinterpret_cast<const uint8_t*>(buf),
-            static_cast<size_t>(len)));
+        output_cb_(byte_view(buf, len));
     } catch (const std::exception& e) {
-        LOG_ERROR("kcp_wrapper", "c_output callback threw: " + std::string(e.what()) +
+        LOG_ERROR("kcp_wrapper", "output callback threw: " + std::string(e.what()) +
                   " len=" + std::to_string(len));
-        return -1;
     } catch (...) {
-        LOG_ERROR("kcp_wrapper", "c_output callback threw unknown exception, len=" + std::to_string(len));
-        return -1;
+        LOG_ERROR("kcp_wrapper", "output callback threw unknown exception, len=" +
+                  std::to_string(len));
     }
-    return 0;
 }
 
 } // namespace kcp_proxy

@@ -92,11 +92,14 @@
             <div class="fld"><label for="serverPort">服务器端口</label><input type="text" id="serverPort" placeholder="8388" inputmode="numeric"/></div>
             <div class="fld"><label for="localPort">本地 SOCKS 端口</label><input type="text" id="localPort" placeholder="1080" inputmode="numeric"/></div>
             <div class="fld"><label for="keySuffix">密钥后缀</label><input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线" spellcheck="false"/></div>
+            <div class="fld"><label for="fecData">FEC 数据分片数</label><input type="text" id="fecData" placeholder="10" inputmode="numeric" disabled/></div>
+            <div class="fld"><label for="fecParity">FEC 校验分片数</label><input type="text" id="fecParity" placeholder="3" inputmode="numeric" disabled/></div>
           </div>
           <div class="checks">
             <label class="checkbox-label"><input type="checkbox" id="autoConnect"/><span class="checkbox-custom"></span><span>打开应用时自动连接</span></label>
             <label class="checkbox-label"><input type="checkbox" id="allowLan"/><span class="checkbox-custom"></span><span>允许局域网使用（默认仅 127.0.0.1）</span></label>
             <label class="checkbox-label"><input type="checkbox" id="autoReconnect"/><span class="checkbox-custom"></span><span>断线重连</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="fecEnabled"/><span class="checkbox-custom"></span><span>启用 FEC 前向纠错（抗丢包；分片数必须与服务端完全一致）</span></label>
           </div>
           <div class="actions">
             <button class="btn btn-fill" id="btn-save">保存设置</button>

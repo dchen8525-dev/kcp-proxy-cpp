@@ -2,8 +2,11 @@
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/time_util.hpp"
+#include "kcp/internal/constants.h"
+#include "kcp/internal/fec.h"
 #include <fmt/format.h>
 #include <cstring>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -11,7 +14,8 @@ namespace kcp_proxy {
 
 KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
                      std::shared_ptr<Crypto> crypto,
-                     std::string log_module, std::string log_tag)
+                     std::string log_module, std::string log_tag,
+                     const FecConfig& fec)
     : io_(io),
       strand_(asio::make_strand(io.get_executor())),
       crypto_(std::move(crypto)),
@@ -22,13 +26,132 @@ KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
     const int64_t now = now_us();
     last_activity_us_.store(now);
     last_keepalive_us_.store(now);
+    if (fec.enabled()) {
+        // header_offset = FEC_CRYPTO_RESERVE: the salt+nonce stay in cleartext
+        // in front of the AEAD plaintext, exactly like kcp-go's sess.headerSize
+        // layering. New() cannot fail here — parse_fec_config already gates
+        // every configuration it could reject — so a null would be a
+        // programming error, and throwing fails the session loudly instead of
+        // silently mismatching the peer's FEC framing.
+        fec_encoder_ = kcp::internal::FecEncoder::New(
+            fec.data_shards, fec.parity_shards,
+            static_cast<int>(FEC_CRYPTO_RESERVE));
+        fec_decoder_ = kcp::internal::FecDecoder::New(
+            fec.data_shards, fec.parity_shards);
+        if (!fec_encoder_ || !fec_decoder_) {
+            LOG_ERROR(log_module_, log_msg("FEC codec creation failed for " +
+                      fec.to_string()));
+            throw std::runtime_error("FEC codec creation failed");
+        }
+        // Pre-size the reusable send frame for the largest possible KCP
+        // datagram (FEC_DATAGRAM_MAX); Encode/resize keep it exact below.
+        fec_send_buf_.reserve(FEC_DATAGRAM_MAX);
+    }
+    LOG_DEBUG(log_module_, log_msg("created conv=" + std::to_string(conv) +
+              " fec=" + fec.to_string()));
     kcp_.set_output_callback([this](byte_view data) {
         // Always invoked from strand_ (KCP only runs there).
-        handle_kcp_output(data);
+        on_kcp_datagram(data);
     });
 }
 
 KcpTunnel::~KcpTunnel() = default;
+
+void KcpTunnel::on_kcp_datagram(byte_view data) {
+    if (!fec_encoder_) {
+        // FEC disabled: the wire stays byte-identical to pre-FEC peers.
+        handle_kcp_output(data);
+        return;
+    }
+    // Frame the datagram: [crypto reserve(28)][fec_hdr(6)][len(2)][payload].
+    // The 28-byte reserve is never written here — handle_kcp_output's
+    // encrypt_into treats the region from offset FEC_CRYPTO_RESERVE as the
+    // AEAD plaintext and writes its own salt+nonce in front of it, exactly
+    // like kcp-go's session writes over the headerOffset region.
+    const size_t frame_size = FEC_CRYPTO_RESERVE + 8 + data.size();
+    fec_send_buf_.resize(frame_size);
+    std::memcpy(fec_send_buf_.data() + FEC_CRYPTO_RESERVE + 8,
+                data.data(), data.size());
+    fec_parity_.clear();
+    // Burst-continuity window = the live RTT-derived RTO, like kcp-go's
+    // sess.rto: a shard set spread wider than one RTO is not a burst, and the
+    // encoder skips its parity while still advancing the seqid.
+    fec_encoder_->Encode(fec_send_buf_.data(), frame_size, kcp_.rto(),
+                         &fec_parity_);
+    // The data shard first, in order, then the parity shards of this set.
+    handle_kcp_output(byte_view(fec_send_buf_.data() + FEC_CRYPTO_RESERVE,
+                                frame_size - FEC_CRYPTO_RESERVE));
+    for (const auto& parity : fec_parity_) {
+        // A parity FecPacket is one full-size buffer whose first
+        // FEC_CRYPTO_RESERVE bytes are dead weight for the crypto layer, just
+        // like a data packet — skip straight to the FEC header.
+        handle_kcp_output(byte_view(parity.data() + FEC_CRYPTO_RESERVE,
+                                    parity.size() - FEC_CRYPTO_RESERVE));
+    }
+}
+
+int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
+    if (!fec_decoder_) {
+        return kcp_.input(byte_view(data, size));
+    }
+    // One decrypted FEC packet: [fec_hdr(6): seqid(4)+type(2)][len(2)][payload].
+    int ret = 0;
+    if (size >= 8) {
+        const uint16_t flag = static_cast<uint16_t>(data[4]) |
+                              static_cast<uint16_t>(data[5] << 8);
+        if (flag == kcp::kTypeData) {
+            // The length field counts itself (fec.go:406): the encoder writes
+            // declared = size - payload_offset(6), so declared already covers
+            // the 2-byte length field plus the payload and must span the
+            // packet minus its 6-byte FEC header exactly.
+            const uint16_t declared = static_cast<uint16_t>(data[6]) |
+                                      static_cast<uint16_t>(data[7] << 8);
+            if (declared + 6 != size) {
+                // The AEAD already authenticated this datagram, so a framing
+                // mismatch means the two peers disagree about FEC parameters
+                // (or a bridge mangled the stream). Refuse like a truncated
+                // KCP segment: the caller's throttled KCP_INPUT_FAILED line
+                // makes the condition visible without per-packet spam.
+                LOG_DEBUG(log_module_, log_msg("fec data framing mismatch: " +
+                          std::to_string(size) + " bytes, declared=" +
+                          std::to_string(declared)));
+                return -2;
+            }
+            ret = kcp_.input(byte_view(data + 8, size - 8));
+        }
+        // typeParity packets carry no KCP payload of their own; typeOob is not
+        // produced by this proxy. Either way they only feed the decoder below.
+    } else {
+        // Too short to even carry an FEC header — same refusal semantics.
+        return -2;
+    }
+    // Every packet (data and parity) must reach the decoder so shard sets
+    // complete; it returns only the shards the codec had to rebuild.
+    for (auto& rebuilt : fec_decoder_->Decode(data, size)) {
+        // A rebuilt shard is the payload region of one data packet, i.e.
+        // [len(2)|payload|zero-pad...]: the decoder zero-extends shards to
+        // the set's maxlen before reconstruction, so the declared prefix is
+        // what matters. The len field counts itself (declared = 2 + payload).
+        if (rebuilt.size() < 2) continue;
+        const uint16_t declared = static_cast<uint16_t>(rebuilt[0]) |
+                                  static_cast<uint16_t>(rebuilt[1] << 8);
+        if (declared < 2 || declared > rebuilt.size()) {
+            LOG_DEBUG(log_module_, log_msg("fec rebuilt framing mismatch: " +
+                      std::to_string(rebuilt.size()) + " bytes, declared=" +
+                      std::to_string(declared)));
+            continue;
+        }
+        const int r = kcp_.input(byte_view(rebuilt.data() + 2,
+                                           declared - 2));
+        if (r >= 0) {
+            metrics_.fec_repaired.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            LOG_DEBUG(log_module_, log_msg("fec rebuilt shard refused by kcp input: ret=" +
+                      std::to_string(r)));
+        }
+    }
+    return ret;
+}
 
 std::string KcpTunnel::log_msg(const std::string& text) const {
     if (log_tag_.empty()) return text;
@@ -132,7 +255,8 @@ std::string KcpTunnel::stats_summary() const {
     const auto& m = metrics_;
     return log_msg(fmt::format(
         "stats tx_pkt={} tx_bytes={} rx_pkt={} rx_bytes={} "
-        "replay_dropped={} decrypt_err={} encrypt_err={} send_err={}",
+        "replay_dropped={} decrypt_err={} encrypt_err={} send_err={} "
+        "fec_repaired={}",
         m.udp_tx_packets.load(std::memory_order_relaxed),
         m.udp_tx_bytes.load(std::memory_order_relaxed),
         m.udp_rx_packets.load(std::memory_order_relaxed),
@@ -140,7 +264,8 @@ std::string KcpTunnel::stats_summary() const {
         m.replay_dropped.load(std::memory_order_relaxed),
         m.decrypt_errors.load(std::memory_order_relaxed),
         m.encrypt_errors.load(std::memory_order_relaxed),
-        m.send_errors.load(std::memory_order_relaxed)));
+        m.send_errors.load(std::memory_order_relaxed),
+        m.fec_repaired.load(std::memory_order_relaxed)));
 }
 
 void KcpTunnel::send_data(byte_view data) {

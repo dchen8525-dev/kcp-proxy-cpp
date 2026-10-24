@@ -23,7 +23,8 @@ public:
                    uint16_t server_port, std::string key,
                    std::string listen_host = "127.0.0.1",
                    uint16_t listen_port = 1080,
-                   int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC);
+                   int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC,
+                   const FecConfig& fec = FecConfig{});
     ~KCPProxyClient();
 
     void start();
@@ -76,6 +77,9 @@ private:
     // How long a half-closed tunnel may sit without the target delivering
     // payload before it is reclaimed. See CLIENT_HALF_CLOSE_GRACE_SEC.
     int half_close_grace_sec_;
+    // FEC parameters applied to every session this client opens. Immutable
+    // after construction (from the -fec CLI flag / GUI config), no lock needed.
+    FecConfig fec_;
 
     void wipe_key();
 

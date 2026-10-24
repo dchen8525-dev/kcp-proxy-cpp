@@ -10,6 +10,8 @@
 #include "kcp_proxy/socks5.hpp"
 #include "kcp_proxy/socket_buffer.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
+#include "kcp/internal/constants.h"
+#include "kcp/internal/fec.h"
 #include <asio.hpp>
 #include <cassert>
 #include <array>
@@ -663,25 +665,143 @@ void test_socket_buffer_clamp_detection() {
 }
 
 void test_kcp_wrapper_applies_constants() {
-    // configure() must apply the KCP_* constants to the live ikcp state. The
+    // configure() must apply the KCP_* constants to the live KCP state. The
     // whole point of promoting the literals to named constants (b52a8bb) was
-    // that the startup log (kcp_config_line) and the live ikcp tuning can
+    // that the startup log (kcp_config_line) and the live KCP tuning can
     // never drift apart; this asserts the live side actually carries them, so
     // the "log renders these exact values" promise is enforced, not just
     // asserted textually by test_kcp_config_line.
     KcpWrapper wrapper(KCP_CONV);
-    const ikcpcb* k = wrapper.ikcp();
-    expect_true(k != nullptr, "KcpWrapper.ikcp() returned null");
+    const kcp::Kcp& k = wrapper.kcp();
 
-    expect_true(k->conv == KCP_CONV, "ikcp conv mismatch");
-    expect_true(k->mtu == static_cast<IUINT32>(KCP_MTU), "ikcp mtu mismatch");
-    expect_true(k->snd_wnd == static_cast<IUINT32>(KCP_SNDWND), "ikcp snd_wnd mismatch");
-    expect_true(k->rcv_wnd == static_cast<IUINT32>(KCP_RCVWND), "ikcp rcv_wnd mismatch");
-    expect_true(k->nodelay == static_cast<IUINT32>(KCP_NODELAY), "ikcp nodelay mismatch");
-    expect_true(k->interval == static_cast<IUINT32>(KCP_INTERVAL_MS), "ikcp interval mismatch");
-    // ikcp_nodelay() maps the resend argument to fastresend and nc to nocwnd.
-    expect_true(k->fastresend == KCP_RESEND, "ikcp fastresend (resend) mismatch");
-    expect_true(k->nocwnd == KCP_NC, "ikcp nocwnd (nc) mismatch");
+    expect_true(k.conv() == KCP_CONV, "kcp conv mismatch");
+    expect_true(k.mtu() == static_cast<uint32_t>(KCP_MTU), "kcp mtu mismatch");
+    expect_true(k.snd_wnd() == static_cast<uint32_t>(KCP_SNDWND), "kcp snd_wnd mismatch");
+    expect_true(k.rcv_wnd() == static_cast<uint32_t>(KCP_RCVWND), "kcp rcv_wnd mismatch");
+    expect_true(k.nodelay() == static_cast<uint32_t>(KCP_NODELAY), "kcp nodelay mismatch");
+    expect_true(k.interval() == static_cast<uint32_t>(KCP_INTERVAL_MS), "kcp interval mismatch");
+    // NoDelay() maps the resend argument to fastresend and nc to nocwnd.
+    expect_true(k.fastresend() == KCP_RESEND, "kcp fastresend (resend) mismatch");
+    expect_true(k.nocwnd() == KCP_NC, "kcp nocwnd (nc) mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// FEC (forward error correction)
+// ---------------------------------------------------------------------------
+
+void test_parse_fec_config() {
+    // Enabled form: both shards parse, and the pair survives the codec's own
+    // constraints (data >= 1, parity >= 1, data+parity <= 256, parity <= data).
+    FecConfig fec;
+    expect_true(parse_fec_config("10:3", fec), "10:3 must parse");
+    expect_true(fec.enabled() && fec.data_shards == 10 && fec.parity_shards == 3,
+                "10:3 must yield enabled 10/3");
+    expect_true(fec.to_string() == "10:3", "to_string must render 10:3");
+
+    // Disabled form.
+    expect_true(parse_fec_config("0:0", fec), "0:0 must parse");
+    expect_true(!fec.enabled(), "0:0 must be disabled");
+    expect_true(fec.to_string() == "off", "disabled must render as off");
+
+    // Every reject case: no colon, empty halves, non-digits, trailing junk,
+    // parity > data, the codec ceiling, and zero-data-nonzero-parity.
+    const char* rejects[] = {"10", "10:", ":3", "", "abc:3", "10:3x", "x10:3",
+                             "3:10", "0:3", "10:0", "250:10", "-1:3", "10:-3"};
+    for (const char* text : rejects) {
+        FecConfig sink;
+        expect_true(!parse_fec_config(text, sink),
+                    (std::string("parse_fec_config must reject '") + text + "'").c_str());
+    }
+    std::cout << "  [ok] parse_fec_config accepts/rejects the documented pairs\n";
+}
+
+void test_fec_codec_repairs_lost_shards() {
+    using kcp::internal::FecDecoder;
+    using kcp::internal::FecEncoder;
+
+    auto encoder = FecEncoder::New(10, 3, 0);
+    auto decoder = FecDecoder::New(10, 3);
+    expect_true(encoder != nullptr, "FecEncoder::New(10,3,0) must succeed");
+    expect_true(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
+
+    // One shard set of 10 data packets, each with a distinct payload pattern.
+    // header_offset = 0: the frame is [fec_hdr(6)][len(2)][payload], i.e. the
+    // exact shape the proxy hands out at FEC_CRYPTO_RESERVE offset.
+    constexpr int kDataShards = 10;
+    std::vector<std::vector<uint8_t>> wire_packets;   // sealed encoder outputs
+    std::vector<std::vector<uint8_t>> payloads;       // the bytes behind len(2)
+    std::vector<std::vector<uint8_t>> parity;
+    for (int i = 0; i < kDataShards; i++) {
+        const size_t payload_len = 100 + static_cast<size_t>(i);
+        std::vector<uint8_t> frame(8 + payload_len);
+        for (size_t j = 0; j < payload_len; j++) {
+            frame[8 + j] = static_cast<uint8_t>((j * 31 + i) & 0xff);
+        }
+        std::vector<std::vector<uint8_t>> emitted;
+        // rto=500ms: packets are emitted back-to-back, so the set is one burst
+        // and parity must be generated (fec.go's continuity branch).
+        encoder->Encode(frame.data(), frame.size(), 500, &emitted);
+        wire_packets.push_back(frame);
+        payloads.push_back(std::vector<uint8_t>(frame.begin() + 8, frame.end()));
+        for (auto& p : emitted) parity.push_back(std::move(p));
+    }
+    expect_true(parity.size() == 3,
+                "a complete 10:3 set must emit exactly 3 parity packets");
+
+    // The encoder seals each data packet: type flag = kTypeData at [4..6) and
+    // the self-counting length field at [6..8).
+    for (const auto& frame : wire_packets) {
+        const uint16_t flag = static_cast<uint16_t>(frame[4]) |
+                              static_cast<uint16_t>(frame[5] << 8);
+        expect_true(flag == kcp::kTypeData, "sealed data packet must carry kTypeData");
+        const uint16_t declared = static_cast<uint16_t>(frame[6]) |
+                                  static_cast<uint16_t>(frame[7] << 8);
+        expect_true(declared + 6 == frame.size(),
+                    "the FEC length field must count itself and span the packet minus its header");
+    }
+
+    // Drop data shards 2, 5 and 9; feed the 7 survivors plus the 3 parity
+    // packets to the decoder and expect exactly the 3 lost payloads rebuilt.
+    const size_t dropped[] = {2, 5, 9};
+    std::vector<std::vector<uint8_t>> rebuilt;
+    for (size_t i = 0; i < wire_packets.size(); i++) {
+        bool is_dropped = false;
+        for (size_t d : dropped) is_dropped = is_dropped || (i == d);
+        if (is_dropped) continue;
+        auto got = decoder->Decode(wire_packets[i].data(), wire_packets[i].size());
+        // Surviving native data packets are buffered by the decoder, never
+        // handed back — only genuinely rebuilt shards are returned.
+        expect_true(got.empty(), "a surviving data packet must not be rebuilt");
+        rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
+                       std::make_move_iterator(got.end()));
+    }
+    for (const auto& p : parity) {
+        auto got = decoder->Decode(p.data(), p.size());
+        rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
+                       std::make_move_iterator(got.end()));
+    }
+    expect_true(rebuilt.size() == 3,
+                (std::string("exactly the 3 lost shards must come back, got ") +
+                 std::to_string(rebuilt.size())).c_str());
+
+    // Each rebuilt shard is [len(2)|payload|zero-pad...] — the decoder
+    // zero-extends every shard to the set's maxlen before reconstruction, so
+    // only the declared prefix is meaningful. The len field counts itself
+    // (declared = 2 + payload). Shards come back in ascending seqid order.
+    for (size_t k = 0; k < rebuilt.size(); k++) {
+        const auto& shard = rebuilt[k];
+        expect_true(shard.size() >= 2, "rebuilt shard must carry its length field");
+        const uint16_t declared = static_cast<uint16_t>(shard[0]) |
+                                  static_cast<uint16_t>(shard[1] << 8);
+        const auto& want = payloads[dropped[k]];
+        expect_true(declared == 2 + want.size(),
+                    "rebuilt shard length field must count itself plus the payload");
+        expect_true(declared <= shard.size(),
+                    "the declared payload must fit inside the possibly zero-extended shard");
+        expect_true(std::equal(want.begin(), want.end(), shard.begin() + 2),
+                    "rebuilt payload must match the lost original byte-for-byte");
+    }
+    std::cout << "  [ok] fec codec rebuilds 3 lost shards of a 10:3 set\n";
 }
 
 void test_kcp_wrapper_oversized_message_is_not_truncated() {
@@ -2125,6 +2245,8 @@ int main() {
         test_async_read_some_rejects_stacked_reads();
         test_kcp_config_line();
         test_socket_buffer_clamp_detection();
+        test_parse_fec_config();
+        test_fec_codec_repairs_lost_shards();
         test_kcp_wrapper_applies_constants();
         test_kcp_wrapper_oversized_message_is_not_truncated();
         test_server_session_routing_and_auth();

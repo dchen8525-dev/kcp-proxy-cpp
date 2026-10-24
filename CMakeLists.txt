@@ -26,8 +26,11 @@ set(PROJECT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 # --- Dependencies ---
 find_package(OpenSSL REQUIRED)
 find_package(asio REQUIRED)
-find_package(kcp REQUIRED)
 find_package(fmt REQUIRED)
+
+# Vendored kcp-cpp core (C++ port of kcp-go) provides the `kcp::kcp` target
+# that replaced the vcpkg C ikcp port. See third_party/kcp-cpp/VENDORED.md.
+add_subdirectory(third_party/kcp-cpp)
 
 # Platform-specific link deps
 find_package(Threads REQUIRED)
@@ -205,6 +208,21 @@ if(Python3_Interpreter_FOUND)
             --client $<TARGET_FILE:kcp-proxy-client>
     )
     set_tests_properties(kcp_proxy_e2e_adversarial PROPERTIES TIMEOUT 300)
+
+    # FEC loss suite: a transparent UDP relay drops ~8% of the datagrams in
+    # both directions. Phase 1 (fec 10:3) asserts the payload survives AND the
+    # codec's repairs are visible in the stats counters; phase 2 (fec off) is
+    # the control proving the default framing is regression-free through the
+    # same loss. Each phase waits one 30s stats interval after the transfer,
+    # hence the timeout.
+    add_test(
+        NAME kcp_proxy_e2e_fec_loss
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_ROOT}/tests/e2e/fec_loss_e2e.py
+            --server $<TARGET_FILE:kcp-proxy-server>
+            --client $<TARGET_FILE:kcp-proxy-client>
+    )
+    set_tests_properties(kcp_proxy_e2e_fec_loss PROPERTIES TIMEOUT 300)
 else()
     message(STATUS "Python3 interpreter not found: skipping smoke + E2E tests")
 endif()

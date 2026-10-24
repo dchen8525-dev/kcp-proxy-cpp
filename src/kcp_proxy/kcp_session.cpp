@@ -11,8 +11,9 @@ namespace kcp_proxy {
 KCPSession::KCPSession(asio::io_context& io, uint32_t conv,
                        asio::ip::udp::endpoint remote_addr,
                        std::shared_ptr<Crypto> crypto,
-                       std::string session_id)
-    : KcpTunnel(io, conv, std::move(crypto), "kcp_session", session_id),
+                       std::string session_id,
+                       const FecConfig& fec)
+    : KcpTunnel(io, conv, std::move(crypto), "kcp_session", session_id, fec),
       session_id_(std::move(session_id)),
       remote_addr_(std::move(remote_addr)) {
     // Mark the session running immediately (synchronously). Previously running_
@@ -126,16 +127,16 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
     metrics_.bytes_received.fetch_add(decrypt_buf_.size(), std::memory_order_relaxed);
     LOG_DEBUG("kcp_session", fmt::format("{}: decrypt OK {} -> {} bytes, peek_before={}",
               session_id_, encrypted.size(), decrypt_buf_.size(), kcp_.peek_size()));
-    int input_ret = kcp_.input(byte_view(decrypt_buf_.data(), decrypt_buf_.size()));
+    int input_ret = feed_kcp_input(decrypt_buf_.data(), decrypt_buf_.size());
     if (input_ret < 0) {
-        // Throttled: any peer holding the session key can make ikcp_input()
+        // Throttled: any peer holding the session key can make kcp input
         // refuse (a truncated segment or a wrong conv is enough), so this is
         // reachable once per datagram -- see log_kcp_input_rejected.
         log_kcp_input_rejected("kcp_session", session_id_, input_ret,
                                decrypt_buf_.size());
         return;
     }
-    LOG_DEBUG("kcp_session", fmt::format("{}: ikcp_input ok, peek_after={} wait_send={}",
+    LOG_DEBUG("kcp_session", fmt::format("{}: kcp input ok, peek_after={} wait_send={}",
               session_id_, kcp_.peek_size(), kcp_.wait_send()));
     try_fulfill_read();
     // ikcp_input() is where the peer's ACKs are consumed, and consuming an ACK
@@ -159,7 +160,7 @@ void KCPSession::on_inject_decrypted(std::vector<uint8_t> decrypted) {
     touch_activity();
     LOG_DEBUG("kcp_session", fmt::format("{}: inject {} decrypted bytes, peek_before={}",
               session_id_, decrypted.size(), kcp_.peek_size()));
-    int input_ret = kcp_.input(byte_view(decrypted.data(), decrypted.size()));
+    int input_ret = feed_kcp_input(decrypted.data(), decrypted.size());
     if (input_ret < 0) {
         log_kcp_input_rejected("kcp_session", session_id_, input_ret,
                                decrypted.size());

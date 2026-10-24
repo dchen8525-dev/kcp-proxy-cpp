@@ -18,6 +18,10 @@ static void print_usage(const char* prog) {
               << "  -H, --host HOST        Bind address (default: 0.0.0.0)\n"
               << "  -k, --key KEY          Encryption key (min 16 chars; alternatively\n"
               << "                         set the KCP_PROXY_KEY environment variable)\n"
+              << "  -fec DATA:PARITY       Reed-Solomon FEC, e.g. -fec 10:3 (default: off).\n"
+              << "                         Repairs up to PARITY lost datagrams per group of\n"
+              << "                         DATA. MUST match the client's value exactly — the\n"
+              << "                         first datagram is already FEC-framed.\n"
               << "  -T, --threads N        io_context worker threads (default: 1).\n"
               << "                         KCP updates run on a single shared 10ms tick;\n"
               << "                         extra threads spread UDP/TCP I/O across cores.\n"
@@ -36,6 +40,7 @@ int main(int argc, char* argv[]) {
     std::string log_level = "INFO";
     unsigned int threads = 1;
     std::vector<std::string> allowed_targets;
+    FecConfig fec;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -45,6 +50,16 @@ int main(int argc, char* argv[]) {
             host = cli::get_arg(argc, argv, i);
         } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
             key = cli::get_arg(argc, argv, i);
+        } else if ((arg == "-fec" || arg == "--fec") && i + 1 < argc) {
+            // Fail-closed parse (see parse_fec_config): anything but 0:0 or a
+            // valid shard pair refuses to start, so a typo can never open a
+            // server whose framing silently mismatches its clients.
+            if (!parse_fec_config(cli::get_arg(argc, argv, i), fec)) {
+                std::cerr << "Error: --fec expects DATA:PARITY (e.g. 10:3), "
+                          << "with 1 <= PARITY <= DATA <= 255, or 0:0 to disable"
+                          << std::endl;
+                return 1;
+            }
         } else if ((arg == "-T" || arg == "--threads") && i + 1 < argc) {
             // Strict digits-only parse, deliberately stricter than std::stoul.
             // stoul throws on "-T abc" / an over-long number, and this argv loop
@@ -115,12 +130,13 @@ int main(int argc, char* argv[]) {
     try {
         asio::io_context io;
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
-        auto server = std::make_shared<KCPServer>(io, port, key, host);
+        auto server = std::make_shared<KCPServer>(io, port, key, host, fec);
         cli::secure_wipe(key);
         server->set_allowed_targets(allowed_targets);
         server->start();
 
-        LOG_INFO("main", "KCP proxy server started on " + host + ":" + std::to_string(port));
+        LOG_INFO("main", "KCP proxy server started on " + host + ":" +
+                 std::to_string(port) + " fec=" + fec.to_string());
 
         cli::setup_signal_handler(io, [server]() { server->stop(); });
 

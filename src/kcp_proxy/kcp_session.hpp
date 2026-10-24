@@ -21,7 +21,8 @@ public:
     KCPSession(asio::io_context& io, uint32_t conv,
                asio::ip::udp::endpoint remote_addr,
                std::shared_ptr<Crypto> crypto,
-               std::string session_id);
+               std::string session_id,
+               const FecConfig& fec = FecConfig{});
     ~KCPSession() override;
 
     void start();

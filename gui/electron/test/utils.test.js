@@ -10,6 +10,7 @@ const {
   formatBytesPerSec,
   isValidPort,
   validateLaunchConfig,
+  buildClientArgs,
   resolveAppIconPath
 } = require('../utils.js');
 
@@ -66,6 +67,61 @@ test('formatBytesPerSec humanizes rates and never goes negative', () => {
   assert.strictEqual(formatBytesPerSec(-5), '0 B/s');
   assert.strictEqual(formatBytesPerSec(1024), '1.00 KB/s');
   assert.strictEqual(formatBytesPerSec(3.5 * 1024 * 1024), '3.50 MB/s');
+});
+
+test('buildClientArgs omits -fec entirely when FEC is disabled', () => {
+  // The absent flag IS the disabled form: argv (and wire) stay byte-identical
+  // to pre-FEC launches, which is what keeps old pairs compatible.
+  const args = buildClientArgs({
+    serverHost: 'example.com', serverPort: '8388', localPort: '1080',
+    allowLan: false
+  });
+  assert.strictEqual(args.includes('-fec'), false);
+});
+
+test('buildClientArgs appends -fec DATA:PARITY when FEC is enabled', () => {
+  const args = buildClientArgs({
+    serverHost: 'example.com', serverPort: '8388', localPort: '1080',
+    allowLan: false, fecEnabled: true, fecData: '10', fecParity: '3'
+  });
+  const i = args.indexOf('-fec');
+  assert.notStrictEqual(i, -1, '-fec flag must be present');
+  assert.strictEqual(args[i + 1], '10:3');
+  // The flag must come after the fixed connect parameters, at the tail.
+  assert.ok(i > args.indexOf('-L'));
+});
+
+test('buildClientArgs coerces numeric shard fields to a canonical pair', () => {
+  const args = buildClientArgs({
+    serverHost: 'h', serverPort: 8388, localPort: 1080,
+    allowLan: true, fecEnabled: true, fecData: 4, fecParity: 2
+  });
+  assert.deepStrictEqual(args.slice(-2), ['-fec', '4:2']);
+});
+
+test('validateLaunchConfig rejects bad FEC pairs only while FEC is enabled', () => {
+  const base = {
+    serverHost: 'example.com', serverPort: '8388', localPort: '1080',
+    keyMode: 'daily', keySuffix: 'Abcd1234', keyDate: '20260820'
+  };
+  // Disabled: the shard fields are ignored entirely (stale garbage must not
+  // block a launch whose FEC is off).
+  assert.strictEqual(
+    validateLaunchConfig({ ...base, fecEnabled: false, fecData: '0', fecParity: '99' }),
+    null);
+  // Enabled: the pair must satisfy 1 <= PARITY <= DATA <= 255.
+  for (const [data, parity] of [['10', '3'], ['4', '2'], ['128', '128']]) {
+    assert.strictEqual(
+      validateLaunchConfig({ ...base, fecEnabled: true, fecData: data, fecParity: parity }),
+      null, `fec ${data}:${parity} must be accepted`);
+  }
+  for (const [data, parity] of [['3', '10'], ['0', '3'], ['10', '0'], ['10', '-3'],
+                                ['10', 'abc'], ['10', '0x3'], ['abc', '3'], ['', '3']]) {
+    assert.match(
+      validateLaunchConfig({ ...base, fecEnabled: true, fecData: data, fecParity: parity }),
+      /FEC 参数/,
+      `fec ${data}:${parity} must be rejected with the parameter message`);
+  }
 });
 
 test('isValidPort accepts 1..65535 only', () => {

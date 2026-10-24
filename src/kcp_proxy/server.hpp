@@ -28,7 +28,8 @@ struct ClientConnection {
 class KCPServer : public std::enable_shared_from_this<KCPServer> {
 public:
     KCPServer(asio::io_context& io, uint16_t port, std::string key,
-              std::string host = "0.0.0.0");
+              std::string host = "0.0.0.0",
+              const FecConfig& fec = FecConfig{});
     ~KCPServer();
 
     void start();
@@ -76,6 +77,9 @@ private:
     uint16_t port_;
     std::string host_;
     std::string key_;
+    // FEC parameters applied to every session this server accepts. Immutable
+    // after construction (read from the -fec CLI flag), so it needs no lock.
+    FecConfig fec_;
 
     // Wipe the plaintext key from memory. Called after the key has been
     // fully consumed (sessions are created lazily, so this is invoked on the
