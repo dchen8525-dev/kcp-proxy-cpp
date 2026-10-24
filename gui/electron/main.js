@@ -613,6 +613,10 @@ function scheduleReconnect() {
 
 // Update UI status
 function updateStatus(running) {
+  // Every start/stop transition begins a fresh traffic session: stale peaks
+  // or a sparkline from the previous run must never leak into the new one
+  // (the display clears on the renderer side via this same event).
+  resetTrafficState();
   mainWindow?.webContents.send('status-update', running);
 
   // Update tray tooltip. The tray IMAGE is static — it is the app icon set
@@ -695,14 +699,51 @@ function createLogLineStream(onLine) {
 // here from consecutive samples — and driven back to zero by the watchdog
 // below once the stream goes quiet, or the display would freeze at the last
 // non-zero rate forever after traffic stops.
-const trafficState = { sample: null, txRate: 0, rxRate: 0 };
+//
+// Beyond the current rates, this state also feeds the sparkline display:
+//   - peaks: the session maxima, formatted for the caption line;
+//   - history: the last TRAFFIC_HISTORY raw rate samples (oldest first), sent
+//     as plain numbers because the renderer only PLOTS them — all humanized
+//     strings stay single-sourced here through utils.js. The history drains
+//     to zero on the watchdog's quiet transition and then freezes flat, which
+//     is the honest picture of an idle link.
+const TRAFFIC_HISTORY = 30; // samples; at the ~2s TRAFFIC cadence ≈ 60 s window
+const trafficState = {
+  sample: null, txRate: 0, rxRate: 0,
+  txPeak: 0, rxPeak: 0,
+  histUp: [], histDown: []
+};
+
+function resetTrafficState() {
+  trafficState.sample = null;
+  trafficState.txRate = 0;
+  trafficState.rxRate = 0;
+  trafficState.txPeak = 0;
+  trafficState.rxPeak = 0;
+  trafficState.histUp.length = 0;
+  trafficState.histDown.length = 0;
+}
+
+function pushTrafficHistory() {
+  trafficState.histUp.push(trafficState.txRate);
+  trafficState.histDown.push(trafficState.rxRate);
+  if (trafficState.histUp.length > TRAFFIC_HISTORY) trafficState.histUp.shift();
+  if (trafficState.histDown.length > TRAFFIC_HISTORY) trafficState.histDown.shift();
+}
 
 function sendTrafficUpdate() {
+  trafficState.txPeak = Math.max(trafficState.txPeak, trafficState.txRate);
+  trafficState.rxPeak = Math.max(trafficState.rxPeak, trafficState.rxRate);
+  pushTrafficHistory();
   mainWindow?.webContents.send('traffic-update', {
     tx: formatBytes(trafficState.sample.tx),
     rx: formatBytes(trafficState.sample.rx),
     txRate: formatBytesPerSec(trafficState.txRate),
-    rxRate: formatBytesPerSec(trafficState.rxRate)
+    rxRate: formatBytesPerSec(trafficState.rxRate),
+    txPeak: formatBytesPerSec(trafficState.txPeak),
+    rxPeak: formatBytesPerSec(trafficState.rxPeak),
+    histUp: trafficState.histUp,
+    histDown: trafficState.histDown
   });
 }
 
@@ -741,8 +782,11 @@ function handleClientLine(line) {
     } else {
       // First sample, or the client restarted and its counters reset — a
       // negative delta would otherwise render as a nonsense negative rate.
+      // The peak belongs to the dead run too, so it resets with the rates.
       trafficState.txRate = 0;
       trafficState.rxRate = 0;
+      trafficState.txPeak = 0;
+      trafficState.rxPeak = 0;
     }
     trafficState.sample = { tx, rx, t: now };
     sendTrafficUpdate();

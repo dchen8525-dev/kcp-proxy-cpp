@@ -17,8 +17,12 @@ const elements = {
   statusDot: document.getElementById('status-dot'),
   statusText: document.getElementById('status-text'),
   trafficIndicator: document.getElementById('traffic-indicator'),
-  trafficUp: document.querySelector('.traffic-up'),
-  trafficDown: document.querySelector('.traffic-down'),
+  trafficDownRate: document.getElementById('traffic-down-rate'),
+  trafficDownSpark: document.getElementById('traffic-down-spark'),
+  trafficDownCap: document.getElementById('traffic-down-cap'),
+  trafficUpRate: document.getElementById('traffic-up-rate'),
+  trafficUpSpark: document.getElementById('traffic-up-spark'),
+  trafficUpCap: document.getElementById('traffic-up-cap'),
   logCard: document.getElementById('log-card'),
   logContainer: document.getElementById('log-container'),
   ovSocks: document.getElementById('ov-socks'),
@@ -427,20 +431,75 @@ function updateStatus(running) {
     elements.statusDot.classList.remove('running');
     elements.statusText.textContent = '未运行';
     elements.trafficIndicator.hidden = true;
-    // Reset the counters, not just hide them: the client only emits a TRAFFIC
+    // Reset the display, not just hide it: the client only emits a TRAFFIC
     // line when the numbers change, so a restart would otherwise re-show the
-    // PREVIOUS run's totals and leave them there until new traffic arrives.
-    elements.trafficUp.textContent = '↑ 0 B · 0 B/s';
-    elements.trafficDown.textContent = '↓ 0 B · 0 B/s';
+    // PREVIOUS run's sparkline and totals until new traffic arrives.
+    resetTrafficDisplay();
   }
 }
 
-// Update traffic display. The main process already humanized both the
-// cumulative counters and the derived rates (utils.js lives there), so these
-// arrive as display strings: "↑ 12.34 KB · 1.25 KB/s".
-function updateTraffic({ tx, rx, txRate, rxRate }) {
-  elements.trafficUp.textContent = `↑ ${tx} · ${txRate}`;
-  elements.trafficDown.textContent = `↓ ${rx} · ${rxRate}`;
+// Traffic display. The main process humanizes everything (utils.js lives
+// there) AND derives the session history: this side is pure presentation —
+// fill the strings, plot the sparkline. histUp/histDown are RAW bytes/sec
+// samples (oldest first, ≤30 points ≈ 60 s at the client's TRAFFIC cadence).
+const SPARK = {
+  WIDTH: 100, HEIGHT: 30,
+  PADDING: 2,                       // keep the stroke clear of the viewBox edge
+  UP_COLOR: '#47685a',              // 松绿 — matches --pine
+  DOWN_COLOR: '#b5432f'             // 朱砂 — matches --cinnabar
+};
+
+function updateTraffic({ tx, rx, txRate, rxRate, txPeak, rxPeak, histUp, histDown }) {
+  elements.trafficDownRate.textContent = rxRate;
+  elements.trafficUpRate.textContent = txRate;
+  elements.trafficDownCap.textContent = `峰值 ${rxPeak} · 累计 ${rx}`;
+  elements.trafficUpCap.textContent = `峰值 ${txPeak} · 累计 ${tx}`;
+  drawSpark(elements.trafficDownSpark, Array.isArray(histDown) ? histDown : [],
+    SPARK.DOWN_COLOR);
+  drawSpark(elements.trafficUpSpark, Array.isArray(histUp) ? histUp : [],
+    SPARK.UP_COLOR);
+}
+
+// Clear the whole traffic block (used when a run ends). Plain strings rather
+// than a loop over a shared "cells" list keep each element's id greppable.
+function resetTrafficDisplay() {
+  elements.trafficDownRate.textContent = '0 B/s';
+  elements.trafficUpRate.textContent = '0 B/s';
+  elements.trafficDownCap.textContent = '峰值 0 B/s · 累计 0 B';
+  elements.trafficUpCap.textContent = '峰值 0 B/s · 累计 0 B';
+  elements.trafficDownSpark.innerHTML = '';
+  elements.trafficUpSpark.innerHTML = '';
+}
+
+// Render a sparkline as an inline SVG: light area fill + 1.2px stroke, scaled
+// to the sample maximum (×1.15 headroom, floored at 1 B/s so an all-zero
+// history still draws as a flat baseline). preserveAspectRatio="none" stretches
+// to the container while vector-effect="non-scaling-stroke" keeps the stroke
+// hairline-thin. Newest sample sits at the RIGHT edge; the curve grows in from
+// there until the 30-sample window is full. innerHTML is safe here: the only
+// interpolated values are numbers we computed and two hardcoded colors.
+function drawSpark(container, samples, color) {
+  if (!samples.length) {
+    container.innerHTML = '';
+    return;
+  }
+  const { WIDTH, HEIGHT, PADDING } = SPARK;
+  const max = Math.max(...samples);
+  const scale = Math.max(max * 1.15, 1);
+  const usable = HEIGHT - 2 * PADDING;
+  const step = WIDTH / (samples.length - 1 || 1);
+  const points = samples.map((v, i) => {
+    const x = i * step;
+    const y = HEIGHT - PADDING - (v / scale) * usable;
+    return `${x.toFixed(2)} ${y.toFixed(2)}`;
+  });
+  const line = `M${points.join(' L')}`;
+  const area = `${line} L${WIDTH} ${HEIGHT} L0 ${HEIGHT} Z`;
+  container.innerHTML =
+    `<svg viewBox="0 0 ${WIDTH} ${HEIGHT}" preserveAspectRatio="none">` +
+    `<path d="${area}" fill="${color}1a"/>` +
+    `<path d="${line}" fill="none" stroke="${color}" stroke-width="1.2" ` +
+    'vector-effect="non-scaling-stroke"/></svg>';
 }
 
 // Append log entry

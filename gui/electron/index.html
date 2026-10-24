@@ -64,8 +64,22 @@
             <span class="test-result" id="test-result" aria-live="polite"></span>
           </div>
           <span class="traffic-indicator" id="traffic-indicator" hidden>
-            <span class="traffic-up">↑ 0 B · 0 B/s</span>
-            <span class="traffic-down">↓ 0 B · 0 B/s</span>
+            <span class="traffic-cell traffic-down">
+              <span class="traffic-row">
+                <span class="traffic-dir">↓ 下载</span>
+                <span class="traffic-rate" id="traffic-down-rate">0 B/s</span>
+                <span class="traffic-spark" id="traffic-down-spark"></span>
+              </span>
+              <span class="traffic-cap" id="traffic-down-cap">峰值 0 B/s · 累计 0 B</span>
+            </span>
+            <span class="traffic-cell traffic-up">
+              <span class="traffic-row">
+                <span class="traffic-dir">↑ 上传</span>
+                <span class="traffic-rate" id="traffic-up-rate">0 B/s</span>
+                <span class="traffic-spark" id="traffic-up-spark"></span>
+              </span>
+              <span class="traffic-cap" id="traffic-up-cap">峰值 0 B/s · 累计 0 B</span>
+            </span>
           </span>
         </section>
 

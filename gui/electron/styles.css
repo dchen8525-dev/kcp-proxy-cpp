@@ -388,25 +388,78 @@ code {
 /* ── Traffic indicator ── */
 /* Sits on its own row directly below the actions (启动/测试按钮) — moved out
    of the actions flex row so the live counters read as a status line. */
+/* Traffic indicator: one row per direction — label, current rate, and a
+   60-second sparkline. The caption line carries the session peak and the
+   cumulative total so the rate stays the visual protagonist. */
 .traffic-indicator {
   display: flex;
-  gap: 16px;
-  font-size: 12px;
-  font-family: var(--mono);
-  color: var(--ink-2);
-  margin-top: 14px;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+  max-width: 430px;
 }
 
 .traffic-indicator[hidden] {
   display: none;
 }
 
-.traffic-up {
-  color: var(--pine);
+.traffic-cell {
+  display: flex;
+  flex-direction: column;
 }
 
-.traffic-down {
+.traffic-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+}
+
+.traffic-dir {
+  flex: none;
+  width: 46px;
+  font-size: 12px;
+  color: var(--ink-2);
+  letter-spacing: .04em;
+}
+
+.traffic-rate {
+  flex: none;
+  min-width: 82px;
+  font-size: 13.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.traffic-spark {
+  flex: 1;
+  height: 26px;
+  min-width: 140px;
+}
+
+.traffic-spark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.traffic-cap {
+  margin: 2px 0 0 56px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.traffic-down .traffic-dir,
+.traffic-down .traffic-rate {
   color: var(--cinnabar);
+}
+
+.traffic-up .traffic-dir,
+.traffic-up .traffic-rate {
+  color: var(--pine);
 }
 
 /* ── Settings view ── */
