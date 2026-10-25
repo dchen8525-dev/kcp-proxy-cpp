@@ -82,7 +82,7 @@ test('buildClientArgs omits -fec entirely when FEC is disabled', () => {
 test('buildClientArgs appends -fec DATA:PARITY when FEC is enabled', () => {
   const args = buildClientArgs({
     serverHost: 'example.com', serverPort: '8388', localPort: '1080',
-    allowLan: false, fecEnabled: true, fecData: '10', fecParity: '3'
+    allowLan: false, fecEnabled: true, fecPair: '10:3'
   });
   const i = args.indexOf('-fec');
   assert.notStrictEqual(i, -1, '-fec flag must be present');
@@ -91,12 +91,14 @@ test('buildClientArgs appends -fec DATA:PARITY when FEC is enabled', () => {
   assert.ok(i > args.indexOf('-L'));
 });
 
-test('buildClientArgs coerces numeric shard fields to a canonical pair', () => {
+test('buildClientArgs canonicalizes the pair it emits', () => {
+  // Leading zeros parse on the C++ side, but the argv carries the canonical
+  // numeric form so logs on both ends read identically.
   const args = buildClientArgs({
     serverHost: 'h', serverPort: 8388, localPort: 1080,
-    allowLan: true, fecEnabled: true, fecData: 4, fecParity: 2
+    allowLan: true, fecEnabled: true, fecPair: '010:003'
   });
-  assert.deepStrictEqual(args.slice(-2), ['-fec', '4:2']);
+  assert.deepStrictEqual(args.slice(-2), ['-fec', '10:3']);
 });
 
 test('validateLaunchConfig rejects bad FEC pairs only while FEC is enabled', () => {
@@ -104,44 +106,47 @@ test('validateLaunchConfig rejects bad FEC pairs only while FEC is enabled', () 
     serverHost: 'example.com', serverPort: '8388', localPort: '1080',
     keyMode: 'daily', keySuffix: 'Abcd1234', keyDate: '20260820'
   };
-  // Disabled: the shard fields are ignored entirely (stale garbage must not
+  // Disabled: the pair field is ignored entirely (stale garbage must not
   // block a launch whose FEC is off).
   assert.strictEqual(
-    validateLaunchConfig({ ...base, fecEnabled: false, fecData: '0', fecParity: '99' }),
+    validateLaunchConfig({ ...base, fecEnabled: false, fecPair: '0:99' }),
     null);
   // Enabled: the pair must satisfy 1 <= PARITY <= DATA <= 255.
-  for (const [data, parity] of [['10', '3'], ['4', '2'], ['128', '128']]) {
+  for (const pair of ['10:3', '4:2', '128:128']) {
     assert.strictEqual(
-      validateLaunchConfig({ ...base, fecEnabled: true, fecData: data, fecParity: parity }),
-      null, `fec ${data}:${parity} must be accepted`);
+      validateLaunchConfig({ ...base, fecEnabled: true, fecPair: pair }),
+      null, `fec ${pair} must be accepted`);
   }
-  for (const [data, parity] of [['3', '10'], ['0', '3'], ['10', '0'], ['10', '-3'],
-                                ['10', 'abc'], ['10', '0x3'], ['abc', '3'], ['', '3']]) {
+  for (const pair of ['3:10', '0:3', '10:0', '10:-3', '10:abc', '10:0x3',
+                      'abc:3', '', '10', '10:3:1', ':3', '10:', '10 :3']) {
     assert.match(
-      validateLaunchConfig({ ...base, fecEnabled: true, fecData: data, fecParity: parity }),
+      validateLaunchConfig({ ...base, fecEnabled: true, fecPair: pair }),
       /FEC 参数/,
-      `fec ${data}:${parity} must be rejected with the parameter message`);
+      `fec ${JSON.stringify(pair)} must be rejected with the parameter message`);
   }
 });
 
-test('buildClientArgs never emits a NaN pair for a half-filled FEC form', () => {
-  // Regression: `Number(undefined)` used to produce the literal argv
-  // "-fec NaN:NaN". The client's parser is fail-closed, so that is not a
-  // degraded tunnel -- it is a client that refuses to start at all.
+test('buildClientArgs never emits a malformed pair for a bad FEC form', () => {
+  // Regression: a malformed pair used to reach the argv verbatim (formerly as
+  // "-fec NaN:NaN"). The client's parser is fail-closed, so that is not a
+  // degraded tunnel -- it is a client that refuses to start at all. Every
+  // unusable value must fall back to the default pair instead.
   const cases = [
-    [{ fecData: undefined, fecParity: undefined }, '10:3'],
-    [{ fecData: '', fecParity: '' }, '10:3'],
-    [{ fecData: 'abc', fecParity: 'xyz' }, '10:3'],
-    [{ fecData: '0', fecParity: '0' }, '10:3'],
-    [{ fecData: '4', fecParity: undefined }, '4:3']
+    [undefined, '10:3'],
+    ['', '10:3'],
+    ['abc', '10:3'],
+    ['0:0', '10:3'],
+    ['10', '10:3'],      // missing colon — a half-typed pair
+    ['10:', '10:3'],
+    ['4:0', '10:3']
   ];
-  for (const [fields, want] of cases) {
+  for (const [fecPair, want] of cases) {
     const args = buildClientArgs({
       serverHost: 'h', serverPort: '8388', localPort: '1080',
-      allowLan: false, fecEnabled: true, ...fields
+      allowLan: false, fecEnabled: true, fecPair
     });
     assert.strictEqual(args[args.indexOf('-fec') + 1], want,
-      `half-filled FEC form ${JSON.stringify(fields)} must fall back to ${want}`);
+      `FEC form ${JSON.stringify(fecPair)} must fall back to ${want}`);
     assert.ok(!args.some((a) => a.includes('NaN')), 'no argv token may contain NaN');
   }
 });

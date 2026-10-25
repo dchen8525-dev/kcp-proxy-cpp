@@ -36,7 +36,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startProxy: (config) => ipcRenderer.invoke('start-proxy', config),
   stopProxy: () => ipcRenderer.invoke('stop-proxy'),
   getStatus: () => ipcRenderer.invoke('get-status'),
-  // `fec` ({fecEnabled, fecData, fecParity}) makes the probe speak the same
+  // `fec` ({fecEnabled, fecPair}) makes the probe speak the same
   // wire format the real launch would; omitting it against an FEC server
   // always reports a timeout.
   testConnection: (host, port, keySuffix, fec) =>

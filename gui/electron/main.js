@@ -4,7 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const dns = require('dns');
 const net = require('net');
-const { generateKey: buildKey, getBeijingDate, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, formatBytesPerSec, resolveAppIconPath } = require('./utils');
+const { generateKey: buildKey, getBeijingDate, validateLaunchConfig, buildClientArgs, buildClientEnv, formatBytes, formatBytesPerSec, resolveAppIconPath, parseFecPair } = require('./utils');
 
 // Auto-updater (electron-updater) — loaded lazily to keep dev/preview simple.
 let autoUpdater = null;
@@ -92,6 +92,20 @@ class ConfigStore {
     }
     if (changed) this._persist();
   }
+
+  // Drop keys entirely (used by one-time migrations so retired config keys do
+  // not linger in the file and re-trigger the migration on every startup).
+  deleteMany(keys) {
+    this._ensure();
+    let changed = false;
+    for (const key of keys) {
+      if (key in this._data) {
+        delete this._data[key];
+        changed = true;
+      }
+    }
+    if (changed) this._persist();
+  }
 }
 
 // Persistent configuration storage
@@ -103,16 +117,30 @@ const store = new ConfigStore({
   autoConnect: false, // Start the proxy automatically when the app opens
   allowLan: false, // Bind SOCKS to 0.0.0.0 instead of 127.0.0.1 only
   autoReconnect: true, // Auto reconnect on disconnect
-  // FEC defaults: OFF, matching the C++ side's default. The shard pair is
-  // kcp-go's recommended 10:3 so enabling the checkbox needs no typing, but it
-  // is only ever sent when fecEnabled is true.
+  // FEC defaults: OFF, matching the C++ side's default. The shard pair rides
+  // as one "DATA:PARITY" field (kcp-go's recommended 10:3) so enabling the
+  // checkbox needs no typing, but it is only ever sent when fecEnabled is true.
   fecEnabled: false,
-  fecData: '10',
-  fecParity: '3',
+  fecPair: '10:3',
   reconnectDelay: 3000, // Delay before reconnect (ms)
   maxReconnectAttempts: 10, // Max reconnect attempts (0 = unlimited)
   legacyAutoStartCleared: false // One-time cleanup of the removed 开机自启 registry entry
 });
+
+// One-time migration: configs saved before the single FEC field stored the
+// shard pair as two keys (fecData/fecParity). Compose them into fecPair, then
+// delete the legacy keys so this runs exactly once. A pair that no longer
+// parses falls back to the default — matching what buildClientArgs did with a
+// malformed pair before the merge.
+{
+  const legacyData = store.get('fecData');
+  const legacyParity = store.get('fecParity');
+  if (legacyData !== undefined || legacyParity !== undefined) {
+    const composed = `${String(legacyData ?? '10').trim() || '10'}:${String(legacyParity ?? '3').trim() || '3'}`;
+    store.set('fecPair', parseFecPair(composed) ? composed : '10:3');
+    store.deleteMany(['fecData', 'fecParity']);
+  }
+}
 
 // ── File-backed log (rotation at ~1MB, keeps one backup) ──
 const MAX_LOG_BYTES = 1024 * 1024;
@@ -427,8 +455,7 @@ async function startProxy(opts = {}) {
   const fecEnabled = override && override.fecEnabled != null
     ? (override.fecEnabled === true || override.fecEnabled === 'true')
     : store.get('fecEnabled') === true;
-  const fecData = String(pick('fecData') ?? '').trim() || '10';
-  const fecParity = String(pick('fecParity') ?? '').trim() || '3';
+  const fecPair = String(pick('fecPair') ?? '').trim() || '10:3';
 
   // Single validation pass over all launch parameters (shared with unit tests)
   const validationError = validateLaunchConfig({
@@ -438,8 +465,7 @@ async function startProxy(opts = {}) {
     keyMode: 'daily',
     keySuffix,
     fecEnabled,
-    fecData,
-    fecParity
+    fecPair
   });
   if (validationError) {
     sendLog(validationError, 'error');
@@ -462,7 +488,7 @@ async function startProxy(opts = {}) {
   // datagram is rejected (KCP_INPUT_FAILED) -- a tunnel that connects at the
   // UDP level and carries nothing.
   const args = buildClientArgs({
-    serverHost, serverPort, localPort, allowLan, fecEnabled, fecData, fecParity
+    serverHost, serverPort, localPort, allowLan, fecEnabled, fecPair
   });
 
   try {
@@ -475,7 +501,7 @@ async function startProxy(opts = {}) {
 
     isRunning = true;
     updateStatus(true);
-    sendLog(`已启动: ${clientPath} server=${serverHost}:${serverPort} socks5=${listenHost}:${localPort} key_mode=daily key_len=${key.length} fec=${fecEnabled ? `${fecData}:${fecParity}` : 'off'}`, 'info');
+    sendLog(`已启动: ${clientPath} server=${serverHost}:${serverPort} socks5=${listenHost}:${localPort} key_mode=daily key_len=${key.length} fec=${fecEnabled ? fecPair : 'off'}`, 'info');
 
     // Capture stdout (client rarely uses it — everything goes to stderr)
     const pushStdoutLine = createLogLineStream((line) => sendLog(line, 'info'));
@@ -847,7 +873,7 @@ ipcMain.handle('validate-config', (event, config) =>
 // The only keys the renderer may persist (see renderer.js saveSettings). A
 // whitelist costs nothing now and stops an unknown or hostile key from being
 // written into the config file if the renderer is ever compromised.
-const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoConnect', 'allowLan', 'autoReconnect', 'fecEnabled', 'fecData', 'fecParity'];
+const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoConnect', 'allowLan', 'autoReconnect', 'fecEnabled', 'fecPair'];
 
 ipcMain.handle('save-config', (event, config) => {
   if (!config || typeof config !== 'object') return false;
@@ -924,7 +950,7 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = gene
         // FEC on and the flag omitted, the probe's plaintext framing is
         // rejected by an FEC server, so 测试连接 would always report a bogus
         // timeout even though 启动连接 works.
-        fecEnabled: fec.fecEnabled, fecData: fec.fecData, fecParity: fec.fecParity
+        fecEnabled: fec.fecEnabled, fecPair: fec.fecPair
       }), {
         cwd: path.dirname(clientPath),
         stdio: ['ignore', 'ignore', 'pipe'],
@@ -1033,8 +1059,7 @@ async function runConnectivityTest(host, port, keySuffixOverride, fecOverride) {
     : store.get('keySuffix');
 
   const fecEnabled = fecOverride && fecOverride.fecEnabled === true;
-  const fecData = String((fecOverride && fecOverride.fecData) ?? '10').trim() || '10';
-  const fecParity = String((fecOverride && fecOverride.fecParity) ?? '3').trim() || '3';
+  const fecPair = String((fecOverride && fecOverride.fecPair) ?? '10:3').trim() || '10:3';
 
   const validationError = validateLaunchConfig({
     serverHost: h,
@@ -1043,8 +1068,7 @@ async function runConnectivityTest(host, port, keySuffixOverride, fecOverride) {
     keyMode: 'daily',
     keySuffix,
     fecEnabled,
-    fecData,
-    fecParity
+    fecPair
   });
   if (validationError) {
     return { ok: false, message: validationError };
@@ -1068,7 +1092,7 @@ async function runConnectivityTest(host, port, keySuffixOverride, fecOverride) {
 
   return probeKcpHandshake(clientPath, h, p, 10000,
     buildKey('daily', { suffix: keySuffix }),
-    { fecEnabled, fecData, fecParity });
+    { fecEnabled, fecPair });
 }
 
 ipcMain.on('window-minimize', () => {

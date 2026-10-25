@@ -47,28 +47,30 @@ function isValidPort(value) {
   return /^\d+$/.test(String(value).trim()) && parseInt(value, 10) >= 1 && parseInt(value, 10) <= 65535;
 }
 
+// Split a "DATA:PARITY" string exactly the way the C++ parse_fec_config does:
+// one colon, strict digits-only halves (no sign, no junk, no empty halves).
+// Returns [data, parity] as numbers, or null when the text is not a pair.
+function parseFecPair(text) {
+  const m = String(text ?? '').trim().match(/^(\d+):(\d+)$/);
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
 // Return an error message string, or null if the config is valid for a launch.
 // cfg: { serverHost, serverPort, localPort, keyMode, keySuffix, fixedKey, keyDate?,
-//        fecEnabled?, fecData?, fecParity? }
+//        fecEnabled?, fecPair? }
 //   keyDate gives a fixed date for deterministic tests; otherwise today's Beijing date is used.
 // FEC validation mirrors the C++ parse_fec_config (config.hpp): when enabled the
 // pair must satisfy 1 <= PARITY <= DATA <= 255 so the redundancy ratio never
-// exceeds 100%; while disabled the fields are ignored entirely.
+// exceeds 100%; while disabled the field is ignored entirely.
 function validateLaunchConfig(cfg) {
   if (!cfg.serverHost) return '请填写服务器地址';
   if (!isValidPort(cfg.serverPort)) return '服务器端口必须是 1-65535 之间的整数';
   if (!isValidPort(cfg.localPort)) return '本地 SOCKS 端口必须是 1-65535 之间的整数';
 
   if (cfg.fecEnabled) {
-    // Digits-only first (same rule as the C++ parse): Number() would otherwise
-    // silently accept '0x10' or '10.0' and canonicalize them into the argv.
-    const dataRaw = String(cfg.fecData ?? '');
-    const parityRaw = String(cfg.fecParity ?? '');
-    const fecData = /^\d+$/.test(dataRaw) ? Number(dataRaw) : NaN;
-    const fecParity = /^\d+$/.test(parityRaw) ? Number(parityRaw) : NaN;
-    if (!Number.isInteger(fecData) || !Number.isInteger(fecParity) ||
-        fecData < 1 || fecParity < 1 || fecParity > fecData ||
-        fecData + fecParity > 256) {
+    const pair = parseFecPair(cfg.fecPair);
+    if (!pair || pair[0] < 1 || pair[1] < 1 ||
+        pair[1] > pair[0] || pair[0] + pair[1] > 256) {
       return 'FEC 参数必须是 DATA:PARITY，满足 1 ≤ PARITY ≤ DATA ≤ 255（例如 10:3）';
     }
   }
@@ -98,7 +100,7 @@ function validateLaunchConfig(cfg) {
 // disabled form, keeping the argv (and the wire) byte-identical to pre-FEC
 // launches. Both peers must run identical values — there is no negotiation.
 function buildClientArgs({ serverHost, serverPort, localPort, allowLan,
-                           fecEnabled, fecData, fecParity }) {
+                           fecEnabled, fecPair }) {
   const args = [
     '-s', String(serverHost),
     '-p', String(serverPort),
@@ -109,14 +111,13 @@ function buildClientArgs({ serverHost, serverPort, localPort, allowLan,
   if (fecEnabled) {
     // Guard the pair here as well as in validateLaunchConfig: buildClientArgs is
     // also reachable from paths that skip validation (the connectivity probe,
-    // unit tests, a future caller), and `Number(undefined)` would put a literal
-    // "-fec NaN:NaN" on the argv, which the client's fail-closed parser rejects
-    // by refusing to start at all. Defaulting keeps a half-filled form usable.
-    const data = Number.isInteger(Number(fecData)) && Number(fecData) > 0
-      ? Number(fecData) : 10;
-    const parity = Number.isInteger(Number(fecParity)) && Number(fecParity) > 0
-      ? Number(fecParity) : 3;
-    args.push('-fec', `${data}:${parity}`);
+    // unit tests, a future caller), and a malformed pair would go onto the argv
+    // verbatim, which the client's fail-closed parser rejects by refusing to
+    // start at all. Anything not a parseable positive pair falls back to 10:3,
+    // keeping a half-filled form usable.
+    const pair = parseFecPair(fecPair);
+    const valid = pair && pair[0] > 0 && pair[1] > 0;
+    args.push('-fec', valid ? `${pair[0]}:${pair[1]}` : '10:3');
   }
   return args;
 }
@@ -150,6 +151,7 @@ module.exports = {
   formatBytes,
   formatBytesPerSec,
   isValidPort,
+  parseFecPair,
   validateLaunchConfig,
   buildClientArgs,
   buildClientEnv,

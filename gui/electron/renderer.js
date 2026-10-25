@@ -31,8 +31,7 @@ const elements = {
   ovKeyDate: document.getElementById('ov-keydate'),
   testResult: document.getElementById('test-result'),
   fecEnabled: document.getElementById('fecEnabled'),
-  fecData: document.getElementById('fecData'),
-  fecParity: document.getElementById('fecParity'),
+  fecPair: document.getElementById('fecPair'),
   sideFoot: document.getElementById('side-foot')
 };
 
@@ -100,11 +99,10 @@ function populateForm(config) {
   elements.autoConnect.checked = config.autoConnect === true;
   elements.allowLan.checked = config.allowLan === true;
   elements.autoReconnect.checked = config.autoReconnect !== false;
-  // FEC: disabled by default; the shard placeholders match the C++-side
+  // FEC: disabled by default; the pair placeholder matches the C++-side
   // recommendation (kcp-go's 10:3) so enabling needs no typing.
   elements.fecEnabled.checked = config.fecEnabled === true;
-  elements.fecData.value = config.fecData || '10';
-  elements.fecParity.value = config.fecParity || '3';
+  elements.fecPair.value = config.fecPair || '10:3';
   syncFecInputs();
   refreshOverview();
 }
@@ -200,13 +198,11 @@ function setupEventListeners() {
   elements.btnSave.addEventListener('click', saveSettings);
 }
 
-// Enable/disable the FEC shard inputs to mirror the FEC checkbox. Called from
+// Enable/disable the FEC pair input to mirror the FEC checkbox. Called from
 // the change listener and after populateForm so a loaded config renders the
-// inputs in the right state.
+// input in the right state.
 function syncFecInputs() {
-  const enabled = elements.fecEnabled.checked;
-  elements.fecData.disabled = !enabled;
-  elements.fecParity.disabled = !enabled;
+  elements.fecPair.disabled = !elements.fecEnabled.checked;
 }
 
 // Scroll the log to its tail. Called both from appendLog and when the log
@@ -259,8 +255,7 @@ function readForm() {
     allowLan: elements.allowLan.checked,
     autoReconnect: elements.autoReconnect.checked,
     fecEnabled: elements.fecEnabled.checked,
-    fecData: elements.fecData.value.trim() || '10',
-    fecParity: elements.fecParity.value.trim() || '3'
+    fecPair: elements.fecPair.value.trim() || '10:3'
   };
 }
 
@@ -324,8 +319,7 @@ async function testConnection() {
   try {
     const result = await window.electronAPI.testConnection(host, port, keySuffix, {
       fecEnabled: elements.fecEnabled.checked,
-      fecData: elements.fecData.value.trim() || '10',
-      fecParity: elements.fecParity.value.trim() || '3'
+      fecPair: elements.fecPair.value.trim() || '10:3'
     });
     showTestResultAfterMinPending(result.ok ? 'success' : 'error', result.message, startedAt);
     appendLog(`${result.ok ? '✓' : '✗'} ${result.message}`, result.ok ? 'info' : 'error');
@@ -410,8 +404,7 @@ async function startProxy() {
     keyMode: 'daily',
     keySuffix: form.keySuffix,
     fecEnabled: form.fecEnabled,
-    fecData: form.fecData,
-    fecParity: form.fecParity
+    fecPair: form.fecPair
   });
   if (validationError) {
     appendLog(validationError, 'error');
