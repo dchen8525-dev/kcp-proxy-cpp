@@ -28,9 +28,24 @@ find_package(OpenSSL REQUIRED)
 find_package(asio REQUIRED)
 find_package(fmt REQUIRED)
 
-# Vendored kcp-cpp core (C++ port of kcp-go) provides the `kcp::kcp` target
-# that replaced the vcpkg C ikcp port. See third_party/kcp-cpp/VENDORED.md.
-add_subdirectory(third_party/kcp-cpp)
+# KCP: the `kcp::kcp` target is the C++17 port of kcp-go (dchen8525-dev/kcp-cpp)
+# that replaced the C ikcp vcpkg port. It is consumed two ways, both pinned to
+# the same upstream revision:
+#   * normal builds — the overlay port in ports/kcp-cpp (see
+#     vcpkg-configuration.json), linked via find_package(kcp CONFIG);
+#   * ASAN builds — MSVC refuses images mixing annotated and unannotated
+#     objects (LNK2038), so the prebuilt package cannot be linked; FetchContent
+#     compiles the pinned revision in-tree and the ASAN block further down
+#     instruments it.
+if(KCP_PROXY_ENABLE_ASAN)
+    include(FetchContent)
+    FetchContent_Declare(kcp_cpp
+        GIT_REPOSITORY https://github.com/dchen8525-dev/kcp-cpp
+        GIT_TAG ca8ad19c18c83400d392986b24bb3a2e389fa41c)  # v0.1.0
+    FetchContent_MakeAvailable(kcp_cpp)
+else()
+    find_package(kcp CONFIG REQUIRED)
+endif()
 
 # Platform-specific link deps
 find_package(Threads REQUIRED)
@@ -85,10 +100,9 @@ if(MSVC)
         # 必须显式补上，否则库与使用者一个有 ASAN 注解一个没有，LNK2038 直接
         # 拒绝链接。
         target_compile_options(kcp_proxy_lib PRIVATE /W4 /wd4324 /fsanitize=address)
-        # vendored kcp 目标更早（文件顶部的 add_subdirectory），需要同样的显式
-        # 补齐：不补的话 kcp.lib 的对象没有容器注解而所有使用者有，链接同样以
-        # LNK2038（annotate_string/vector/optional 不匹配）失败——自 kcp-cpp
-        # 引入起，文档记载的 build-asan 内存回归工作流就连构建都无法完成。
+        # ASAN 构建里 kcp 来自 FetchContent（文件顶部的条件分支；普通构建用的
+        # vcpkg 预编译包不参与 ASAN），源码在树内编译，需要同样的显式补齐：不补
+        # 的话 kcp 的对象没有容器注解而所有使用者有，链接同样以 LNK2038 失败。
         if(TARGET kcp)
             target_compile_options(kcp PRIVATE /fsanitize=address)
         endif()
