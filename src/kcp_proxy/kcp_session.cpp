@@ -132,12 +132,18 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
         // Throttled: any peer holding the session key can make kcp input
         // refuse (a truncated segment or a wrong conv is enough), so this is
         // reachable once per datagram -- see log_kcp_input_rejected.
+        //
+        // NOTE: do NOT return here. The return value describes the NATIVE
+        // shard only; with FEC enabled the decoder may have rebuilt other
+        // shards of the set and already queued them into KCP. Bailing out
+        // would leave those bytes unread until the next 10ms tick and skip
+        // the parked-write resume, so the post-processing below always runs.
         log_kcp_input_rejected("kcp_session", session_id_, input_ret,
                                decrypt_buf_.size());
-        return;
+    } else {
+        LOG_DEBUG("kcp_session", fmt::format("{}: kcp input ok, peek_after={} wait_send={}",
+                  session_id_, kcp_.peek_size(), kcp_.wait_send()));
     }
-    LOG_DEBUG("kcp_session", fmt::format("{}: kcp input ok, peek_after={} wait_send={}",
-              session_id_, kcp_.peek_size(), kcp_.wait_send()));
     try_fulfill_read();
     // ikcp_input() is where the peer's ACKs are consumed, and consuming an ACK
     // is the only thing that frees send-window space. Resume a parked tcp->kcp
@@ -162,11 +168,14 @@ void KCPSession::on_inject_decrypted(std::vector<uint8_t> decrypted) {
               session_id_, decrypted.size(), kcp_.peek_size()));
     int input_ret = feed_kcp_input(decrypted.data(), decrypted.size());
     if (input_ret < 0) {
+        // Same reasoning as on_receive: the native shard was refused, but the
+        // decoder may have rebuilt siblings into KCP, so keep draining.
         log_kcp_input_rejected("kcp_session", session_id_, input_ret,
                                decrypted.size());
-        return;
+    } else {
+        LOG_DEBUG("kcp_session", fmt::format("{}: inject ok, peek_after={}",
+                  session_id_, kcp_.peek_size()));
     }
-    LOG_DEBUG("kcp_session", fmt::format("{}: inject ok, peek_after={}", session_id_, kcp_.peek_size()));
     try_fulfill_read();
     maybe_resume_write();
 }

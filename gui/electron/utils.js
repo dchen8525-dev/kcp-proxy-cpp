@@ -107,7 +107,16 @@ function buildClientArgs({ serverHost, serverPort, localPort, allowLan,
     '-L', 'info'
   ];
   if (fecEnabled) {
-    args.push('-fec', `${Number(fecData)}:${Number(fecParity)}`);
+    // Guard the pair here as well as in validateLaunchConfig: buildClientArgs is
+    // also reachable from paths that skip validation (the connectivity probe,
+    // unit tests, a future caller), and `Number(undefined)` would put a literal
+    // "-fec NaN:NaN" on the argv, which the client's fail-closed parser rejects
+    // by refusing to start at all. Defaulting keeps a half-filled form usable.
+    const data = Number.isInteger(Number(fecData)) && Number(fecData) > 0
+      ? Number(fecData) : 10;
+    const parity = Number.isInteger(Number(fecParity)) && Number(fecParity) > 0
+      ? Number(fecParity) : 3;
+    args.push('-fec', `${data}:${parity}`);
   }
   return args;
 }

@@ -322,7 +322,11 @@ async function testConnection() {
 
   const startedAt = Date.now();
   try {
-    const result = await window.electronAPI.testConnection(host, port, keySuffix);
+    const result = await window.electronAPI.testConnection(host, port, keySuffix, {
+      fecEnabled: elements.fecEnabled.checked,
+      fecData: elements.fecData.value.trim() || '10',
+      fecParity: elements.fecParity.value.trim() || '3'
+    });
     showTestResultAfterMinPending(result.ok ? 'success' : 'error', result.message, startedAt);
     appendLog(`${result.ok ? '✓' : '✗'} ${result.message}`, result.ok ? 'info' : 'error');
   } catch (err) {
@@ -404,7 +408,10 @@ async function startProxy() {
     serverPort: form.serverPort,
     localPort: form.localPort,
     keyMode: 'daily',
-    keySuffix: form.keySuffix
+    keySuffix: form.keySuffix,
+    fecEnabled: form.fecEnabled,
+    fecData: form.fecData,
+    fecParity: form.fecParity
   });
   if (validationError) {
     appendLog(validationError, 'error');

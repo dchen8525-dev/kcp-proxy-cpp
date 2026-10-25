@@ -95,38 +95,54 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         return kcp_.input(byte_view(data, size));
     }
     // One decrypted FEC packet: [fec_hdr(6): seqid(4)+type(2)][len(2)][payload].
-    int ret = 0;
-    if (size >= 8) {
-        const uint16_t flag = static_cast<uint16_t>(data[4]) |
-                              static_cast<uint16_t>(data[5] << 8);
-        if (flag == kcp::kTypeData) {
-            // The length field counts itself (fec.go:406): the encoder writes
-            // declared = size - payload_offset(6), so declared already covers
-            // the 2-byte length field plus the payload and must span the
-            // packet minus its 6-byte FEC header exactly.
-            const uint16_t declared = static_cast<uint16_t>(data[6]) |
-                                      static_cast<uint16_t>(data[7] << 8);
-            if (declared + 6 != size) {
-                // The AEAD already authenticated this datagram, so a framing
-                // mismatch means the two peers disagree about FEC parameters
-                // (or a bridge mangled the stream). Refuse like a truncated
-                // KCP segment: the caller's throttled KCP_INPUT_FAILED line
-                // makes the condition visible without per-packet spam.
-                LOG_DEBUG(log_module_, log_msg("fec data framing mismatch: " +
-                          std::to_string(size) + " bytes, declared=" +
-                          std::to_string(declared)));
-                return -2;
-            }
-            ret = kcp_.input(byte_view(data + 8, size - 8));
-        }
-        // typeParity packets carry no KCP payload of their own; typeOob is not
-        // produced by this proxy. Either way they only feed the decoder below.
-    } else {
-        // Too short to even carry an FEC header — same refusal semantics.
+    if (size < 8) {
+        // Too short to even carry an FEC header + length field — same refusal
+        // semantics as a truncated KCP segment.
         return -2;
     }
-    // Every packet (data and parity) must reach the decoder so shard sets
-    // complete; it returns only the shards the codec had to rebuild.
+    const uint16_t flag = static_cast<uint16_t>(data[4]) |
+                          static_cast<uint16_t>(data[5] << 8);
+    int ret = 0;
+    if (flag == kcp::kTypeData) {
+        // The length field counts itself (fec.go:406): the encoder writes
+        // declared = size - payload_offset(6), so declared already covers the
+        // 2-byte length field plus the payload and must span the packet minus
+        // its 6-byte FEC header exactly.
+        const uint16_t declared = static_cast<uint16_t>(data[6]) |
+                                  static_cast<uint16_t>(data[7] << 8);
+        // declared == 2 means an empty payload; the encoder never emits one (a
+        // KCP datagram always carries its 24-byte segment header), so treat it
+        // as a framing error rather than handing KCP a zero-length input.
+        if (declared <= 2 || declared + 6 != size) {
+            // The AEAD already authenticated this datagram, so a framing
+            // mismatch means the two peers disagree about FEC parameters (or a
+            // bridge mangled the stream). Refuse like a truncated KCP segment:
+            // the caller's throttled KCP_INPUT_FAILED line makes the condition
+            // visible without per-packet spam.
+            LOG_DEBUG(log_module_, log_msg("fec data framing mismatch: " +
+                      std::to_string(size) + " bytes, declared=" +
+                      std::to_string(declared)));
+            return -2;
+        }
+        ret = kcp_.input(byte_view(data + 8, size - 8));
+    } else if (flag != kcp::kTypeParity && flag != kcp::kTypeOob) {
+        // Not a FEC type at all. This is what a peer with a DIFFERENT -fec
+        // setting looks like: an unframed KCP segment puts its cmd byte at
+        // offset 4 (0x51..0x54) and its frg at 5, so the flag lands nowhere
+        // near 0xf1..0xf3. Reporting success here would make a parameter
+        // mismatch completely silent -- the tunnel would connect at the UDP
+        // level and carry nothing, with no FAIL_STAGE line anywhere. Refuse
+        // instead so the mismatch is as loud as the docs promise.
+        LOG_DEBUG(log_module_, log_msg("fec packet type mismatch: flag=" +
+                  std::to_string(flag) + " size=" + std::to_string(size) +
+                  " (peers disagree about -fec)"));
+        return -2;
+    }
+    // Every packet that reached this point (data and parity) must also feed the
+    // decoder so shard sets complete; it returns only the shards the codec had
+    // to rebuild. The result is a by-value vector, so the kcp_.input() calls
+    // below (which may synchronously flush and therefore re-enter
+    // on_kcp_datagram) cannot invalidate this loop.
     for (auto& rebuilt : fec_decoder_->Decode(data, size)) {
         // A rebuilt shard is the payload region of one data packet, i.e.
         // [len(2)|payload|zero-pad...]: the decoder zero-extends shards to
@@ -135,7 +151,7 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         if (rebuilt.size() < 2) continue;
         const uint16_t declared = static_cast<uint16_t>(rebuilt[0]) |
                                   static_cast<uint16_t>(rebuilt[1] << 8);
-        if (declared < 2 || declared > rebuilt.size()) {
+        if (declared <= 2 || declared > rebuilt.size()) {
             LOG_DEBUG(log_module_, log_msg("fec rebuilt framing mismatch: " +
                       std::to_string(rebuilt.size()) + " bytes, declared=" +
                       std::to_string(declared)));

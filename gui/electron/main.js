@@ -103,6 +103,12 @@ const store = new ConfigStore({
   autoConnect: false, // Start the proxy automatically when the app opens
   allowLan: false, // Bind SOCKS to 0.0.0.0 instead of 127.0.0.1 only
   autoReconnect: true, // Auto reconnect on disconnect
+  // FEC defaults: OFF, matching the C++ side's default. The shard pair is
+  // kcp-go's recommended 10:3 so enabling the checkbox needs no typing, but it
+  // is only ever sent when fecEnabled is true.
+  fecEnabled: false,
+  fecData: '10',
+  fecParity: '3',
   reconnectDelay: 3000, // Delay before reconnect (ms)
   maxReconnectAttempts: 10, // Max reconnect attempts (0 = unlimited)
   legacyAutoStartCleared: false // One-time cleanup of the removed 开机自启 registry entry
@@ -415,13 +421,25 @@ async function startProxy(opts = {}) {
   const localPort = pick('localPort');
   const keySuffix = pick('keySuffix');
 
+  // FEC: the form sends fecEnabled as a real boolean, but a value that round
+  // tripped through the config file is a string, so normalize both. Without
+  // this the checkbox alone would not be enough to make `-fec` appear.
+  const fecEnabled = override && override.fecEnabled != null
+    ? (override.fecEnabled === true || override.fecEnabled === 'true')
+    : store.get('fecEnabled') === true;
+  const fecData = String(pick('fecData') ?? '').trim() || '10';
+  const fecParity = String(pick('fecParity') ?? '').trim() || '3';
+
   // Single validation pass over all launch parameters (shared with unit tests)
   const validationError = validateLaunchConfig({
     serverHost,
     serverPort,
     localPort,
     keyMode: 'daily',
-    keySuffix
+    keySuffix,
+    fecEnabled,
+    fecData,
+    fecParity
   });
   if (validationError) {
     sendLog(validationError, 'error');
@@ -439,7 +457,13 @@ async function startProxy(opts = {}) {
   // The key travels via KCP_PROXY_KEY in the environment, NOT argv: the
   // command line of a process is visible to every local user (Task Manager /
   // wmic), while the environment is readable only by the same user.
-  const args = buildClientArgs({ serverHost, serverPort, localPort, allowLan });
+  // FEC MUST ride along: without it the client frames plaintext the way a
+  // pre-FEC peer does while the server expects FEC framing, and every
+  // datagram is rejected (KCP_INPUT_FAILED) -- a tunnel that connects at the
+  // UDP level and carries nothing.
+  const args = buildClientArgs({
+    serverHost, serverPort, localPort, allowLan, fecEnabled, fecData, fecParity
+  });
 
   try {
     const proc = spawn(clientPath, args, {
@@ -451,7 +475,7 @@ async function startProxy(opts = {}) {
 
     isRunning = true;
     updateStatus(true);
-    sendLog(`已启动: ${clientPath} server=${serverHost}:${serverPort} socks5=${listenHost}:${localPort} key_mode=daily key_len=${key.length}`, 'info');
+    sendLog(`已启动: ${clientPath} server=${serverHost}:${serverPort} socks5=${listenHost}:${localPort} key_mode=daily key_len=${key.length} fec=${fecEnabled ? `${fecData}:${fecParity}` : 'off'}`, 'info');
 
     // Capture stdout (client rarely uses it — everything goes to stderr)
     const pushStdoutLine = createLogLineStream((line) => sendLog(line, 'info'));
@@ -823,7 +847,7 @@ ipcMain.handle('validate-config', (event, config) =>
 // The only keys the renderer may persist (see renderer.js saveSettings). A
 // whitelist costs nothing now and stops an unknown or hostile key from being
 // written into the config file if the renderer is ever compromised.
-const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoConnect', 'allowLan', 'autoReconnect'];
+const SAVEABLE_CONFIG_KEYS = ['serverHost', 'serverPort', 'localPort', 'keySuffix', 'autoConnect', 'allowLan', 'autoReconnect', 'fecEnabled', 'fecData', 'fecParity'];
 
 ipcMain.handle('save-config', (event, config) => {
   if (!config || typeof config !== 'object') return false;
@@ -870,7 +894,8 @@ ipcMain.handle('get-key-date', () => getBeijingDate());
 // The probe binds the local SOCKS5 listener to a free ephemeral port so it
 // never collides with a running proxy. Killing the probe afterwards leaves one
 // idle session on the server, reaped by its 60s idle sweep.
-function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = generateKey()) {
+function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = generateKey(),
+                           fec = {}) {
   return getFreePort().then((listenPort) => new Promise((resolve) => {
     let settled = false;
     let timer = null;
@@ -894,7 +919,12 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = gene
 
     try {
       proc = spawn(clientPath, buildClientArgs({
-        serverHost: host, serverPort: port, localPort: listenPort
+        serverHost: host, serverPort: port, localPort: listenPort,
+        // The probe must speak the SAME wire format as the real launch: with
+        // FEC on and the flag omitted, the probe's plaintext framing is
+        // rejected by an FEC server, so 测试连接 would always report a bogus
+        // timeout even though 启动连接 works.
+        fecEnabled: fec.fecEnabled, fecData: fec.fecData, fecParity: fec.fecParity
       }), {
         cwd: path.dirname(clientPath),
         stdio: ['ignore', 'ignore', 'pipe'],
@@ -974,13 +1004,13 @@ function getFreePort() {
   });
 }
 
-ipcMain.handle('test-connection', async (event, host, port, keySuffix) => {
+ipcMain.handle('test-connection', async (event, host, port, keySuffix, fec) => {
   if (connectivityTestInFlight) {
     return { ok: false, message: '测试进行中，请稍候' };
   }
   connectivityTestInFlight = true;
   try {
-    return await runConnectivityTest(host, port, keySuffix);
+    return await runConnectivityTest(host, port, keySuffix, fec);
   } finally {
     connectivityTestInFlight = false;
   }
@@ -990,7 +1020,9 @@ ipcMain.handle('test-connection', async (event, host, port, keySuffix) => {
 // one test-connection can run concurrently. keySuffixOverride carries the
 // settings form's value so the probe mints the same key the user sees — the
 // saved config is not consulted unless the field is untouched.
-async function runConnectivityTest(host, port, keySuffixOverride) {
+// `fecOverride` carries the form's FEC selection for the same reason: the
+// probe must hand the client the exact argv the launch would.
+async function runConnectivityTest(host, port, keySuffixOverride, fecOverride) {
   const h = (host || store.get('serverHost') || '').trim();
   // The RAW value the user asked to test, not parseInt() of it: the launch path
   // validates the string through isValidPort, so coercing here let "8388x" test
@@ -1000,12 +1032,19 @@ async function runConnectivityTest(host, port, keySuffixOverride) {
     ? String(keySuffixOverride).trim()
     : store.get('keySuffix');
 
+  const fecEnabled = fecOverride && fecOverride.fecEnabled === true;
+  const fecData = String((fecOverride && fecOverride.fecData) ?? '10').trim() || '10';
+  const fecParity = String((fecOverride && fecOverride.fecParity) ?? '3').trim() || '3';
+
   const validationError = validateLaunchConfig({
     serverHost: h,
     serverPort: rawPort,
     localPort: store.get('localPort'),
     keyMode: 'daily',
-    keySuffix
+    keySuffix,
+    fecEnabled,
+    fecData,
+    fecParity
   });
   if (validationError) {
     return { ok: false, message: validationError };
@@ -1028,7 +1067,8 @@ async function runConnectivityTest(host, port, keySuffixOverride) {
   }
 
   return probeKcpHandshake(clientPath, h, p, 10000,
-    buildKey('daily', { suffix: keySuffix }));
+    buildKey('daily', { suffix: keySuffix }),
+    { fecEnabled, fecData, fecParity });
 }
 
 ipcMain.on('window-minimize', () => {

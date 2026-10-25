@@ -36,8 +36,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startProxy: (config) => ipcRenderer.invoke('start-proxy', config),
   stopProxy: () => ipcRenderer.invoke('stop-proxy'),
   getStatus: () => ipcRenderer.invoke('get-status'),
-  testConnection: (host, port, keySuffix) =>
-    ipcRenderer.invoke('test-connection', host, port, keySuffix),
+  // `fec` ({fecEnabled, fecData, fecParity}) makes the probe speak the same
+  // wire format the real launch would; omitting it against an FEC server
+  // always reports a timeout.
+  testConnection: (host, port, keySuffix, fec) =>
+    ipcRenderer.invoke('test-connection', host, port, keySuffix, fec),
 
   // Window control
   minimizeWindow: () => ipcRenderer.send('window-minimize'),

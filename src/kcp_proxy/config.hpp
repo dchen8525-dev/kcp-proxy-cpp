@@ -272,8 +272,23 @@ inline bool parse_fec_config(const std::string& text, FecConfig& out) {
     // trailing junk, no empty halves.
     if (data_part.empty() || parity_part.empty() ||
         data_part.find_first_not_of("0123456789") != std::string::npos ||
-        parity_part.find_first_not_of("0123456789") != std::string::npos ||
-        data_part.size() > 3 || parity_part.size() > 3) {
+        parity_part.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+    // Bound the digit count BEFORE stol. The largest legal value is 255, so a
+    // value with more than 3 significant digits can never be accepted; the
+    // gate exists to keep stol provably in range (std::stol throws on
+    // overflow, and this parser is called from the argv loop outside main's
+    // try block, where an escaping exception aborts with no diagnostic).
+    // Leading zeros are stripped first so "010" (a legitimate way to write 10)
+    // is not rejected by the length check alone -- the numeric checks below
+    // still apply to it.
+    const size_t data_sig = data_part.find_first_not_of('0');
+    const size_t parity_sig = parity_part.find_first_not_of('0');
+    const size_t data_digits = (data_sig == std::string::npos) ? 0 : data_part.size() - data_sig;
+    const size_t parity_digits =
+        (parity_sig == std::string::npos) ? 0 : parity_part.size() - parity_sig;
+    if (data_digits > 3 || parity_digits > 3) {
         return false;
     }
     const long data = std::stol(data_part);

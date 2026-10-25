@@ -87,3 +87,6 @@ gui/electron/dist-*/
 
 # Local deploy helper (contains server credentials; kept out of the repo)
 scripts/deploy/sshrun.py
+# Ad-hoc deployment scratch directory (source tarball + SSH helper with the
+# server password). Never commit it.
+.deploy/

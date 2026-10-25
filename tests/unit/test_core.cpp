@@ -706,11 +706,28 @@ void test_parse_fec_config() {
     // Every reject case: no colon, empty halves, non-digits, trailing junk,
     // parity > data, the codec ceiling, and zero-data-nonzero-parity.
     const char* rejects[] = {"10", "10:", ":3", "", "abc:3", "10:3x", "x10:3",
-                             "3:10", "0:3", "10:0", "250:10", "-1:3", "10:-3"};
+                             "3:10", "0:3", "10:0", "250:10", "-1:3", "10:-3",
+                             // Digit-count gate: 4+ significant digits can never
+                             // be a legal shard count (max 255) and must be
+                             // rejected without ever reaching std::stol.
+                             "1000:1", "1:1000", "99999999999999999999:1"};
     for (const char* text : rejects) {
         FecConfig sink;
         expect_true(!parse_fec_config(text, sink),
                     (std::string("parse_fec_config must reject '") + text + "'").c_str());
+    }
+    // Leading zeros are a legitimate spelling of the same number; the gate must
+    // count SIGNIFICANT digits, not characters.
+    {
+        FecConfig lead;
+        expect_true(parse_fec_config("010:03", lead),
+                    "leading zeros must not be rejected by the digit-count gate");
+        expect_true(lead.data_shards == 10 && lead.parity_shards == 3,
+                    "010:03 must normalize to 10:3");
+        FecConfig zeros;
+        expect_true(parse_fec_config("000:000", zeros),
+                    "all-zero halves must still parse as the disabled form");
+        expect_true(!zeros.enabled(), "000:000 must be disabled");
     }
     std::cout << "  [ok] parse_fec_config accepts/rejects the documented pairs\n";
 }
@@ -802,6 +819,212 @@ void test_fec_codec_repairs_lost_shards() {
                     "rebuilt payload must match the lost original byte-for-byte");
     }
     std::cout << "  [ok] fec codec rebuilds 3 lost shards of a 10:3 set\n";
+}
+
+void test_fec_frame_layout_at_crypto_reserve() {
+    // The tunnel frames KCP datagrams at header_offset = FEC_CRYPTO_RESERVE,
+    // i.e. the FEC header starts AFTER the 28-byte region the crypto layer
+    // fills with salt+nonce. Only the e2e suite exercised that offset before,
+    // which is exactly where an off-by-one in the payload_offset arithmetic
+    // would hide: a wrong offset still produces plausible-looking frames that
+    // simply never repair anything.
+    using kcp::internal::FecDecoder;
+    using kcp::internal::FecEncoder;
+
+    auto encoder = FecEncoder::New(10, 3, static_cast<int>(FEC_CRYPTO_RESERVE));
+    auto decoder = FecDecoder::New(10, 3);
+    expect_true(encoder != nullptr, "FecEncoder::New(10,3,crypto_reserve) must succeed");
+    expect_true(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
+
+    // Exactly the largest datagram KCP can emit, which is the budget the
+    // FEC_WIRE_DATAGRAM_MAX static_assert is built on.
+    constexpr int kDataShards = 10;
+    const size_t kcp_len = KCP_MTU;
+    const size_t frame_size = FEC_CRYPTO_RESERVE + 8 + kcp_len;
+
+    std::vector<std::vector<uint8_t>> frames;
+    std::vector<std::vector<uint8_t>> payloads;
+    std::vector<std::vector<uint8_t>> parity;
+    for (int i = 0; i < kDataShards; i++) {
+        // 0xA5 in the reserve region: the crypto layer owns those bytes and
+        // must never see them modified by the FEC seal.
+        std::vector<uint8_t> frame(frame_size, 0xA5);
+        for (size_t j = 0; j < kcp_len; j++) {
+            frame[FEC_CRYPTO_RESERVE + 8 + j] = static_cast<uint8_t>((j * 17 + i) & 0xff);
+        }
+        std::vector<std::vector<uint8_t>> emitted;
+        encoder->Encode(frame.data(), frame_size, 500, &emitted);
+        frames.push_back(frame);
+        payloads.push_back(std::vector<uint8_t>(frame.begin() + FEC_CRYPTO_RESERVE + 8,
+                                                frame.end()));
+        for (auto& p : emitted) parity.push_back(std::move(p));
+    }
+
+    expect_true(parity.size() == 3, "a complete 10:3 set must emit exactly 3 parity packets");
+
+    for (const auto& frame : frames) {
+        // The reserve region stays byte-identical: the FEC seal only writes
+        // from header_offset onwards.
+        bool reserve_untouched = true;
+        for (size_t j = 0; j < FEC_CRYPTO_RESERVE; j++) {
+            reserve_untouched = reserve_untouched && frame[j] == 0xA5;
+        }
+        expect_true(reserve_untouched,
+                    "the crypto reserve region must not be written by the FEC seal");
+        const uint16_t flag = static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 4]) |
+                              static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 5] << 8);
+        expect_true(flag == kcp::kTypeData, "sealed data packet must carry kTypeData");
+        const uint16_t declared = static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 6]) |
+                                  static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 7] << 8);
+        // The length field counts itself: everything from payload_offset to
+        // the end of the frame, which here is 2 + KCP_MTU.
+        expect_true(declared == 2 + kcp_len,
+                    "declared must cover the length field plus the KCP datagram");
+    }
+
+    // Drop shards 0, 4 and 8 (the extremes plus the middle), then verify the
+    // rebuilt payload is the KCP datagram itself -- not the length field and
+    // not shifted by the crypto reserve.
+    //
+    // Decode() must be handed the packet the ENCODER produced starting at
+    // header_offset, not the whole crypto-reserved buffer: on_kcp_datagram
+    // passes `fec_send_buf_ + FEC_CRYPTO_RESERVE` and the parity loop passes
+    // `parity.data() + FEC_CRYPTO_RESERVE` (kcp_tunnel.cpp:82-89), because the
+    // decrypt path also strips the salt+nonce before feed_kcp_input sees the
+    // bytes. Feeding the reserve in would make ReadLe32 read 0x... as the
+    // seqid and silently drop every shard into one slot.
+    const size_t dropped[] = {0, 4, 8};
+    std::vector<std::vector<uint8_t>> rebuilt;
+    for (size_t i = 0; i < frames.size(); i++) {
+        bool is_dropped = false;
+        for (size_t d : dropped) is_dropped = is_dropped || (i == d);
+        if (is_dropped) continue;
+        auto got = decoder->Decode(frames[i].data() + FEC_CRYPTO_RESERVE,
+                                   frames[i].size() - FEC_CRYPTO_RESERVE);
+        expect_true(got.empty(), "a surviving data packet must not be rebuilt");
+    }
+    for (const auto& p : parity) {
+        auto got = decoder->Decode(p.data() + FEC_CRYPTO_RESERVE,
+                                   p.size() - FEC_CRYPTO_RESERVE);
+        rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
+                       std::make_move_iterator(got.end()));
+    }
+    expect_true(rebuilt.size() == 3,
+                (std::string("exactly 3 shards must be rebuilt at the reserve offset, got ") +
+                 std::to_string(rebuilt.size())).c_str());
+
+    for (size_t k = 0; k < rebuilt.size(); k++) {
+        const auto& shard = rebuilt[k];
+        expect_true(shard.size() >= 2, "rebuilt shard must carry its length field");
+        const uint16_t declared = static_cast<uint16_t>(shard[0]) |
+                                  static_cast<uint16_t>(shard[1] << 8);
+        const auto& want = payloads[dropped[k]];
+        expect_true(declared == 2 + want.size(),
+                    "rebuilt shard must declare the length field plus the KCP datagram");
+        expect_true(declared <= shard.size(),
+                    "the declared prefix must fit inside the zero-extended shard");
+        expect_true(std::equal(want.begin(), want.end(), shard.begin() + 2),
+                    "rebuilt KCP datagram must match the lost original byte-for-byte");
+    }
+    std::cout << "  [ok] fec frames keep the crypto reserve intact and rebuild at that offset\n";
+}
+
+void test_fec_encoder_does_not_leak_stale_shard_bytes() {
+    // shard_cache_ is reused across shard sets and only grows
+    // (fec.cc:102-105, 124-126), so slot i keeps whatever the previous set put
+    // there. GenerateParity zeroes [shard_length_, max_size_) for every data
+    // shard (fec.cc:158-162) before copying the payload out, which is what
+    // makes a shorter follow-up set safe. If that memset were ever dropped, the
+    // parity shards would carry the tail of a previous, longer datagram -- the
+    // decoder would then "successfully" rebuild a shard whose trailing bytes are
+    // another packet's ciphertext, and KCP would consume corruption as if it had
+    // been authenticated on the wire. Pin the behaviour down end-to-end.
+    using kcp::internal::FecDecoder;
+    using kcp::internal::FecEncoder;
+
+    constexpr int kDataShards = 4;
+    auto encoder = FecEncoder::New(kDataShards, 2, 0);
+    expect_true(encoder != nullptr, "FecEncoder::New(4,2,0) must succeed");
+
+    // Set 1: every shard fills the full 1400-byte budget with a loud pattern.
+    const size_t long_len = 8 + 1392;
+    for (int i = 0; i < kDataShards; i++) {
+        std::vector<uint8_t> frame(long_len, 0xEE);
+        std::vector<std::vector<uint8_t>> emitted;
+        encoder->Encode(frame.data(), frame.size(), 500, &emitted);
+    }
+
+    // Set 2: same slots, but each shard is only the minimum 8 + 16 bytes.
+    // Every byte the second set exposes beyond its own length must be zero.
+    const size_t short_len = 8 + 16;
+    std::vector<std::vector<uint8_t>> short_payloads;
+    std::vector<std::vector<uint8_t>> short_frames;
+    std::vector<std::vector<uint8_t>> parity;
+    for (int i = 0; i < kDataShards; i++) {
+        std::vector<uint8_t> frame(short_len, 0);
+        // 0x11.. so a leaked 0xEE tail is unmistakable.
+        std::fill(frame.begin() + 8, frame.end(), static_cast<uint8_t>(0x10 + i));
+        std::vector<std::vector<uint8_t>> emitted;
+        encoder->Encode(frame.data(), frame.size(), 500, &emitted);
+        short_frames.push_back(frame);
+        short_payloads.push_back(std::vector<uint8_t>(frame.begin() + 8, frame.end()));
+        for (auto& p : emitted) parity.push_back(std::move(p));
+    }
+    expect_true(parity.size() == 2, "a complete 4:2 set must emit exactly 2 parity packets");
+
+    // The parity packets of set 2 are max_size long (8 + 16 here), never the
+    // 1400 bytes set 1 used -- GenerateParity truncates to max_size_.
+    for (const auto& p : parity) {
+        expect_true(p.size() == short_len,
+                    "parity length must follow the CURRENT set's max_size, not a stale one");
+    }
+
+    // Drop one shard of set 2 and rebuild it from the survivors plus parity.
+    auto decoder = FecDecoder::New(kDataShards, 2);
+    expect_true(decoder != nullptr, "FecDecoder::New(4,2) must succeed");
+    const size_t dropped_index = 2;
+    std::vector<std::vector<uint8_t>> rebuilt;
+    for (size_t i = 0; i < short_frames.size(); i++) {
+        if (i == dropped_index) continue;
+        auto got = decoder->Decode(short_frames[i].data(), short_frames[i].size());
+        rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
+                       std::make_move_iterator(got.end()));
+    }
+    for (const auto& p : parity) {
+        auto got = decoder->Decode(p.data(), p.size());
+        rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
+                       std::make_move_iterator(got.end()));
+    }
+    expect_true(rebuilt.size() == 1,
+                (std::string("the dropped short shard must be rebuilt, got ") +
+                 std::to_string(rebuilt.size())).c_str());
+
+    if (rebuilt.size() == 1) {
+        const auto& shard = rebuilt[0];
+        const uint16_t declared = static_cast<uint16_t>(shard[0]) |
+                                  static_cast<uint16_t>(shard[1] << 8);
+        const auto& want = short_payloads[dropped_index];
+        expect_true(declared == 2 + want.size(),
+                    "rebuilt short shard must declare its own length, not set 1's");
+        expect_true(std::equal(want.begin(), want.end(), shard.begin() + 2),
+                    "rebuilt short shard payload must match its original");
+        // The decisive assertion: nothing past the declared prefix may carry a
+        // byte from set 1. With a 4:2 set the rebuild is zero-extended to
+        // maxlen == short_len, so the whole trailing region must be 0x00 --
+        // never 0xEE.
+        bool no_stale_byte = true;
+        for (size_t j = declared; j < shard.size(); j++) {
+            no_stale_byte = no_stale_byte && shard[j] == 0x00;
+        }
+        expect_true(no_stale_byte,
+                    "a rebuilt shard must never expose bytes from a previous, longer set");
+        bool no_stale_anywhere = true;
+        for (uint8_t b : shard) {
+            no_stale_anywhere = no_stale_anywhere && b != 0xEE;
+        }
+        expect_true(no_stale_anywhere, "no 0xEE filler from set 1 may survive into set 2");
+    }
+    std::cout << "  [ok] fec encoder zero-fills reused shard slots across sets\n";
 }
 
 void test_kcp_wrapper_oversized_message_is_not_truncated() {
@@ -2247,6 +2470,8 @@ int main() {
         test_socket_buffer_clamp_detection();
         test_parse_fec_config();
         test_fec_codec_repairs_lost_shards();
+        test_fec_frame_layout_at_crypto_reserve();
+        test_fec_encoder_does_not_leak_stale_shard_bytes();
         test_kcp_wrapper_applies_constants();
         test_kcp_wrapper_oversized_message_is_not_truncated();
         test_server_session_routing_and_auth();

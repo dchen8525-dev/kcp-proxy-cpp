@@ -47,7 +47,15 @@ int main(int argc, char* argv[]) {
             if (!cli::get_port_arg(argc, argv, i, server_port)) return 1;
         } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
             key = cli::get_arg(argc, argv, i);
-        } else if ((arg == "-fec" || arg == "--fec") && i + 1 < argc) {
+        } else if (arg == "-fec" || arg == "--fec") {
+            // Split from the "-fec VALUE" arm above so a bare trailing "-fec"
+            // reports what is actually wrong instead of "Unknown option: -fec"
+            // (which reads as if the flag did not exist at all).
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --fec requires a DATA:PARITY value (e.g. 10:3), "
+                          << "or 0:0 to disable" << std::endl;
+                return 1;
+            }
             // Fail-closed parse (see parse_fec_config): anything but 0:0 or a
             // valid shard pair refuses to start, so a typo can never open a
             // tunnel whose framing silently mismatches the server's.

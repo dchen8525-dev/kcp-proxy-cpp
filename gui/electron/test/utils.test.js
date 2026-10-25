@@ -124,6 +124,28 @@ test('validateLaunchConfig rejects bad FEC pairs only while FEC is enabled', () 
   }
 });
 
+test('buildClientArgs never emits a NaN pair for a half-filled FEC form', () => {
+  // Regression: `Number(undefined)` used to produce the literal argv
+  // "-fec NaN:NaN". The client's parser is fail-closed, so that is not a
+  // degraded tunnel -- it is a client that refuses to start at all.
+  const cases = [
+    [{ fecData: undefined, fecParity: undefined }, '10:3'],
+    [{ fecData: '', fecParity: '' }, '10:3'],
+    [{ fecData: 'abc', fecParity: 'xyz' }, '10:3'],
+    [{ fecData: '0', fecParity: '0' }, '10:3'],
+    [{ fecData: '4', fecParity: undefined }, '4:3']
+  ];
+  for (const [fields, want] of cases) {
+    const args = buildClientArgs({
+      serverHost: 'h', serverPort: '8388', localPort: '1080',
+      allowLan: false, fecEnabled: true, ...fields
+    });
+    assert.strictEqual(args[args.indexOf('-fec') + 1], want,
+      `half-filled FEC form ${JSON.stringify(fields)} must fall back to ${want}`);
+    assert.ok(!args.some((a) => a.includes('NaN')), 'no argv token may contain NaN');
+  }
+});
+
 test('isValidPort accepts 1..65535 only', () => {
   assert.strictEqual(isValidPort('8388'), true);
   assert.strictEqual(isValidPort('1'), true);

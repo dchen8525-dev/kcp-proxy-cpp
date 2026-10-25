@@ -466,11 +466,16 @@ void KCPClientSession::on_receive(byte_view packet) {
         // Throttled for the same reason as the server side: the server holds
         // the session key too, so a hostile (or merely corrupted) datagram can
         // reach this once per packet -- see log_kcp_input_rejected.
+        //
+        // Do NOT return: with FEC enabled the decoder may have rebuilt other
+        // shards of the set and queued them into KCP even when the native
+        // shard was refused, and the drain/resume below is what makes them
+        // visible.
         log_kcp_input_rejected("kcp_client", std::string_view(), input_ret,
                                decrypt_buf_.size());
-        return;
+    } else {
+        LOG_DEBUG("kcp_client", "kcp input ok, peek=" + std::to_string(kcp_.peek_size()));
     }
-    LOG_DEBUG("kcp_client", "kcp input ok, peek=" + std::to_string(kcp_.peek_size()));
     try_fulfill_read();
     // ACKs consumed by ikcp_input() are what free send-window space; resuming a
     // parked client->kcp loop here keeps the upload window full instead of
