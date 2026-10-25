@@ -33,7 +33,7 @@ Electron (`gui/electron`) 是主 GUI，提供跨平台的图形界面。
 |------|------|------|
 | OpenSSL | vcpkg | TLS / AES-128-GCM |
 | Asio | vcpkg | 异步网络库（standalone，无 Boost） |
-| KCP | vcpkg | 可靠 UDP 传输 |
+| KCP | 内置 vendored | C++17 移植（`third_party/kcp-cpp`），含 FEC 编解码 |
 | fmt | vcpkg | 日志/字符串格式化（{fmt}） |
 
 ### 通用前置条件
@@ -96,7 +96,7 @@ cmake -B build -DKCP_PROXY_ENABLE_NATIVE_TUNE=ON
 脚本会自动：
 1. 检测并设置 MSVC 编译环境
 2. 按优先级选择 vcpkg：用户 `VCPKG_ROOT` 环境变量 > 项目本地 `vcpkg/` > 自动克隆并引导安装
-3. 通过 vcpkg 安装依赖（asio、openssl、kcp）
+3. 通过 vcpkg 安装依赖（asio、openssl、fmt）
 4. CMake 配置、编译并输出到 `bin\windows\`
 
 **手动构建：**
@@ -547,7 +547,7 @@ kcp-proxy-cpp/
 **配置文件**：
 - `CMakeLists.txt` - CMake构建配置（必须在根目录）
 - `CMakePresets.json` - CMake预设，简化构建命令
-- `vcpkg.json` - vcpkg依赖清单（OpenSSL、Asio、KCP）
+- `vcpkg.json` - vcpkg依赖清单（OpenSSL、Asio、fmt）；KCP 使用内置的 `third_party/kcp-cpp`
 
 **快捷脚本**：
 - `build.sh` / `build_vs.bat` - 一键构建
@@ -563,7 +563,7 @@ kcp-proxy-cpp/
 |------|------|
 | OpenSSL | vcpkg |
 | Asio | vcpkg（standalone，无 Boost） |
-| KCP | vcpkg |
+| KCP | 内置（`third_party/kcp-cpp`） |
 | fmt | vcpkg |
 
 KCP 基于 UDP 的可靠 ARQ 协议，以极速模式运行：`conv=1`，`mtu=1400`，`nodelay=1`，`interval=10ms`，`fast resend=5`，`nc=1`，发送/接收窗口 `1024`，会话超时 `60s`。窗口曾为 256/512，实测在 190ms RTT 链路上会把单隧道限速在约 14 Mbps，提升后消除该瓶颈。
