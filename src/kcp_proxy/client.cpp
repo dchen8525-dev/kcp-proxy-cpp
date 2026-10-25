@@ -227,6 +227,17 @@ void KCPProxyClient::do_accept() {
                 }
                 return;
             }
+            // stop() may have run while this accept was in flight: it closed
+            // the acceptor and cancelled every timer, so a session created now
+            // would never be ticked (the shared update-tick chain is stopped)
+            // and would sit on its KCP handshake until the connect timeout
+            // reaped it. Close the socket and let the chain end; the error
+            // branch above already handles the acceptor's own abort.
+            if (!running_) {
+                std::error_code ignored;
+                socket.close(ignored);
+                return;
+            }
             handle_client_connection(std::move(socket));
             do_accept();
         });

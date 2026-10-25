@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
         if ((arg == "-s" || arg == "--server") && i + 1 < argc) {
             server_host = cli::get_arg(argc, argv, i);
         } else if ((arg == "-p" || arg == "--server-port") && i + 1 < argc) {
-            if (!cli::get_port_arg(argc, argv, i, server_port)) return 1;
+            if (!cli::get_port_arg(argc, argv, i, server_port, "-p/--server-port")) return 1;
         } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
             key = cli::get_arg(argc, argv, i);
         } else if (arg == "-fec" || arg == "--fec") {
@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
         } else if ((arg == "-H" || arg == "--listen-host") && i + 1 < argc) {
             listen_host = cli::get_arg(argc, argv, i);
         } else if ((arg == "-l" || arg == "--listen-port") && i + 1 < argc) {
-            if (!cli::get_port_arg(argc, argv, i, listen_port)) return 1;
+            if (!cli::get_port_arg(argc, argv, i, listen_port, "-l/--listen-port")) return 1;
         } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
             log_level = cli::get_arg(argc, argv, i);
         } else if (arg == "--half-close-grace" && i + 1 < argc) {

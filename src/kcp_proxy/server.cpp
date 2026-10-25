@@ -1370,6 +1370,19 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
     // copies into KCP before we re-arm, so the buffer is free again immediately.
     if (!buf) buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
 
+    // The target has closed: the client->target direction is dead, so this loop
+    // must simply stop. Reaching here with a closed target used to fall through
+    // to the socket check below and tear the whole session down, dropping the
+    // response tail that was still queued for the client -- a stale parked hook
+    // resumed by a window drain is exactly how this can happen (the hook is
+    // dropped in mark_target_closed, but a resume queued before that must be
+    // absorbed here too). The session keeps draining via the drained callback,
+    // mirroring the guard at the top of forward_kcp_to_tcp.
+    if (session->is_target_closed()) {
+        LOG_DEBUG("server", session_id + ": target closed, tcp->kcp loop stops");
+        return;
+    }
+
     LOG_DEBUG("server", session_id + ": forward_tcp_to_kcp (tcp->kcp), wait_send=" +
               std::to_string(session->wait_send()) +
               " running=" + std::to_string(session->is_running()));

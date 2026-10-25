@@ -92,7 +92,18 @@ public:
     // stream. mark_target_closed() records the condition and the drained
     // callback (if set) is invoked once by on_update_tick when the buffer drains.
     bool is_target_closed() const { return target_closed_.load(); }
-    void mark_target_closed() { target_closed_.store(true); }
+    // Dropping the parked write hook here is part of the state change, not
+    // cleanup after it: the hook belongs to the tcp->kcp loop, whose direction
+    // is dead the moment the target closed. If it stayed registered, the next
+    // window drain (an ACK arrival or the update tick) would resume the loop,
+    // whose forward_tcp_to_kcp would find the target socket closed and tear the
+    // session down -- dropping the queued response tail the drained callback
+    // exists to deliver. Server-side only: the client never marks a target
+    // closed.
+    void mark_target_closed() {
+        target_closed_.store(true);
+        unpark_write();
+    }
     // drained_cb_ is a plain (non-atomic) std::function that on_update_tick
     // reads and moves on the session strand. Callers MUST set it on that strand
     // (asio::dispatch(session->strand(), ...)); calling from a raw io_context

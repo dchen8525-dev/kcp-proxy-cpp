@@ -2605,6 +2605,69 @@ void test_kcp_input_rejection_log_is_bounded_and_single_line() {
                 "one rejected datagram must produce exactly one warning line");
 }
 
+void test_session_target_close_drops_parked_write_hook() {
+    // Regression: when the target TCP closed while the server's tcp->kcp loop
+    // was parked on backpressure, the parked hook survived the close. The next
+    // window drain (an ACK arrival, or the update tick's safety net) then
+    // resumed the loop, whose forward_tcp_to_kcp found the target socket closed
+    // and tore the whole session down -- dropping the response tail still queued
+    // in KCP's send buffer, which is exactly what the drained-callback design
+    // (mark_target_closed + wait for wait_send()==0) exists to deliver. Large
+    // downloads whose FIN arrived while the tunnel was window-saturated were
+    // truncated by up to ~KCP_BACKPRESSURE_RESUME_THRESHOLD segments.
+    //
+    // The contract pinned here: mark_target_closed() drops the parked hook as
+    // part of the state change, and the session keeps draining afterwards.
+    asio::io_context io;
+    auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
+                                            Crypto::generate_session_salt());
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+    auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto,
+                                                "park-target-close");
+    session->set_send_callback([](std::vector<uint8_t>) {});
+    session->start();
+    io.restart();
+    io.poll();
+
+    // Fill KCP's send queue past the park threshold the way a large response
+    // does (nothing ACKs here, so the queue only ever grows).
+    const std::vector<uint8_t> payload(FWD_BUF_SIZE, 0x5A);
+    for (int i = 0; i < 100; ++i) {
+        session->send_data(byte_view(payload.data(), payload.size()));
+    }
+    io.restart();
+    io.poll();
+    expect_true(session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD,
+                "the queued response must exceed the backpressure park threshold");
+
+    // Park a hook exactly like forward_tcp_to_kcp does when it finds the window
+    // full, then close the target.
+    session->park_write([]() {
+        throw std::runtime_error("stale tcp->kcp hook must never resume after the target closed");
+    });
+    expect_true(session->write_parked(), "the parked hook must be registered before the close");
+
+    session->mark_target_closed();
+    io.restart();
+    io.poll();
+    expect_true(!session->write_parked(),
+                "mark_target_closed must drop the parked tcp->kcp hook");
+
+    // The session must keep draining instead of being torn down: wait_send() is
+    // still > 0, so the drained callback stays withheld (the anti-truncation
+    // contract of test_session_drained_deferred_while_send_buffer_nonempty).
+    bool drained = false;
+    session->set_drained_callback([&]() { drained = true; });
+    asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+    io.restart();
+    io.poll();
+    expect_true(!drained,
+                "a draining session must stay alive after the target closed");
+    expect_true(session->is_alive(),
+                "the draining session must not have been stopped by a stale resume");
+
+    session->stop();
+}
 
 } // namespace
 
@@ -2640,6 +2703,7 @@ int main() {
         test_session_stop_makes_inert();
         test_session_drained_callback_on_target_closed();
         test_session_drained_deferred_while_send_buffer_nonempty();
+        test_session_target_close_drops_parked_write_hook();
         test_session_half_close_fin_gate_and_delivery();
         test_client_session_close_before_connect_is_safe_and_idempotent();
         test_client_session_close_mid_handshake_makes_it_inert();

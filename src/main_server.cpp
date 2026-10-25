@@ -45,7 +45,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-            if (!cli::get_port_arg(argc, argv, i, port)) return 1;
+            if (!cli::get_port_arg(argc, argv, i, port, "-p/--port")) return 1;
         } else if ((arg == "-H" || arg == "--host") && i + 1 < argc) {
             host = cli::get_arg(argc, argv, i);
         } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {

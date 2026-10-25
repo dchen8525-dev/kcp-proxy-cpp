@@ -19,13 +19,17 @@ inline std::string get_arg(int argc, char* argv[], int& i) {
     return "";
 }
 
-inline bool get_port_arg(int argc, char* argv[], int& i, uint16_t& out) {
+// `option` names the flag in the diagnostics: the client passes "-l/--listen-port"
+// for its local port, so a missing value cannot be reported as the unrelated
+// "-p/--port" (the message used to be hard-coded to the server's flag spelling).
+inline bool get_port_arg(int argc, char* argv[], int& i, uint16_t& out,
+                         const std::string& option = "-p/--port") {
     std::string val = get_arg(argc, argv, i);
-    // Covers both "-p" as the last argument and an explicitly empty "-p ''":
+    // Covers both the flag as the last argument and an explicitly empty value:
     // both leave the port unset, and exiting 1 with no diagnostic (the old
     // behavior) made a mistyped invocation look like a crash.
     if (val.empty()) {
-        std::cerr << "Error: -p/--port requires a port number\n";
+        std::cerr << "Error: " << option << " requires a port number\n";
         return false;
     }
     // Strict decimal parse: std::stoul alone accepts leading whitespace and a
