@@ -96,8 +96,12 @@ class Kcp {
   // Absolute time at which Update should next be called (kcp.go:1034-1077).
   std::uint32_t Check();
 
-  // Runs the scheduler. Public because the session flushes the tail on close (kcp.go:757-985).
-  void Flush(FlushType flush_type);
+  // Runs the scheduler and returns the milliseconds until the next call wants to happen:
+  // min(resendts - now, interval) over the segments still in flight. sess.go:807 re-arms the
+  // session's timer with exactly this value, so timer-driven retransmits fire at resendts rather
+  // than at the next ts_flush tick. Public because the session flushes the tail on close
+  // (kcp.go:757-985).
+  std::uint32_t Flush(FlushType flush_type);
 
   // Sets the MTU. Returns -1 when it cannot even hold a header (kcp.go:1080-1088).
   int SetMtu(int mtu);

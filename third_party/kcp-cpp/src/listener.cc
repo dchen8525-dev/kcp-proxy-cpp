@@ -311,9 +311,15 @@ void Listener::close(std::error_code* ec) {
     session->close(nullptr);
   }
 
-  if (own_conn_ && fd_ != platform::kInvalidSocket) {
-    platform::SysClose(fd_);
-    fd_ = platform::kInvalidSocket;
+  // mu_ pairs with Control()/SetDscp()/Set{Read,Write}Buffer(), which read fd_ under the same
+  // mutex (the setters gain the lock with this change); writing it unlocked races those paths and
+  // can hand a closed, possibly reused handle to a concurrent caller.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (own_conn_ && fd_ != platform::kInvalidSocket) {
+      platform::SysClose(fd_);
+      fd_ = platform::kInvalidSocket;
+    }
   }
   Succeed(ec);
 }
@@ -334,19 +340,39 @@ ErrorCode Listener::SetWriteDeadline(Deadline deadline) {
 }
 
 ErrorCode Listener::SetReadBuffer(int bytes) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (fd_ == platform::kInvalidSocket) {
+    return ErrorCode::kClosedPipe;
+  }
   return platform::SysSetRecvBuffer(fd_, bytes) == 0 ? ErrorCode::kOk : ErrorCode::kSocketError;
 }
 
 ErrorCode Listener::SetWriteBuffer(int bytes) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (fd_ == platform::kInvalidSocket) {
+    return ErrorCode::kClosedPipe;
+  }
   return platform::SysSetSendBuffer(fd_, bytes) == 0 ? ErrorCode::kOk : ErrorCode::kSocketError;
 }
 
 ErrorCode Listener::SetDscp(int dscp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (fd_ == platform::kInvalidSocket) {
+    return ErrorCode::kClosedPipe;
+  }
   return platform::SysSetDscp(fd_, dscp) == 0 ? ErrorCode::kOk : ErrorCode::kInvalidOperation;
 }
 
 int Listener::Control(const std::function<int(platform::SocketHandle)>& fn, std::error_code* ec) {
   std::lock_guard<std::mutex> lock(mu_);
+  // Same contract as UdpSession::Control: never hand out a handle that close() already closed -
+  // the OS may have reused its value for an unrelated socket.
+  if (fd_ == platform::kInvalidSocket) {
+    if (ec != nullptr) {
+      *ec = MakeErrorCode(ErrorCode::kClosedPipe);
+    }
+    return -1;
+  }
   const int rc = fn(fd_);
   Succeed(ec);
   return rc;
@@ -366,9 +392,19 @@ void Listener::SetPacketTrace(UdpSession::PacketTrace trace) {
                     std::make_shared<const UdpSession::PacketTrace>(std::move(trace)));
 }
 
-void Listener::CloseSession(const platform::SocketAddress& remote) {
+void Listener::CloseSession(const platform::SocketAddress& remote, const UdpSession* session) {
   std::lock_guard<std::mutex> lock(mu_);
-  sessions_.erase(remote.ToString());
+  const auto it = sessions_.find(remote.ToString());
+  // Erase only the entry that still belongs to `session`. A reconnecting peer (same source
+  // address, new conv) races with the old session's close(): the monitor may already have
+  // replaced the map entry with the new session, and an unconditional erase would orphan it -
+  // every later packet from that address then misses the map and the new session never gets
+  // another datagram. Go closes this window in microseconds because CloseSession runs before
+  // any join; the port's join-based teardown (D7) stretches it across the whole drain, so the
+  // identity check is what keeps the replacement alive.
+  if (it != sessions_.end() && it->second.get() == session) {
+    sessions_.erase(it);
+  }
 }
 
 void Listener::NotifyReadError(int socket_errno) {

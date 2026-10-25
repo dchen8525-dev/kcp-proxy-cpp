@@ -111,6 +111,10 @@ private:
     // loudest thing in the log (hundreds of lines a second, see LogThrottle).
     // Only touched from the io thread.
     LogThrottle greeting_reject_log_;
+    // Throttle for the accept-error diagnostic: the 10ms retry timer paces it
+    // to ~100 lines/s under a persistent failure (fd exhaustion), forever.
+    // Only touched from the io thread.
+    LogThrottle accept_error_log_;
 
     // Shared KCP update tick: one 10ms timer for ALL client sessions (same
     // design as KCPServer::do_update_tick). The registry stores weak refs
@@ -198,7 +202,18 @@ private:
     void forward_kcp_to_client(std::shared_ptr<asio::ip::tcp::socket> client_socket,
                                std::shared_ptr<KCPClientSession> session,
                                std::shared_ptr<std::vector<uint8_t>> buf = {},
-                               std::shared_ptr<HalfCloseGuard> guard = {});
+                               std::shared_ptr<HalfCloseGuard> guard = {},
+                               bool fin_check = true);
+
+    // Shared eof handling for "the server half-closed": both the read
+    // completion (FIN consumed while a read was pending) and the re-arm entry
+    // (FIN consumed while the loop was mid-write and no read was pending --
+    // try_fulfill_read latched it in KcpTunnel::peer_fin_received_ with no
+    // handler to complete) deliver it through here, so the local app always
+    // learns immediately instead of via the 60s idle sweep.
+    void handle_server_fin(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                           std::shared_ptr<KCPClientSession> session,
+                           std::shared_ptr<HalfCloseGuard> guard);
 
     // Arm the half-close grace deadline after the local app's read side hit EOF.
     // The tunnel is now drain-only: it exists solely to deliver whatever the

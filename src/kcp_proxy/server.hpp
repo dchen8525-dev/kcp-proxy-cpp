@@ -35,6 +35,10 @@ public:
     void start();
     void stop();
 
+    // The port actually bound (differs from the constructor's port_ when the
+    // caller passed 0 and the OS chose an ephemeral one). Valid after start().
+    uint16_t bound_port() const;
+
     // Lab allowlist: targets explicitly permitted to bypass the SSRF guard.
     // Empty by default, so production traffic is fully protected. Populated
     // only when an operator passes --allow-target (e.g. to test against a
@@ -201,6 +205,16 @@ private:
     LogThrottle auth_global_budget_log_;
     LogThrottle drop_log_;
     LogThrottle decrypt_fail_log_;
+    // Throttle for the session-cap rejection. It fires BEFORE authentication,
+    // so any unauthenticated UDP source at the cap (4096 sessions -- a
+    // legitimate operating state) can drive one formatted WARNING per
+    // datagram; a flood then pins the logger's global mutex and stalls every
+    // other log producer (ticks, sessions) behind the console write.
+    LogThrottle session_cap_log_;
+    // Throttle for the post-authentication rejections (duplicate/replayed
+    // salt, authoritative cap re-check). Reachable only with the shared key,
+    // but the auth budget still permits thousands of lines per second.
+    LogThrottle auth_reject_log_;
     // Throttle for route_datagram's exception containment: a persistently
     // failing allocation would otherwise emit one ERROR line per datagram.
     LogThrottle route_exception_log_;

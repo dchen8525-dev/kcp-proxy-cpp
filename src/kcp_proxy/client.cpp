@@ -134,6 +134,18 @@ void KCPProxyClient::do_resolve() {
     udp_resolver_.async_resolve(server_host_, std::to_string(server_port_),
         [this, self](const std::error_code& ec,
                      asio::ip::udp::resolver::results_type results) {
+            // stop() cancels the resolver, so a Ctrl-C during startup lands
+            // here as operation_aborted. That is a clean shutdown, not a DNS
+            // failure -- reporting it as one exits 1 under a service manager.
+            //
+            // `!running_` is deliberately NOT part of this guard: running_ is
+            // only set further down this same handler (after the TCP acceptor
+            // binds), so it is false during NORMAL startup. The stop() path
+            // has no flag to consult here -- that is exactly what the comment
+            // at the `running_` declaration warns about.
+            if (ec == asio::error::operation_aborted) {
+                return;
+            }
             if (ec) {
                 fail_startup("resolve error: " + ec.message());
                 return;
@@ -190,8 +202,15 @@ void KCPProxyClient::do_resolve() {
             }
 
             running_ = true;
-            LOG_INFO("client", "SOCKS5 proxy listening on " +
-                     listen_host_ + ":" + std::to_string(listen_port_));
+            // Report the bound endpoint: -l 0 picks an ephemeral port, and the
+            // GUI greps this line to learn the proxy address.
+            {
+                std::error_code ep_ec;
+                const auto bound = tcp_acceptor_.local_endpoint(ep_ec);
+                LOG_INFO("client", "SOCKS5 proxy listening on " +
+                         listen_host_ + ":" +
+                         std::to_string(ep_ec ? listen_port_ : bound.port()));
+            }
             // Same rendering as the server's startup line: diff the two logs to
             // confirm both ends of the tunnel negotiate with identical KCP
             // parameters (a mismatch manifests as a dead handshake).
@@ -216,7 +235,16 @@ void KCPProxyClient::do_accept() {
         [this, self](const std::error_code& ec, asio::ip::tcp::socket socket) {
             if (ec) {
                 if (running_) {
-                    LOG_ERROR("client", "accept error: " + ec.message());
+                    // Throttled: under a persistent failure (fd exhaustion --
+                    // exactly what 512 live sessions can produce) the 10ms
+                    // retry below still permits ~100 ERROR lines per second,
+                    // forever. Same loudness class as greeting_reject_log_.
+                    uint32_t suppressed = 0;
+                    if (accept_error_log_.should_log(suppressed)) {
+                        LOG_ERROR("client", "accept error: " + ec.message() +
+                                  (suppressed ? " (" + std::to_string(suppressed) +
+                                    " more suppressed this interval)" : ""));
+                    }
                     // Back off before re-arming: a persistent accept failure
                     // (e.g. fd exhaustion) would otherwise busy-spin with one
                     // log per iteration. The timer is cancelled in stop().
@@ -309,8 +337,15 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         active_sessions_->fetch_sub(1, std::memory_order_relaxed);
         LOG_WARNING("client", "connection limit reached (" +
                     std::to_string(MAX_CLIENT_SESSIONS) + "), refusing connection");
-        std::error_code ignored;
-        client->close(ignored);
+        // Best-effort SOCKS5 "general failure" instead of a bare reset, so a
+        // well-behaved app can report "proxy overloaded". The socket closes in
+        // the write completion -- closing first would cancel the reply write
+        // before it ever leaves.
+        send_socks5_error(client, SOCKS5_REPLY_GENERAL_FAILURE,
+            [client] {
+                std::error_code ignored;
+                client->close(ignored);
+            });
         return;
     }
     // The ticket's deleter holds shared ownership of the counter itself, not a
@@ -430,7 +465,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                     (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
-                        [this, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
+                        [this, self, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
                             abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                         });
                     return;
@@ -445,7 +480,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                     (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
-                        [this, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
+                        [this, self, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
                             abort_handshake(client, session, handshake_deadline, handshake_cancelled);
                         });
                     return;
@@ -523,7 +558,12 @@ void KCPProxyClient::read_socks5_request(
 
             if (version != SOCKS5_VERSION) {
                 LOG_ERROR("client", "bad version: " + std::to_string(version));
-                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                // RFC 1928 expects an error reply, not a bare EOF: the local
+                // app could not otherwise tell its own bug from a dead proxy.
+                send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
+                    [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
+                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                    });
                 return;
             }
             // RFC 1928: RSV must be 0x00. The server-side parser
@@ -532,7 +572,10 @@ void KCPProxyClient::read_socks5_request(
             if ((*header)[2] != 0x00) {
                 LOG_ERROR("client", "bad RSV in SOCKS5 request: " +
                           std::to_string((*header)[2]));
-                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
+                    [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
+                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                    });
                 return;
             }
 
@@ -545,7 +588,10 @@ void KCPProxyClient::read_socks5_request(
             else if (atyp == SOCKS5_ATYP_IPV6) addr_bytes = 18;
             else {
                 LOG_ERROR("client", "bad atyp: " + std::to_string(atyp));
-                abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                send_socks5_error(client_socket, SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED,
+                    [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
+                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                    });
                 return;
             }
 
@@ -572,7 +618,12 @@ void KCPProxyClient::read_socks5_request(
                         uint8_t dlen = (*addr_buf)[0];
                         if (dlen == 0) {
                             LOG_ERROR("client", "empty domain in SOCKS5 request");
-                            abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                            // Same RFC 1928 contract as the other malformed
+                            // request paths: an error reply, not a bare EOF.
+                            send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
+                                [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
+                                    abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                                });
                             return;
                         }
                         auto domain_buf = std::make_shared<std::vector<uint8_t>>(dlen + 2);
@@ -603,13 +654,18 @@ void KCPProxyClient::handle_sync_request(
     std::shared_ptr<asio::steady_timer> handshake_deadline,
     std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
 
+    // Every completion below must hold a strong ref: the on_complete closures
+    // run inside send_socks5_error's write handler, which otherwise keeps no
+    // owner alive for the object whose member function it invokes.
+    auto self = shared_from_this();
+
     if (cmd != SOCKS5_CMD_CONNECT) {
         LOG_WARNING("client", "unsupported SOCKS5 cmd: " + std::to_string(cmd));
         // The deadline stays armed while the error reply is in flight: if the
         // local app stops reading, the reply write can stall forever, and the
         // deadline is what closes the session in that case.
         send_socks5_error(client_socket, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED,
-            [this, client_socket, session, handshake_deadline, handshake_cancelled] {
+            [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
                 abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
             });
         return;
@@ -667,10 +723,10 @@ void KCPProxyClient::read_socks5_reply(
             // Send the error reply, then release the session once the write
             // settles. The deadline stays armed during the reply write so a
             // stalled write (local app stopped reading) is still cleaned up.
-            auto fail_with_reply = [this, client_socket, session, handshake_deadline,
+            auto fail_with_reply = [this, self, client_socket, session, handshake_deadline,
                                     handshake_cancelled](uint8_t reply) {
                 send_socks5_error(client_socket, reply,
-                    [this, client_socket, session, handshake_deadline, handshake_cancelled] {
+                    [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
                         abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
                     });
             };
@@ -922,16 +978,31 @@ void KCPProxyClient::forward_kcp_to_client(
     std::shared_ptr<asio::ip::tcp::socket> client_socket,
     std::shared_ptr<KCPClientSession> session,
     std::shared_ptr<std::vector<uint8_t>> buf,
-    std::shared_ptr<HalfCloseGuard> guard) {
+    std::shared_ptr<HalfCloseGuard> guard,
+    bool fin_check) {
 
     if (!session->strand().running_in_this_thread()) {
         auto self = shared_from_this();
-        asio::dispatch(session->strand(), [this, self, client_socket, session, buf, guard]() mutable {
-            forward_kcp_to_client(client_socket, session, buf, guard);
+        asio::dispatch(session->strand(), [this, self, client_socket, session, buf, guard,
+                                           fin_check]() mutable {
+            forward_kcp_to_client(client_socket, session, buf, guard, fin_check);
         });
         return;
     }
     if (!buf) buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
+
+    // A FIN that arrived while this loop was mid-write (no pending read on the
+    // tunnel) was consumed by try_fulfill_read and only latched in
+    // peer_fin_received_ -- complete_pending_read had no handler to fire, so
+    // re-registering a read would hang until the idle sweep. Deliver its eof
+    // now. guard->peer_fin records that the eof was already delivered through
+    // this loop, which is what keeps handle_server_fin's re-arm (back into
+    // this function) from re-entering the branch; fin_check=false is the
+    // belt-and-braces bound for the guard-less path.
+    if (fin_check && session->peer_fin_received() && !(guard && guard->peer_fin.load())) {
+        handle_server_fin(client_socket, session, guard);
+        return;
+    }
 
     // Hold a self reference through the whole read->write->re-arm chain (every
     // other async chain in this class does the same): the client object owns
@@ -948,34 +1019,7 @@ void KCPProxyClient::forward_kcp_to_client(
                 // to this loop (KCP is ordered), so stopping now loses nothing
                 // -- and the local app learns immediately instead of after the
                 // session's 60s idle sweep.
-                LOG_INFO("client", "KCP session half-closed by server (FIN)");
-                if (guard) {
-                    guard->peer_fin.store(true);
-                    std::error_code timer_ec;
-                    guard->deadline.cancel(timer_ec);
-                    if (guard->app_eof.load()) {
-                        // Both directions are finished: the app stopped sending
-                        // earlier (arm_half_close_grace) and so has the server.
-                        // Nothing is left to drain, so tear down now.
-                        std::error_code ignored;
-                        client_socket->close(ignored);
-                        session->close();
-                        return;
-                    }
-                }
-                // Half-close towards the app rather than close(): the app must
-                // still be able to read whatever is already in its receive
-                // buffer, and closing a socket with unread data turns into an
-                // RST that can discard it. The socket is closed for real when
-                // the app finishes and its own read reports EOF.
-                std::error_code ignored;
-                client_socket->shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
-                // Stay armed. The session is still alive -- the server only
-                // half-closed -- so a later teardown (its idle sweep, or the app
-                // closing its own end) must still be able to reach the
-                // close-everything path below. Returning here instead would
-                // leave the local socket open with nothing left to close it.
-                forward_kcp_to_client(client_socket, session, buf, guard);
+                handle_server_fin(client_socket, session, guard);
                 return;
             }
             if (ec || bytes == 0) {
@@ -1041,6 +1085,40 @@ void KCPProxyClient::forward_kcp_to_client(
                     forward_kcp_to_client(client_socket, session, buf, guard);
                 }));
         });
+}
+
+void KCPProxyClient::handle_server_fin(
+    std::shared_ptr<asio::ip::tcp::socket> client_socket,
+    std::shared_ptr<KCPClientSession> session,
+    std::shared_ptr<HalfCloseGuard> guard) {
+    LOG_INFO("client", "KCP session half-closed by server (FIN)");
+    if (guard) {
+        guard->peer_fin.store(true);
+        std::error_code timer_ec;
+        guard->deadline.cancel(timer_ec);
+        if (guard->app_eof.load()) {
+            // Both directions are finished: the app stopped sending earlier
+            // (arm_half_close_grace) and so has the server. Nothing is left to
+            // drain, so tear down now.
+            std::error_code ignored;
+            client_socket->close(ignored);
+            session->close();
+            return;
+        }
+    }
+    // Half-close towards the app rather than close(): the app must still be
+    // able to read whatever is already in its receive buffer, and closing a
+    // socket with unread data turns into an RST that can discard it. The
+    // socket is closed for real when the app finishes and its own read
+    // reports EOF.
+    std::error_code ignored;
+    client_socket->shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
+    // Stay armed. The session is still alive -- the server only half-closed --
+    // so a later teardown (its idle sweep, or the app closing its own end)
+    // must still be able to reach the close-everything path in the read
+    // handler. fin_check=false: the eof was just delivered, so re-entering the
+    // FIN branch of forward_kcp_to_client would recurse forever.
+    forward_kcp_to_client(client_socket, session, {}, guard, /*fin_check=*/false);
 }
 
 // --------------------------------------------------------------------------- //

@@ -21,7 +21,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -246,8 +246,12 @@ bool IsIgnorableRecvError(int err) {
   // WSAEMSGSIZE: the datagram was larger than the MTU buffer; it is already lost, keep reading.
   return err == 10054 || err == 10052 || err == 10060 || err == 10040;
 #else
+  // EINTR: a signal landed mid-recvfrom. The sockets here are blocking, so treating it as fatal
+  // would kill a client read loop - or a listener's monitor, starving every session it serves -
+  // on any stray SIGALRM/SIGCHLD. Go retries EINTR inside net.UDPConn.ReadFrom; SysWaitReadable
+  // already applies the same policy to select().
   return err == ECONNREFUSED || err == ECONNRESET || err == EAGAIN || err == EWOULDBLOCK ||
-         err == EMSGSIZE;
+         err == EMSGSIZE || err == EINTR;
 #endif
 }
 
@@ -420,12 +424,6 @@ int SysSetRecvTimeout(SocketHandle fd, int timeout_ms) {
 
 int SysWaitReadable(SocketHandle fd, int timeout_ms) {
   NativeSocket sock = ToNative(fd);
-  fd_set read_set;
-  FD_ZERO(&read_set);
-  FD_SET(sock, &read_set);
-  timeval tv;
-  tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = static_cast<long>(timeout_ms % 1000) * 1000;
   // A zero timeout is the read loop's "is there another datagram queued" probe; a non-zero one is
   // a real wait whose elapsed time is idle, not work. They are counted separately (P8.0).
   IoCounters* counters = ThreadCounters();
@@ -434,9 +432,24 @@ int SysWaitReadable(SocketHandle fd, int timeout_ms) {
   }
   const std::uint64_t start_us = counters != nullptr ? WallMicros() : 0;
 #if defined(_WIN32)
+  // One socket per set, so the FD_SETSIZE slot count (64 on Windows) is never a constraint here.
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(sock, &read_set);
+  timeval tv;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = static_cast<long>(timeout_ms % 1000) * 1000;
   const int rc = ::select(0, &read_set, nullptr, nullptr, &tv);
 #else
-  const int rc = ::select(static_cast<int>(sock) + 1, &read_set, nullptr, nullptr, &tv);
+  // poll, not select: FD_SET on a descriptor >= FD_SETSIZE (1024 with the typical soft limit) is
+  // a write past the fd_set bitmap - stack corruption, reachable with ~1000 concurrent sessions
+  // in one process. Go's netpoller has no such ceiling. poll also maps errors to revents, so a
+  // failed peer still wakes the caller, which then probes recvfrom for the error code.
+  struct pollfd pfd;
+  pfd.fd = sock;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  const int rc = ::poll(&pfd, 1, timeout_ms);
 #endif
   if (counters != nullptr) {
     const std::uint64_t elapsed = WallMicros() - start_us;
@@ -457,7 +470,14 @@ int SysWaitReadable(SocketHandle fd, int timeout_ms) {
 #endif
     return -1;
   }
+#if defined(_WIN32)
   return rc > 0 ? 1 : 0;
+#else
+  if (rc == 0) {
+    return 0;
+  }
+  return (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0 ? 1 : 0;
+#endif
 }
 
 int SysSetDscp(SocketHandle fd, int dscp) {

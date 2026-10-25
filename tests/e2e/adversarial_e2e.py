@@ -315,6 +315,27 @@ def expect_eof(s, timeout=8, what="connection"):
                              % (what, data[:16]))
 
 
+def expect_error_reply(s, rep, timeout=8, what="request"):
+    """A malformed request must be answered with the RFC 1928 error reply
+    (VER REP RSV ATYP=IPv4 BND=0.0.0.0:0), then a clean close. A bare EOF
+    would leave the app unable to tell its own bug from a dead proxy."""
+    s.settimeout(timeout)
+    expected = bytes([0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+    data = b""
+    try:
+        while len(data) < len(expected):
+            chunk = s.recv(len(expected) - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except socket.timeout:
+        raise AssertionError("%s: timed out waiting for the error reply" % what)
+    if data != expected:
+        raise AssertionError("%s: expected error reply %r, got %r"
+                             % (what, expected[:16], data[:16]))
+    expect_eof(s, what=what + " (after reply)")
+
+
 def greeting_ok(s):
     s.sendall(bytes([0x05, 0x01, 0x00]))
     ver, method = read_method_selection(s)
@@ -377,25 +398,27 @@ def check_malformed_openings(socks_port, echo_port):
         s.close()
 
         # 4. Non-zero RSV in the request: RFC 1928 says it MUST be 0x00.
+        #    Answered with a GENERAL FAILURE reply, then closed (RFC 1928: an
+        #    error reply, not a bare EOF, so the app can tell bug from outage).
         s = open_client(socks_port)
         greeting_ok(s)
         s.sendall(bytes([0x05, 0x01, 0x01, 0x01, 127, 0, 0, 1,
                          (echo_port >> 8) & 0xFF, echo_port & 0xFF]))
-        expect_eof(s, what="RSV!=0 request")
+        expect_error_reply(s, 0x01, what="RSV!=0 request")
         s.close()
 
         # 5. Unknown ATYP (0x02): refuse before any target work.
         s = open_client(socks_port)
         greeting_ok(s)
         s.sendall(bytes([0x05, 0x01, 0x00, 0x02, 1, 2, 3, 4, 0, 80]))
-        expect_eof(s, what="unknown-ATYP request")
+        expect_error_reply(s, 0x08, what="unknown-ATYP request")
         s.close()
 
         # 6. Zero-length domain name.
         s = open_client(socks_port)
         greeting_ok(s)
         s.sendall(bytes([0x05, 0x01, 0x00, 0x03, 0x00, 0, 80]))
-        expect_eof(s, what="empty-domain request")
+        expect_error_reply(s, 0x01, what="empty-domain request")
         s.close()
     print("  [ok] malformed openings x%d (bad version / nmethods=0 / "
           "no-auth / RSV!=0 / bad ATYP / empty domain) -> always answered, "

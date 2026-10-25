@@ -42,6 +42,12 @@ void RateLimiter::Acquire(std::size_t n) {
 
   std::unique_lock<std::mutex> lock(mu_);
   for (;;) {
+    if (closed_.load(std::memory_order_acquire)) {
+      // Torn down: transmit without waiting. This mirrors the oversized-batch out above - the
+      // reference discards limiter errors and sends anyway, and a closing session must not park
+      // its post thread (and whoever joins it) for a full burst of token accrual.
+      return;
+    }
     const auto now = std::chrono::steady_clock::now();
     Refill(now);
     if (tokens_ >= want) {
@@ -53,6 +59,14 @@ void RateLimiter::Acquire(std::size_t n) {
     cv_.wait_for(lock, std::chrono::duration_cast<std::chrono::microseconds>(wait) +
                            std::chrono::microseconds(100));
   }
+}
+
+void RateLimiter::Close() {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_.store(true, std::memory_order_release);
+  }
+  cv_.notify_all();
 }
 
 }  // namespace internal

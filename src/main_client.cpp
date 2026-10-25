@@ -18,8 +18,9 @@ static void print_usage(const char* prog) {
               << "                         set the KCP_PROXY_KEY environment variable)\n"
               << "  -fec DATA:PARITY       Reed-Solomon FEC, e.g. -fec 10:3 (default: off).\n"
               << "                         Repairs up to PARITY lost datagrams per group of\n"
-              << "                         DATA. MUST match the server's value exactly — the\n"
-              << "                         first datagram is already FEC-framed.\n"
+              << "                         DATA. The server auto-adapts to this framing; keep\n"
+              << "                         the value equal to the server's -fec (default 10:3)\n"
+              << "                         so parity repair works in both directions.\n"
               << "  -H, --listen-host HOST Local SOCKS5 bind address (default: 127.0.0.1)\n"
               << "  -l, --listen-port PORT Local SOCKS5 listen port (default: 1080)\n"
               << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n"
@@ -41,6 +42,17 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        // A value-taking flag left dangling at the end of argv must report the
+        // missing value, not "Unknown option" (same reasoning as the -fec arm
+        // below; the server CLI got the same guard).
+        if ((arg == "-s" || arg == "--server" || arg == "-p" || arg == "--server-port" ||
+             arg == "-k" || arg == "--key" || arg == "-H" || arg == "--listen-host" ||
+             arg == "-l" || arg == "--listen-port" || arg == "-L" || arg == "--log-level" ||
+             arg == "--half-close-grace") &&
+            i + 1 >= argc) {
+            std::cerr << "Error: " << arg << " requires a value" << std::endl;
+            return 1;
+        }
         if ((arg == "-s" || arg == "--server") && i + 1 < argc) {
             server_host = cli::get_arg(argc, argv, i);
         } else if ((arg == "-p" || arg == "--server-port") && i + 1 < argc) {

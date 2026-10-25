@@ -4,8 +4,18 @@ C++17 port of the xtaci/kcp-go v5 protocol state machine
 (https://github.com/xtaci/kcp-go), vendored from the kcp-cpp repository
 (https://github.com/dchen8525-dev/kcp-cpp).
 
-- Provenance: kcp-cpp @ `584c46f` (2026-10-24, master)
+- Provenance: kcp-cpp @ `0538725` (2026-10-25, master)
 - License: MIT (see `LICENSE`; upstream kcp-go is MIT, Copyright (c) 2015 xtaci)
+- Previous sync: `584c46f` (2026-10-24). The delta is porting rounds 36-45
+  (upstream PORTING-PLAN.md v5.17, risks R32-R38): in the compiled subset it
+  changes `Kcp::Flush` to return the `nextUpdate` interval (callers may ignore
+  it — the proxy's own driver is a fixed 10 ms shared tick with an
+  unconditional flush after every `Update()`, so retransmit granularity stays
+  bounded by that tick by design) and makes `PeekSize` hold fragments whose
+  head carries `frg == 255` instead of assembling across the uint8 wrap
+  (upstream deviation D21, hostile-input-only). The session-layer fixes
+  (close-path races, EINTR, poll-based wait, cancellable rate limiter) live in
+  files this vendor does not compile; they are vendored for provenance.
 
 ## Why vendored
 

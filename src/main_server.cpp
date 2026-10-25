@@ -19,9 +19,12 @@ static void print_usage(const char* prog) {
               << "  -k, --key KEY          Encryption key (min 16 chars; alternatively\n"
               << "                         set the KCP_PROXY_KEY environment variable)\n"
               << "  -fec DATA:PARITY       Reed-Solomon FEC, e.g. -fec 10:3 (default: off).\n"
-              << "                         Repairs up to PARITY lost datagrams per group of\n"
-              << "                         DATA. MUST match the client's value exactly — the\n"
-              << "                         first datagram is already FEC-framed.\n"
+              << "                         The server auto-adapts per session: a client that\n"
+              << "                         speaks FEC gets FEC back, a client that does not gets\n"
+              << "                         bare datagrams. This value sets the shard parameters\n"
+              << "                         used for adapting clients (default 10:3 when unset);\n"
+              << "                         keep the client's value equal to it so parity repair\n"
+              << "                         works in both directions.\n"
               << "  -T, --threads N        io_context worker threads (default: 1).\n"
               << "                         KCP updates run on a single shared 10ms tick;\n"
               << "                         extra threads spread UDP/TCP I/O across cores.\n"
@@ -44,6 +47,16 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        // A value-taking flag left dangling at the end of argv must report the
+        // missing value, not "Unknown option" (which reads as if the flag did
+        // not exist -- the same reasoning that split the -fec arm below).
+        if ((arg == "-p" || arg == "--port" || arg == "-H" || arg == "--host" ||
+             arg == "-k" || arg == "--key" || arg == "-T" || arg == "--threads" ||
+             arg == "-L" || arg == "--log-level" || arg == "--allow-target") &&
+            i + 1 >= argc) {
+            std::cerr << "Error: " << arg << " requires a value" << std::endl;
+            return 1;
+        }
         if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             if (!cli::get_port_arg(argc, argv, i, port, "-p/--port")) return 1;
         } else if ((arg == "-H" || arg == "--host") && i + 1 < argc) {
@@ -144,7 +157,7 @@ int main(int argc, char* argv[]) {
         server->start();
 
         LOG_INFO("main", "KCP proxy server started on " + host + ":" +
-                 std::to_string(port) + " fec=" + fec.to_string());
+                 std::to_string(server->bound_port()) + " fec=" + fec.to_string());
 
         cli::setup_signal_handler(io, [server]() { server->stop(); });
 

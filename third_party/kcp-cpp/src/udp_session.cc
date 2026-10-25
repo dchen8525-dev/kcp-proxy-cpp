@@ -158,18 +158,19 @@ void UdpSession::Update() {
     if (closed_.load(std::memory_order_acquire)) {
       return;
     }
-    // Kcp::Update is Go's KCP.Update: it advances ts_flush and flushes when due. Check() then
-    // reports the absolute millisecond of the next wake-up, which is what the reference hands to
-    // SystemTimedSched.Put (sess.go:814-822).
-    kcp_->Update();
+    // sess.go:803-816: the reference's update loop calls flush(FULL) unconditionally on every
+    // callback and re-arms itself with the returned nextUpdate = min(resendts - now, interval).
+    // Going through Update()+Check() instead quantizes every timer-driven event (RTO retransmit,
+    // dead_link, probes) to the next ts_flush tick: Check() wakes at resendts, Update() no-ops
+    // because ts_flush is not due, and the loop spins at 1 ms until the tick boundary.
+    const std::uint32_t interval = kcp_->Flush(kFlushFull);
     if (kcp_->wait_snd() < static_cast<int>(kcp_->snd_wnd())) {
       write_cv_.notify_one();
     }
-    const std::uint32_t next = kcp_->Check();
-    const std::int32_t delta = static_cast<std::int32_t>(next - internal::CurrentMs());
-    // Clamp to 1 ms: Check() returns "now" when a segment is already due, and a zero delay would
-    // turn the scheduler into a spin loop.
-    when = std::chrono::steady_clock::now() + std::chrono::milliseconds(delta > 0 ? delta : 1);
+    // Clamp to 1 ms: flush returns at least 1 here (interval >= 10, resend diffs are > 0 when
+    // they lower it), but a zero delay must never turn the scheduler into a spin loop.
+    when =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(interval > 0 ? interval : 1);
   }
 
   if (closed_.load(std::memory_order_acquire)) {
@@ -628,6 +629,19 @@ void UdpSession::close(std::error_code* ec) {
   }
 
   DefaultSnmp().curr_estab.fetch_sub(1);
+  // Cancel the token bucket before anything else can sleep in it: the post thread may already be
+  // parked inside Acquire waiting for up to burst/rate seconds, and close() joins that thread -
+  // as does the listener's single monitor thread on the stale-conv reset path.
+  {
+    std::shared_ptr<internal::RateLimiter> limiter;
+    {
+      std::lock_guard<std::mutex> lock(rate_mutex_);
+      limiter = std::move(rate_limiter_);
+    }
+    if (limiter != nullptr) {
+      limiter->Close();
+    }
+  }
   // Best effort: push whatever KCP still holds. The queue is still open, so the tail is encoded
   // and sent instead of being lost (§3.1 item 2).
   {
@@ -644,13 +658,19 @@ void UdpSession::close(std::error_code* ec) {
     read_thread_.join();
   }
 
-  if (own_conn_ && fd_ != platform::kInvalidSocket) {
-    platform::SysClose(fd_);
-    fd_ = platform::kInvalidSocket;
+  // mu_ pairs with Control()/SetDscp()/Set{Read,Write}Buffer(), which read fd_ under the same
+  // mutex; writing it here without the lock is a data race and lets a concurrent callback run on
+  // a closed (possibly reused) handle.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (own_conn_ && fd_ != platform::kInvalidSocket) {
+      platform::SysClose(fd_);
+      fd_ = platform::kInvalidSocket;
+    }
   }
 
   if (listener_ != nullptr) {
-    listener_->CloseSession(remote_);
+    listener_->CloseSession(remote_, this);
   }
 
   Succeed(ec);
@@ -873,6 +893,12 @@ int UdpSession::Control(const std::function<int(platform::SocketHandle)>& fn, st
     return Fail(ec, ErrorCode::kInvalidOperation);
   }
   std::lock_guard<std::mutex> lock(mu_);
+  // The callback receives a raw handle, not a wrapped conn like Go's net.PacketConn; once close()
+  // has run, the handle value may already be reused by the OS for another socket, so it must not
+  // be handed out. Go surfaces this as "use of closed network connection" from the conn method.
+  if (closed_.load(std::memory_order_acquire) || fd_ == platform::kInvalidSocket) {
+    return Fail(ec, ErrorCode::kClosedPipe);
+  }
   const int rc = fn(fd_);
   Succeed(ec);
   return rc;

@@ -86,6 +86,14 @@ void KCPServer::wipe_key() {
     key_.shrink_to_fit();
 }
 
+uint16_t KCPServer::bound_port() const {
+    // Safe to query from any thread: the socket is bound once in start() and
+    // outlives every session until stop() closes it.
+    std::error_code ec;
+    const auto ep = udp_socket_.local_endpoint(ec);
+    return ec ? port_ : ep.port();
+}
+
 void KCPServer::start() {
     std::error_code ec;
     const auto listen_addr = asio::ip::make_address(host_, ec);
@@ -178,15 +186,25 @@ void KCPServer::start() {
     // Start the shared KCP update tick (10ms, one timer for all sessions).
     do_update_tick(std::error_code{});
 
-    LOG_INFO("server", "listening on " + host_ + ":" + std::to_string(port_));
+    // Report the bound endpoint, not the requested one: -p 0 binds an
+    // ephemeral port, and operators grep diagnostics by the real number.
+    std::error_code bind_ec;
+    const auto bound_ep = udp_socket_.local_endpoint(bind_ec);
+    const uint16_t bound_port = bind_ec ? port_ : bound_ep.port();
+    LOG_INFO("server", "listening on " + host_ + ":" + std::to_string(bound_port));
     LOG_INFO("server", "diagnostics udp_bind=" + host_ +
-             " udp_port=" + std::to_string(port_) +
+             " udp_port=" + std::to_string(bound_port) +
              " udp_recv_slots=" + std::to_string(UDP_RECV_SLOTS) +
              " crypto=AES-128-GCM/HKDF-SHA256" +
              " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
              " log_level=" + log_level_name());
     LOG_INFO("server", kcp_config_line());
     LOG_INFO("server", fec_config_line(fec_));
+    LOG_INFO("server", std::string("server FEC mode: auto-adapt per client framing") +
+             (fec_.enabled() ? " (shards=" + fec_.to_string() + ")"
+                             : " (default shards=" +
+                                   std::to_string(FEC_ADAPTIVE_DATA_SHARDS) + ":" +
+                                   std::to_string(FEC_ADAPTIVE_PARITY_SHARDS) + ")"));
 
     do_receive();
 }
@@ -557,6 +575,8 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     bool live_salt_mismatch = false;
     bool stale_replaced = false;
     bool cap_reached = false;
+    bool log_client_fec_framed = false;
+    FecConfig log_client_fec_value{};
     {
         std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
         auto it = sessions_.find(sid);
@@ -589,8 +609,17 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         LOG_DEBUG("server", sid + ": stale session found, replacing");
     }
     if (cap_reached) {
-        LOG_WARNING("server", fmt::format("session cap reached ({}) dropping packet from {}",
-                    MAX_CONCURRENT_SESSIONS, sid));
+        // Pre-auth path: an unauthenticated flood at the cap would otherwise
+        // emit one formatted WARNING per datagram and pin the logger mutex
+        // (see session_cap_log_ in server.hpp).
+        uint32_t suppressed = 0;
+        if (session_cap_log_.should_log(suppressed)) {
+            LOG_WARNING("server", fmt::format(
+                        "session cap reached ({}) dropping packet from {}{}",
+                        MAX_CONCURRENT_SESSIONS, sid,
+                        suppressed ? fmt::format(" ({} more suppressed this interval)",
+                                   suppressed) : std::string()));
+        }
         return nullptr;
     }
 
@@ -648,7 +677,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     std::vector<uint8_t> decrypted;
     // server_mode=true: the first decrypted packet of a brand-new session seeds
     // the replay window (handled inside Crypto::decrypt) and is never rejected
-    // as a replay. The client side always enforces the window from packet #1.
+    // as a replay. The client side always enforces the replay window from packet #1.
     auto session_crypto = std::make_shared<Crypto>(key_, NONCE_DIR_SERVER, byte_view{}, true);
     try {
         decrypted = session_crypto->decrypt(encrypted_packet);
@@ -678,6 +707,19 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         }
         return nullptr;
     }
+
+    // Per-session FEC auto-adaptation (see the framing notes in config.hpp):
+    // this first decrypted datagram either carries a FEC header (the client
+    // speaks FEC) or is a bare KCP segment (it does not). The detection is
+    // reliable — a bare segment's byte 4 is the KCP command (0x51..0x54),
+    // disjoint from the FEC types — and it decides this session's framing in
+    // BOTH directions: a FEC-speaking client gets FEC-framed replies, a bare
+    // client gets bare replies. fec_ only supplies the shard parameters used
+    // when adapting, so the two ends no longer have to agree on -fec for the
+    // tunnel to work at all (the GUI defaults to FEC on, the service installer
+    // to off — the exact mismatch that used to kill every handshake).
+    const bool client_fec_framed =
+        looks_like_fec_frame(decrypted.data(), decrypted.size());
 
     std::shared_ptr<KCPSession> session;
     size_t total_sessions = 0;
@@ -759,16 +801,34 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             // fresh random salt per session, so they never hit their own
             // tombstones; the salt is already known-good here (the packet
             // decrypted successfully).
-            if (rejection == RejectReason::None) {
-                const byte_view salt = session_crypto->session_salt();
-                const std::string salt_key(reinterpret_cast<const char*>(salt.data()),
-                                           salt.size());
-                const auto now = std::chrono::steady_clock::now();
-                const auto tomb = salt_tombstones_.find(salt_key);
-                if (tomb != salt_tombstones_.end() && tomb->second > now) {
-                    rejection = RejectReason::ReplayedSalt;
-                } else {
-                    session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid, fec_);
+                if (rejection == RejectReason::None) {
+                    const byte_view salt = session_crypto->session_salt();
+                    const std::string salt_key(reinterpret_cast<const char*>(salt.data()),
+                                               salt.size());
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto tomb = salt_tombstones_.find(salt_key);
+                    if (tomb != salt_tombstones_.end() && tomb->second > now) {
+                        rejection = RejectReason::ReplayedSalt;
+                    } else {
+                        // Shard parameters for an adapting session: the
+                        // operator's -fec when set (data flows even if the
+                        // client runs different values; only parity repair
+                        // needs agreement), else the documented default.
+                        const FecConfig session_fec =
+                            client_fec_framed
+                                ? (fec_.enabled() ? fec_
+                                                  : FecConfig{FEC_ADAPTIVE_DATA_SHARDS,
+                                                              FEC_ADAPTIVE_PARITY_SHARDS})
+                                : FecConfig{};
+                        if (client_fec_framed) {
+                            // Deferred: logging inside the sessions_mutex_ write
+                            // lock stalls every router/tick/sweep behind the
+                            // console write (the file's own rule, see the
+                            // stale_replaced note above).
+                            log_client_fec_framed = true;
+                            log_client_fec_value = session_fec;
+                        }
+                        session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid, session_fec);
                     // Record the tombstone only after the session exists: an
                     // insert that then lost make_shared() to an exception would
                     // blacklist a salt that was never accepted for the whole TTL.
@@ -804,26 +864,39 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     if (authenticated_reconnect) {
         LOG_DEBUG("server", sid + ": authenticated reconnect, replacing session");
     }
+    if (log_client_fec_framed) {
+        LOG_DEBUG("server", sid + ": client speaks FEC, session framed " +
+                  log_client_fec_value.to_string());
+    }
     if (rejection != RejectReason::None) {
-        std::string rejection_line;
-        switch (rejection) {
-            case RejectReason::SessionCap:
-                rejection_line = "session cap reached (" +
-                                 std::to_string(MAX_CONCURRENT_SESSIONS) +
-                                 "), dropping packet from " + sid;
-                break;
-            case RejectReason::DuplicateSalt:
-                rejection_line = fmt::format(
-                    "duplicate session salt rejected: {} collides with live session {}",
-                    sid, duplicate_salt_with);
-                break;
-            case RejectReason::ReplayedSalt:
-                rejection_line = "replayed session salt rejected from " + sid;
-                break;
-            case RejectReason::None:
-                break;
+        // Auth-key holders can drive these (up to the auth budget, 5000/s);
+        // every sibling rejection path is throttled, so this one is too.
+        uint32_t suppressed = 0;
+        if (auth_reject_log_.should_log(suppressed)) {
+            std::string rejection_line;
+            switch (rejection) {
+                case RejectReason::SessionCap:
+                    rejection_line = "session cap reached (" +
+                                     std::to_string(MAX_CONCURRENT_SESSIONS) +
+                                     "), dropping packet from " + sid;
+                    break;
+                case RejectReason::DuplicateSalt:
+                    rejection_line = fmt::format(
+                        "duplicate session salt rejected: {} collides with live session {}",
+                        sid, duplicate_salt_with);
+                    break;
+                case RejectReason::ReplayedSalt:
+                    rejection_line = "replayed session salt rejected from " + sid;
+                    break;
+                case RejectReason::None:
+                    break;
+            }
+            if (suppressed) {
+                rejection_line += " (" + std::to_string(suppressed) +
+                                  " more suppressed this interval)";
+            }
+            LOG_WARNING("server", rejection_line);
         }
-        LOG_WARNING("server", rejection_line);
         return nullptr;
     }
 
@@ -1526,7 +1599,11 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
         }
         auto it = connections_.find(sid);
         if (it == connections_.end() || !it->second.tcp_socket) {
-            LOG_INFO("server", sid + ": forward_kcp_to_tcp - no TCP connection found");
+            // DEBUG, not INFO: the handshake completes before start_forwarding()
+            // inserts connections_[sid], so while the pipelined initial payload
+            // write is in flight this fires once per client data packet.
+            // INFO is lifecycle only (AGENTS.md #8).
+            LOG_DEBUG("server", sid + ": forward_kcp_to_tcp - no TCP connection found");
             session->set_forward_read_pending(false);
             return;
         }

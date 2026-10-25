@@ -94,7 +94,7 @@ class Listener {
   void Start();
   void Monitor();
   void PacketInput(std::uint8_t* data, std::size_t len, const platform::SocketAddress& from);
-  void CloseSession(const platform::SocketAddress& remote);
+  void CloseSession(const platform::SocketAddress& remote, const UdpSession* session);
   void NotifyReadError(int socket_errno);
 
   Crypt crypt_;

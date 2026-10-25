@@ -565,7 +565,7 @@ std::uint16_t Kcp::WndUnused() const {
 }
 
 // kcp.go:757-985
-void Kcp::Flush(FlushType flush_type) {
+std::uint32_t Kcp::Flush(FlushType flush_type) {
   Segment seg;
   seg.conv = conv_;
   seg.cmd = kCmdAck;
@@ -821,6 +821,7 @@ void Kcp::Flush(FlushType flush_type) {
   Store(DefaultSnmp().ring_buffer_snd_queue, snd_queue_.Len());
   Store(DefaultSnmp().ring_buffer_rcv_queue, rcv_queue_.Len());
   Store(DefaultSnmp().ring_buffer_snd_buffer, snd_buf_.Len());
+  return next_update;
 }
 
 // kcp.go:1003-1025

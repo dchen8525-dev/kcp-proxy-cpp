@@ -8,6 +8,7 @@
 #ifndef KCP_INTERNAL_RATE_LIMITER_H_
 #define KCP_INTERNAL_RATE_LIMITER_H_
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -33,6 +34,12 @@ class RateLimiter {
   // Blocks until `n` bytes may be sent. No-op when unlimited.
   void Acquire(std::size_t n);
 
+  // Wakes every sleeper in Acquire and makes all future calls return immediately. Without this,
+  // a session close would block for up to burst/rate seconds inside the post thread's token wait
+  // (at 1 kB/s that is ~96 s), and whoever joins that thread - including the listener's single
+  // monitor thread on the stale-conv reset path - freezes every other session on the listener.
+  void Close();
+
   bool unlimited() const { return rate_ <= 0.0; }
 
  private:
@@ -40,6 +47,7 @@ class RateLimiter {
 
   std::mutex mu_;
   std::condition_variable cv_;
+  std::atomic<bool> closed_{false};
   const double rate_;   // bytes per second; <= 0 means unlimited
   const double burst_;  // bytes
   double tokens_ = 0.0;
