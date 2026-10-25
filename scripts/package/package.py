@@ -213,6 +213,30 @@ LOG_LEVEL="${LOG_LEVEL:-INFO}"
 # to the file. The key-refresh timer restarts the service every 6h, so the
 # 10 MiB rotation below runs every 6h and keeps one .1 generation.
 LOG_FILE="${LOG_FILE:-}"
+# Server FEC shard parameters for FEC-speaking clients ("DATA:PARITY" e.g.
+# 10:3; "0:0"/empty = auto-adapt with the built-in default). FEC framing
+# itself is per-session auto-adapted by the server; this only pins DATA:PARITY
+# when a client speaks FEC. Same fail-closed validation as install-service.sh;
+# POSIX sh only here (no arrays, no bash arithmetic prefixes).
+FEC="${FEC:-}"
+FEC_ARGS=""
+case "$FEC" in
+    ""|0:0) ;;
+    *[!0-9:]*)
+        echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2
+        exit 1
+        ;;
+    *)
+        d=${FEC%%:*}; p=${FEC##*:}
+        while [ "${#d}" -gt 1 ] && [ "${d#0}" != "$d" ]; do d=${d#0}; done
+        while [ "${#p}" -gt 1 ] && [ "${p#0}" != "$p" ]; do p=${p#0}; done
+        if [ "$d" -lt 1 ] || [ "$p" -lt 1 ] || [ "$p" -gt "$d" ] || [ $((d + p)) -gt 256 ]; then
+            echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2
+            exit 1
+        fi
+        FEC_ARGS="-fec $FEC"
+        ;;
+esac
 SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
 
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
@@ -226,8 +250,9 @@ KEY="${DATE_BEIJING}${SUFFIX}"
 export KCP_PROXY_KEY="$KEY"
 unset KEY
 
-# Never log the full key - only the date portion and suffix length.
-echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}"
+# Never log the full key - only the date portion and suffix length. FEC is not
+# secret; logging it makes a two-end shard mismatch diagnosable from one host.
+echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}  fec=${FEC:-adaptive-default}"
 
 # Probe writability in a subshell: a failed redirection on a special builtin
 # would abort the wrapper, but here it just fails the probe.
@@ -239,15 +264,17 @@ if [ -n "$LOG_FILE" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
         fi
     fi
     {
-        echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT} ==="
-        exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+        echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT}  fec=${FEC:-adaptive-default} ==="
+        # $FEC_ARGS is validated above to be empty or exactly "-fec N:M", so
+        # the unquoted word split is safe and keeps this /bin/sh (dash) clean.
+        exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL" $FEC_ARGS
     } >> "$LOG_FILE" 2>&1
 fi
 
 if [ -n "$LOG_FILE" ]; then
     echo "WARNING: LOG_FILE=$LOG_FILE is not writable - logging to journald instead" >&2
 fi
-exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL" $FEC_ARGS
 """
 
 SERVER_ENV = f"""\
@@ -479,6 +506,15 @@ case "$1" in
                 echo "  + that suffix. Read it with:" >&2
                 echo "    grep '^SUFFIX=' {ENV_FILE}" >&2
             fi
+        fi
+
+        # Ensure the FEC line exists (upgrades from pre-FEC packages and fresh
+        # templates both land here). Empty value = per-session auto-adapt with
+        # the built-in 10:3 default; set it to "DATA:PARITY" (e.g. 10:3) to pin
+        # the shard parameters for FEC-speaking clients. Existing values are
+        # never touched. The wrapper validates the value fail-closed.
+        if ! grep -qE '^FEC=' "$env_file" 2>/dev/null; then
+            printf 'FEC=\\n' >> "$env_file"
         fi
 
         # Clear a crash-loop latch from an earlier failed boot attempt: without

@@ -934,11 +934,13 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
                 "postinst must leave a configured SUFFIX untouched")
 
         # Case C: missing conffile (dpkg conffile prompt declined, etc.) ->
-        # the file is created, not a silent no-op.
+        # the file is created, not a silent no-op. The FEC-ensure block also
+        # lands here, so the created file is SUFFIX plus the (empty) FEC line
+        # the wrapper's auto-adapt default reads.
         env_file.unlink()
         run(block)
         require(env_file.exists()
-                and re.fullmatch(r"SUFFIX=[0-9a-f]{24}\n",
+                and re.fullmatch(r"SUFFIX=[0-9a-f]{24}\n(FEC=\n)?",
                                  env_file.read_text(encoding="utf-8")) is not None,
                 "postinst must create server.env when it is missing")
 
