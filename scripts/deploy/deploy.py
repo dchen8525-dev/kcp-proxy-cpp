@@ -92,6 +92,21 @@ def validate_suffix(suffix):
         die("suffix must contain 8-128 letters, digits, '.', '_' or '-'", EXIT_CONFIG_ERROR)
 
 
+def validate_fec(fec):
+    """Mirror parse_fec_config's fail-closed rules (see config.hpp): only empty,
+    '0:0', or DATA:PARITY with 1 <= PARITY <= DATA and DATA+PARITY <= 256."""
+    if not fec:
+        return
+    m = re.fullmatch(r"(\d+):(\d+)", fec)
+    if not m:
+        die(f"invalid --fec '{fec}' (expected DATA:PARITY like 10:3, or 0:0)",
+            EXIT_CONFIG_ERROR)
+    data, parity = int(m.group(1)), int(m.group(2))
+    if not (1 <= parity <= data and data + parity <= 256):
+        die(f"invalid --fec '{fec}': need 1 <= PARITY <= DATA and "
+            f"DATA+PARITY <= 256", EXIT_CONFIG_ERROR)
+
+
 def validate_tar_members(path):
     with tarfile.open(path, "r:gz") as tar:
         for member in tar.getmembers():
@@ -218,6 +233,11 @@ def main():
     parser.add_argument("--prompt-suffix", action="store_true",
                         help="prompt for the suffix interactively (hidden input, kept "
                              "out of shell history and the process list)")
+    parser.add_argument("--fec",
+                        help="server FEC shard parameters for FEC-speaking clients, "
+                             "'DATA:PARITY' (e.g. 10:3) or '0:0'. Omit for the "
+                             "auto-adapt default (10:3). Written to server.env; "
+                             "reinstalls without --fec keep the existing value")
     parser.add_argument("--uninstall", action="store_true",
                         help="remove the service and all files from the server")
     parser.add_argument("--dry-run", action="store_true",
@@ -240,6 +260,7 @@ def main():
         args.suffix = os.environ.get("KCP_PROXY_DEPLOY_SUFFIX")
     if args.suffix:
         validate_suffix(args.suffix)
+    validate_fec(args.fec)
 
     if args.dry_run:
         with tempfile.TemporaryDirectory() as tmp:
@@ -316,7 +337,10 @@ def main():
             if args.suffix:
                 # Pass only validated values; avoid shell injection.
                 suffix_arg = f" {shlex.quote(args.suffix)}"
-            remote += f"sudo ./install-service.sh{suffix_arg}"
+            fec_arg = ""
+            if args.fec:
+                fec_arg = f" FEC={shlex.quote(args.fec)}"
+            remote += f"sudo{fec_arg} ./install-service.sh{suffix_arg}"
         # -t gives sudo a tty in case it needs to prompt for a password
         run(ssh_cmd(args) + [remote], env=run_env)
 

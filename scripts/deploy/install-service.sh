@@ -3,6 +3,13 @@
 #
 # Usage:
 #   sudo ./install-service.sh [suffix]
+#   FEC=10:3 sudo ./install-service.sh [suffix]   # pin server FEC shards
+#
+# FEC (optional): "DATA:PARITY" pins the shard parameters the server uses for
+# clients that speak FEC (clients that do not are unaffected — the server
+# auto-adapts its per-session FEC framing either way). Empty/0:0 = adaptive
+# default (10:3). Stored in server.env; survives daily restarts. On reinstall
+# without FEC set, the previously configured value is kept.
 #
 # Layout: this script expects the kcp-proxy-server binary next to itself
 # (deploy package), or in ../bin/linux (repo checkout). kcp-proxy-client is
@@ -43,6 +50,7 @@ else
     SYSCTL_CONF="/etc/sysctl.d/99-kcp-proxy.conf"
     UDP_RMEM_MAX=4194304
     UDP_WMEM_MAX=4194304
+    SERVER_FEC=""
 fi
 
 # Serialize concurrent installs when flock is available.
@@ -82,6 +90,42 @@ fi
 validate_suffix "$SUFFIX"
 KEY_LEN=$((8 + ${#SUFFIX}))
 check_key_len "$(printf '%*s' "$KEY_LEN" '' | tr ' ' x)"
+
+# ---------- FEC: env > existing env file > common.sh default ----------
+# Value is "DATA:PARITY" (e.g. 10:3), "0:0" (explicit off) or empty. The server
+# auto-adapts its per-session FEC framing to each client either way (see
+# config.hpp); this setting only pins the shard parameters used for clients
+# that speak FEC. Written to server.env; the wrapper passes it as -fec so it
+# survives the daily key-refresh restarts.
+FEC="${FEC:-}"
+if [ -z "$FEC" ] && [ -f "$ENV_FILE" ]; then
+    FEC=$(grep -E '^FEC=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '\r' || true)
+fi
+if [ -z "$FEC" ]; then
+    FEC="${SERVER_FEC:-}"
+fi
+
+# Fail-closed validation, mirroring parse_fec_config in config.hpp: only 0:0,
+# empty, or DATA:PARITY with 1 <= PARITY <= DATA and DATA+PARITY <= 256.
+# An invalid value must abort the install loudly rather than reach the server
+# and turn the next restart into a crash loop (the server refuses a bad -fec).
+# Leading zeros are stripped with the same dash-safe loop as the timer
+# fallback below (10#.. is bash-only and this file must stay dash-clean).
+validate_fec() {
+    local v="$1"
+    [ -z "$v" ] && return 0
+    [ "$v" = "0:0" ] && return 0
+    [[ "$v" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    local d=${v%%:*} p=${v##*:}
+    while [ "${#d}" -gt 1 ] && [ "${d#0}" != "$d" ]; do d=${d#0}; done
+    while [ "${#p}" -gt 1 ] && [ "${p#0}" != "$p" ]; do p=${p#0}; done
+    [ "$d" -ge 1 ] && [ "$p" -ge 1 ] && [ "$p" -le "$d" ] && [ $((d + p)) -le 256 ]
+}
+if ! validate_fec "$FEC"; then
+    echo "Error: invalid FEC='$FEC' (expected DATA:PARITY with 1 <= PARITY <= DATA" >&2
+    echo "and DATA+PARITY <= 256, or 0:0 / empty)" >&2
+    exit 1
+fi
 
 # ---------- log file: existing env file wins, else default ----------
 # The service can only write under /var/log/kcp-proxy (ReadWritePaths in the
@@ -146,6 +190,10 @@ LOG_LEVEL=$LOG_LEVEL
 # Must stay under /var/log/kcp-proxy unless you also extend ReadWritePaths
 # in the systemd unit (ProtectSystem=strict blocks everything else).
 LOG_FILE=$LOG_FILE
+# Server FEC shard parameters for FEC-speaking clients ("DATA:PARITY", e.g.
+# 10:3; "0:0" or empty = auto-adapt with the built-in default). Clients that
+# do not speak FEC are unaffected either way.
+FEC=$FEC
 EOF
 mv -f "$tmp_env" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -160,7 +208,8 @@ chmod 755 "$LOG_DIR"
 cat > "$INSTALL_DIR/kcp-proxy-server-wrapper.sh" << 'WRAPPER'
 #!/usr/bin/env bash
 # Wrapper: derives daily key = YYYYMMDD (Beijing time) + SUFFIX.
-# SUFFIX/PORT/HOST/LOG_LEVEL/LOG_FILE come from EnvironmentFile=/etc/kcp-proxy/server.env
+# SUFFIX/PORT/HOST/LOG_LEVEL/LOG_FILE/FEC come from
+# EnvironmentFile=/etc/kcp-proxy/server.env
 set -euo pipefail
 
 SUFFIX="${SUFFIX:?SUFFIX not set — check /etc/kcp-proxy/server.env}"
@@ -171,7 +220,32 @@ LOG_LEVEL="${LOG_LEVEL:-INFO}"
 # to the file. The key-refresh timer restarts the service every 6h, so the
 # 10 MiB rotation below runs every 6h and keeps one .1 generation.
 LOG_FILE="${LOG_FILE:-}"
+# Server FEC shard parameters for FEC-speaking clients ("DATA:PARITY" or
+# "0:0"/empty). FEC framing itself is per-session auto-adapted by the server;
+# this only pins DATA:PARITY when a client speaks FEC.
+FEC="${FEC:-}"
 SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
+
+# Same fail-closed shape as the installer's validate_fec: a corrupted FEC line
+# must abort here (visible in journald) instead of crash-looping the server on
+# a -fec it refuses.
+case "$FEC" in
+    ""|0:0) ;;
+    *[!0-9:]*) echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2; exit 1 ;;
+    *)
+        d=${FEC%%:*}; p=${FEC##*:}
+        while [ "${#d}" -gt 1 ] && [ "${d#0}" != "$d" ]; do d=${d#0}; done
+        while [ "${#p}" -gt 1 ] && [ "${p#0}" != "$p" ]; do p=${p#0}; done
+        if [ "$d" -lt 1 ] || [ "$p" -lt 1 ] || [ "$p" -gt "$d" ] || [ $((d + p)) -gt 256 ]; then
+            echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2
+            exit 1
+        fi
+        ;;
+esac
+SERVER_ARGS=(-p "$PORT" -H "$HOST" -L "$LOG_LEVEL")
+if [ -n "$FEC" ] && [ "$FEC" != "0:0" ]; then
+    SERVER_ARGS+=(-fec "$FEC")
+fi
 
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)
 KEY="${DATE_BEIJING}${SUFFIX}"
@@ -184,8 +258,9 @@ KEY="${DATE_BEIJING}${SUFFIX}"
 export KCP_PROXY_KEY="$KEY"
 unset KEY
 
-# Never log the full key — only the date portion and suffix length.
-echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}"
+# Never log the full key — only the date portion and suffix length. FEC is not
+# secret; logging it makes a two-end shard mismatch diagnosable from one host.
+echo "Starting kcp-proxy-server  key_date=${DATE_BEIJING}  suffix_len=${#SUFFIX}  port=${PORT}  fec=${FEC:-adaptive-default}"
 
 # Probe writability in a subshell: a failed redirection on a special builtin
 # would abort the wrapper, but here it just fails the probe.
@@ -197,15 +272,15 @@ if [ -n "$LOG_FILE" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
         fi
     fi
     {
-        echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT} ==="
-        exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+        echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT}  fec=${FEC:-adaptive-default} ==="
+        exec "$SERVER_BIN" "${SERVER_ARGS[@]}"
     } >> "$LOG_FILE" 2>&1
 fi
 
 if [ -n "$LOG_FILE" ]; then
     echo "WARNING: LOG_FILE=$LOG_FILE is not writable — logging to journald instead" >&2
 fi
-exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL"
+exec "$SERVER_BIN" "${SERVER_ARGS[@]}"
 WRAPPER
 chmod 755 "$INSTALL_DIR/kcp-proxy-server-wrapper.sh"
 

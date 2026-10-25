@@ -99,8 +99,9 @@
             <label class="checkbox-label"><input type="checkbox" id="autoConnect"/><span class="checkbox-custom"></span><span>打开应用时自动连接</span></label>
             <label class="checkbox-label"><input type="checkbox" id="allowLan"/><span class="checkbox-custom"></span><span>允许局域网使用（默认仅 127.0.0.1）</span></label>
             <label class="checkbox-label"><input type="checkbox" id="autoReconnect"/><span class="checkbox-custom"></span><span>断线重连</span></label>
-            <label class="checkbox-label"><input type="checkbox" id="fecEnabled"/><span class="checkbox-custom"></span><span>启用 FEC 前向纠错（抗丢包；分片数必须与服务端完全一致）</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="fecEnabled"/><span class="checkbox-custom"></span><span>启用 FEC 前向纠错（抗丢包）</span></label>
           </div>
+          <div class="note" id="fec-note"><b>FEC 分片参数（数据:校验，默认 10:3）不能单独改：</b>必须与服务器端完全一致，否则仍能连接，但 FEC 丢包修复会静默失效。修改方法：客户端改这里两个数值的同时，在服务器上修改 <code>/etc/kcp-proxy/server.env</code> 里的 <code>FEC=数据:校验</code> 行并执行 <code>systemctl restart kcp-proxy-server</code>，两端数值必须完全相同。</div>
           <div class="actions">
             <button class="btn btn-fill" id="btn-save">保存设置</button>
             <span class="test-result" id="save-result" aria-live="polite"></span>

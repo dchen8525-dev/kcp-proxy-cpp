@@ -14,6 +14,12 @@ CLIENT_LISTEN_PORT=1080
 LOG_LEVEL="INFO"
 # Server log file (stdout+stderr). Empty LOG_FILE in server.env = journald only.
 LOG_FILE="/var/log/kcp-proxy/server.log"
+# Server FEC shard parameters for FEC-speaking clients ("DATA:PARITY", e.g.
+# 10:3; "0:0" or empty = auto-adapt with the built-in 10:3 default). The server
+# auto-adapts its per-session FEC framing to each client either way; see
+# FEC_ADAPTIVE_* in src/kcp_proxy/config.hpp. Parsed by deploy.py like the
+# other KEY=VALUE lines above.
+SERVER_FEC=""
 
 # ---------- install paths (server side) ----------
 INSTALL_DIR="/usr/local/bin/kcp-proxy"

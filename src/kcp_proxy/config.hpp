@@ -228,11 +228,19 @@ constexpr uint8_t NONCE_DIR_SERVER = 0x02;
 // 2-byte length field ride INSIDE the AEAD plaintext, in front of the KCP
 // datagram, while [salt16|nonce12] stay in cleartext — the same layering
 // kcp-go's sess.headerSize offset produces. 0:0 disables FEC entirely and
-// keeps the wire byte-identical to pre-FEC peers. There is NO negotiation:
-// the very first datagram (the handshake itself) is already FEC-framed, so
-// BOTH peers must run identical values — a mismatch surfaces as KCP input
-// failures on every datagram, made visible by the throttled
-// KCP_INPUT_FAILED log line.
+// keeps the wire byte-identical to pre-FEC peers.
+//
+// Framing per direction: the CLIENT is explicit (its -fec decides what it
+// sends and expects). The SERVER auto-adapts per session: the first decrypted
+// datagram of a session either carries a FEC header (client speaks FEC, the
+// session frames both directions) or is a bare KCP segment (session stays
+// bare) — see looks_like_fec_frame and KCPServer::get_or_create_session. A
+// bare segment can never be mistaken for a frame, because its byte 4 is the
+// KCP command (0x51..0x54), disjoint from the FEC types 0xf1..0xf3. The
+// server's own -fec only supplies the shard parameters used when adapting;
+// when it is unset the ADAPTIVE_FEC_DEFAULT below applies. Data shards flow
+// between mismatched shard parameters (each data packet is independently
+// valid); only parity REPAIR requires both ends to agree on data:parity.
 constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE;  // 28
 
 // Wire-size budget: the largest KCP datagram (KCP_MTU) FEC-framed becomes
@@ -245,6 +253,14 @@ constexpr size_t FEC_DATAGRAM_MAX = FEC_CRYPTO_RESERVE + 8 + KCP_MTU;
 constexpr size_t FEC_WIRE_DATAGRAM_MAX = FEC_DATAGRAM_MAX + TAG_SIZE;
 static_assert(FEC_WIRE_DATAGRAM_MAX + 28 /* IP + UDP headers */ <= 1500,
               "FEC-framed datagrams would fragment on a 1500 MTU path");
+
+// Shard parameters the server uses when it auto-adapts to a FEC client and
+// carries no -fec of its own. 10:3 is the documented example and the GUI/CLI
+// default, so the common setup gets full parity repair without any server
+// configuration. A client running different values still transfers data (each
+// data shard is independently valid); only its repair capability degrades.
+constexpr int FEC_ADAPTIVE_DATA_SHARDS = 10;
+constexpr int FEC_ADAPTIVE_PARITY_SHARDS = 3;
 
 struct FecConfig {
     int data_shards = 0;    // 0 = disabled

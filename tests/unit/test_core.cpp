@@ -1049,6 +1049,229 @@ protected:
     void handle_kcp_output(byte_view) override {}
 };
 
+void test_server_adapts_fec_per_client_framing() {
+    // The server's per-session FEC auto-adaptation (see
+    // KCPServer::get_or_create_session): the first decrypted datagram decides
+    // the session's framing in BOTH directions. A FEC-speaking client must get
+    // FEC-framed replies (the GUI default FEC on used to die against a
+    // FEC-off service), a bare client must keep bare datagrams even when the
+    // server was started with -fec (client framing overrides server config),
+    // and the adaptive shard default is FEC_ADAPTIVE_{DATA,PARITY}_SHARDS.
+    const std::string key = "remote_test_key_123456";
+    const auto ep = [](uint16_t port) {
+        return asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), port);
+    };
+
+    // Frame one KCP segment the way a FEC client's on_kcp_datagram does:
+    // [reserve(28)][fec_hdr(6)][len(2)][segment], sealed by the real encoder.
+    const auto frame_segment = [](const std::vector<uint8_t>& seg,
+                                  kcp::internal::FecEncoder& enc) {
+        std::vector<uint8_t> frame(FEC_CRYPTO_RESERVE + 8 + seg.size());
+        std::memcpy(frame.data() + FEC_CRYPTO_RESERVE + 8, seg.data(), seg.size());
+        std::vector<std::vector<uint8_t>> parity;
+        enc.Encode(frame.data(), frame.size(), 1000, &parity);
+        // The sealed data shard only; parity is not needed to drive a handshake.
+        return std::vector<uint8_t>(
+            frame.begin() + static_cast<std::ptrdiff_t>(FEC_CRYPTO_RESERVE),
+            frame.end());
+    };
+
+    const auto decrypt_reply = [](const std::vector<uint8_t>& wire,
+                                  Crypto& client_crypto,
+                                  const char* what) {
+        auto plain = client_crypto.decrypt(byte_view(wire.data(), wire.size()));
+        expect_true(plain.size() >= 8, what);
+        const uint16_t type = static_cast<uint16_t>(plain[4]) |
+                              static_cast<uint16_t>(plain[5] << 8);
+        return std::make_pair(std::move(plain), type);
+    };
+
+    // ---- A. FEC-off server + FEC-speaking client: session adapts, replies are
+    //         FEC-framed, and the unwrapped ACK is a valid KCP segment. --------
+    {
+        asio::io_context io;
+        auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+        auto fec_encoder =
+            kcp::internal::FecEncoder::New(10, 3, static_cast<int>(FEC_CRYPTO_RESERVE));
+        expect_true(fec_encoder != nullptr, "adaptive-test FecEncoder must create");
+
+        const auto salt = Crypto::generate_session_salt();
+        Crypto client_crypto(key, NONCE_DIR_CLIENT, salt, false);
+        KcpWrapper peer(KCP_CONV);
+
+        // HELLO_V2 as a real KCP segment, then FEC-framed, then encrypted.
+        const std::vector<uint8_t> hello(KCP_CONTROL_HELLO_V2,
+                                         KCP_CONTROL_HELLO_V2 + std::strlen(KCP_CONTROL_HELLO_V2));
+        std::vector<uint8_t> hello_seg;
+        peer.set_output_callback([&hello_seg](byte_view d) {
+            hello_seg.assign(d.begin(), d.end());
+        });
+        expect_true(peer.send(byte_view(hello.data(), hello.size())) >= 0,
+                    "peer HELLO send");
+        peer.update(10);
+        peer.flush();
+        expect_true(!hello_seg.empty(),
+                    "the flushed HELLO datagram must be captured for framing");
+
+        const std::vector<uint8_t> framed_first = frame_segment(hello_seg, *fec_encoder);
+        auto first = client_crypto.encrypt(byte_view(framed_first.data(), framed_first.size()));
+        const LogLevel dbg_prev = current_log_level();
+        set_log_level(LogLevel::Debug);
+        auto session = server->route_datagram(ep(42001), byte_view(first.data(), first.size()));
+        expect_true(session != nullptr, "a FEC-framed first packet must create a session");
+
+        // Install the collector BEFORE polling: the strand handlers queued by
+        // route_datagram (inject + handle_kcp_data) complete the whole
+        // handshake on the first poll, so the default send callback (which
+        // goes to the unstarted server's socket and drops) must be replaced
+        // before any of that runs.
+        std::vector<std::vector<uint8_t>> replies;
+        session->set_send_callback([&replies](std::vector<uint8_t> wire) {
+            replies.push_back(std::move(wire));
+        });
+        io.restart();
+        io.poll();
+
+        // A second (duplicate) datagram drives handle_kcp_data, which reads
+        // the queued HELLO and answers. The datagram itself may be a KCP
+        // duplicate — only its strand dispatch matters here.
+        auto dup_seg = hello_seg;  // same sn -> KCP dedups, framing still drives
+        const std::vector<uint8_t> framed_second = frame_segment(dup_seg, *fec_encoder);
+        auto second = client_crypto.encrypt(byte_view(framed_second.data(), framed_second.size()));
+        expect_true(server->route_datagram(ep(42001), byte_view(second.data(), second.size())) != nullptr,
+                    "the second datagram must reuse the adapted session");
+        io.restart();
+        io.poll();
+        set_log_level(dbg_prev);
+
+        expect_true(!replies.empty(), "the adapted session must answer the HELLO");
+        auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
+                                           "the reply must decrypt with the client's key");
+        expect_true(type == kcp::kTypeData,
+                    "a FEC-speaking client must receive FEC-framed replies");
+        // Unwrap [fec_hdr(6)|len(2)|segment] and verify the ACK payload.
+        const uint16_t declared = static_cast<uint16_t>(plain[6]) |
+                                  static_cast<uint16_t>(plain[7] << 8);
+        expect_true(declared + 6 == plain.size(),
+                    "the reply's FEC length field must match its size");
+        KcpWrapper unwrapper(KCP_CONV);
+        expect_true(unwrapper.input(byte_view(plain.data() + 8, plain.size() - 8)) >= 0,
+                    "the unwrapped reply must be a valid KCP segment");
+        std::vector<uint8_t> ack;
+        expect_true(unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
+                    "the unwrapped reply must carry HELLO_ACK_V2");
+        expect_true(std::memcmp(ack.data(), KCP_CONTROL_HELLO_ACK_V2, ack.size()) == 0,
+                    "the ACK payload must be exactly HELLO_ACK_V2");
+
+        session->stop();
+    }
+
+    // ---- B. FEC-off server + bare client: session stays bare (byte 4 is a KCP
+    //         cmd, not a FEC type), even though the client could have been
+    //         "upgraded". Framing must mirror the client, not the server. -----
+    {
+        asio::io_context io;
+        auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+        const auto salt = Crypto::generate_session_salt();
+        Crypto client_crypto(key, NONCE_DIR_CLIENT, salt, false);
+        KcpWrapper peer(KCP_CONV);
+
+        const std::vector<uint8_t> hello(KCP_CONTROL_HELLO_V2,
+                                         KCP_CONTROL_HELLO_V2 + std::strlen(KCP_CONTROL_HELLO_V2));
+        std::vector<uint8_t> hello_seg;
+        peer.set_output_callback([&hello_seg](byte_view d) {
+            hello_seg.assign(d.begin(), d.end());
+        });
+        expect_true(peer.send(byte_view(hello.data(), hello.size())) >= 0, "bare HELLO send");
+        peer.update(10);
+        peer.flush();
+        expect_true(!hello_seg.empty(), "the bare HELLO datagram must be captured");
+
+        auto first = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
+        auto session = server->route_datagram(ep(42002), byte_view(first.data(), first.size()));
+        expect_true(session != nullptr, "a bare first packet must create a session");
+        // Collector installed before polling (same ordering as part A).
+        std::vector<std::vector<uint8_t>> replies;
+        session->set_send_callback([&replies](std::vector<uint8_t> wire) {
+            replies.push_back(std::move(wire));
+        });
+        io.restart();
+        io.poll();
+
+        auto second = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
+        expect_true(server->route_datagram(ep(42002), byte_view(second.data(), second.size())) != nullptr,
+                    "the second bare datagram must reuse the session");
+        io.restart();
+        io.poll();
+
+        expect_true(!replies.empty(), "the bare session must answer the HELLO");
+        auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
+                                           "the bare reply must decrypt with the client's key");
+        (void)type;
+        expect_true(!looks_like_fec_frame(plain.data(), plain.size()),
+                    "a bare client must keep receiving bare datagrams");
+        // The bare plaintext IS the KCP segment: it must unwrap to HELLO_ACK_V2.
+        KcpWrapper unwrapper(KCP_CONV);
+        expect_true(unwrapper.input(byte_view(plain.data(), plain.size())) >= 0,
+                    "the bare reply must be a valid KCP segment");
+        std::vector<uint8_t> ack;
+        expect_true(unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
+                    "the bare reply must carry HELLO_ACK_V2");
+        session->stop();
+    }
+
+    // ---- C. Server started WITH -fec + bare client: the client's framing
+    //         still wins. A FEC-off client must never be sent framed datagrams
+    //         (it would reject them), so the explicit server -fec only matters
+    //         for FEC-speaking clients. --------------------------------------
+    {
+        asio::io_context io;
+        auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1",
+                                                  FecConfig{10, 3});
+        const auto salt = Crypto::generate_session_salt();
+        Crypto client_crypto(key, NONCE_DIR_CLIENT, salt, false);
+        KcpWrapper peer(KCP_CONV);
+
+        const std::vector<uint8_t> hello(KCP_CONTROL_HELLO_V2,
+                                         KCP_CONTROL_HELLO_V2 + std::strlen(KCP_CONTROL_HELLO_V2));
+        std::vector<uint8_t> hello_seg;
+        peer.set_output_callback([&hello_seg](byte_view d) {
+            hello_seg.assign(d.begin(), d.end());
+        });
+        expect_true(peer.send(byte_view(hello.data(), hello.size())) >= 0, "bare HELLO send (C)");
+        peer.update(10);
+        peer.flush();
+        expect_true(!hello_seg.empty(), "the bare HELLO datagram must be captured (C)");
+
+        auto first = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
+        auto session = server->route_datagram(ep(42003), byte_view(first.data(), first.size()));
+        expect_true(session != nullptr, "a bare first packet must create a session (C)");
+        // Collector installed before polling (same ordering as part A).
+        std::vector<std::vector<uint8_t>> replies;
+        session->set_send_callback([&replies](std::vector<uint8_t> wire) {
+            replies.push_back(std::move(wire));
+        });
+        io.restart();
+        io.poll();
+
+        auto second = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
+        expect_true(server->route_datagram(ep(42003), byte_view(second.data(), second.size())) != nullptr,
+                    "the second bare datagram must reuse the session (C)");
+        io.restart();
+        io.poll();
+
+        expect_true(!replies.empty(), "the session must answer the HELLO (C)");
+        auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
+                                           "the reply must decrypt (C)");
+        (void)type;
+        expect_true(!looks_like_fec_frame(plain.data(), plain.size()),
+                    "an explicit server -fec must not frame towards a bare client");
+        session->stop();
+    }
+
+    std::cout << "  [ok] server FEC framing follows the client per session\n";
+}
+
 void test_fec_off_detects_a_fec_peer() {
     // The mirror image of the ret_-2 arm in feed_kcp_input. When the LOCAL side
     // has -fec off but the PEER has it on, the datagram is [fec_hdr(6)|len(2)|
@@ -2616,21 +2839,51 @@ void test_session_target_close_drops_parked_write_hook() {
     // downloads whose FIN arrived while the tunnel was window-saturated were
     // truncated by up to ~KCP_BACKPRESSURE_RESUME_THRESHOLD segments.
     //
-    // The contract pinned here: mark_target_closed() drops the parked hook as
-    // part of the state change, and the session keeps draining afterwards.
+    // Two contracts are pinned, and the second is the one that actually
+    // reproduces the original failure: merely asserting write_parked() after
+    // the close says nothing about the resume path unless the window is drained
+    // below the resume watermark, because maybe_resume_write refuses to fire
+    // the hook while wait_send() stays above it. A peer KCP wired back-to-back
+    // with the session supplies real ACKs, so the drain (and the stale resume
+    // it used to trigger) is genuinely exercised.
     asio::io_context io;
-    auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
-                                            Crypto::generate_session_salt());
+    const std::string key = "remote_test_key_123456";
+    const auto salt = Crypto::generate_session_salt();
+    // Server crypto WITH the salt up front: a server-mode Crypto with no salt
+    // refuses every encrypt, which would shut the session down instead of
+    // letting it queue the response this test needs.
+    auto crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, salt);
+    Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
     auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
-    auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto,
+    auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, crypto,
                                                 "park-target-close");
-    session->set_send_callback([](std::vector<uint8_t>) {});
+
+    // Wire the session to a peer KCP so ACKs can actually drain the window:
+    // session output (encrypted as the server) -> peer input, peer output
+    // (encrypted as the client) -> session input. Everything runs inside
+    // io.poll() on the test thread, the same back-to-back pattern as the FIN
+    // tests, so there is no cross-thread access to the peer wrapper.
+    KcpWrapper peer(KCP_CONV);
+    peer.set_output_callback([&](byte_view plain) {
+        auto wire = peer_crypto.encrypt(plain);
+        session->receive_data(byte_view(wire.data(), wire.size()));
+    });
+    session->set_send_callback([&](std::vector<uint8_t> wire) {
+        auto plain = peer_crypto.decrypt(byte_view(wire.data(), wire.size()));
+        if (peer.input(byte_view(plain.data(), plain.size())) < 0) {
+            // The session only emits genuine segments with the same conv; a
+            // refusal here would mean the back-to-back wiring is broken and
+            // every later wait_send assertion would be measuring nothing.
+            throw std::runtime_error("peer kcp input refused a session datagram");
+        }
+    });
+
     session->start();
     io.restart();
     io.poll();
 
-    // Fill KCP's send queue past the park threshold the way a large response
-    // does (nothing ACKs here, so the queue only ever grows).
+    // Queue a response large enough to fill the window past the park threshold.
+    // The peer has not ticked yet, so its ACKs are pending and nothing drains.
     const std::vector<uint8_t> payload(FWD_BUF_SIZE, 0x5A);
     for (int i = 0; i < 100; ++i) {
         session->send_data(byte_view(payload.data(), payload.size()));
@@ -2640,33 +2893,57 @@ void test_session_target_close_drops_parked_write_hook() {
     expect_true(session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD,
                 "the queued response must exceed the backpressure park threshold");
 
-    // Park a hook exactly like forward_tcp_to_kcp does when it finds the window
-    // full, then close the target.
+    // Park the tcp->kcp loop's hook exactly like forward_tcp_to_kcp does, then
+    // close the target. The hook deliberately throws if it is ever run: with
+    // the fix it is dropped by mark_target_closed and never invoked.
     session->park_write([]() {
-        throw std::runtime_error("stale tcp->kcp hook must never resume after the target closed");
+        throw std::runtime_error(
+            "stale tcp->kcp hook must never resume after the target closed");
     });
-    expect_true(session->write_parked(), "the parked hook must be registered before the close");
-
+    expect_true(session->write_parked(),
+                "the parked hook must be registered before the close");
     session->mark_target_closed();
     io.restart();
     io.poll();
     expect_true(!session->write_parked(),
                 "mark_target_closed must drop the parked tcp->kcp hook");
 
-    // The session must keep draining instead of being torn down: wait_send() is
-    // still > 0, so the drained callback stays withheld (the anti-truncation
-    // contract of test_session_drained_deferred_while_send_buffer_nonempty).
-    bool drained = false;
-    session->set_drained_callback([&]() { drained = true; });
+    // Drain the window with real peer ACKs until the resume watermark is
+    // crossed -- the exact condition under which maybe_resume_write used to
+    // fire the stale hook (from on_receive as the ACKs land, or from the tick).
+    // The iteration bound is a hang guard only; the assertion after the loop
+    // proves the drain actually happened, so the test cannot pass vacuously.
+    uint32_t now = 0;
+    for (int i = 0;
+         i < 200 && session->wait_send() > KCP_BACKPRESSURE_RESUME_THRESHOLD;
+         ++i) {
+        now += KCP_INTERVAL_MS;
+        peer.update(now);
+        peer.flush();               // ACKs for everything received so far
+        io.restart();
+        io.poll();                  // session consumes the ACKs (on_receive)
+        asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
+        io.restart();
+        io.poll();                  // session flushes more of the queued tail
+    }
+    expect_true(session->wait_send() <= KCP_BACKPRESSURE_RESUME_THRESHOLD,
+                "the peer ACKs must have drained the window below the resume "
+                "watermark (a vacuous drain would leave it above)");
+
+    // The safety-net tick with a drained window: with the fix this is a no-op
+    // for the (dropped) hook; without it, the stale resume fires here -- or
+    // earlier inside the pump -- and the throw fails the test outright.
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.restart();
     io.poll();
-    expect_true(!drained,
-                "a draining session must stay alive after the target closed");
-    expect_true(session->is_alive(),
+    expect_true(session->is_running(),
                 "the draining session must not have been stopped by a stale resume");
+    expect_true(session->is_alive(),
+                "the draining session must stay alive after the target closed");
 
     session->stop();
+    io.restart();
+    io.poll();
 }
 
 } // namespace
@@ -2704,6 +2981,7 @@ int main() {
         test_session_drained_callback_on_target_closed();
         test_session_drained_deferred_while_send_buffer_nonempty();
         test_session_target_close_drops_parked_write_hook();
+        test_server_adapts_fec_per_client_framing();
         test_session_half_close_fin_gate_and_delivery();
         test_client_session_close_before_connect_is_safe_and_idempotent();
         test_client_session_close_mid_handshake_makes_it_inert();

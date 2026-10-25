@@ -85,6 +85,13 @@ if(MSVC)
         # 必须显式补上，否则库与使用者一个有 ASAN 注解一个没有，LNK2038 直接
         # 拒绝链接。
         target_compile_options(kcp_proxy_lib PRIVATE /W4 /wd4324 /fsanitize=address)
+        # vendored kcp 目标更早（文件顶部的 add_subdirectory），需要同样的显式
+        # 补齐：不补的话 kcp.lib 的对象没有容器注解而所有使用者有，链接同样以
+        # LNK2038（annotate_string/vector/optional 不匹配）失败——自 kcp-cpp
+        # 引入起，文档记载的 build-asan 内存回归工作流就连构建都无法完成。
+        if(TARGET kcp)
+            target_compile_options(kcp PRIVATE /fsanitize=address)
+        endif()
     else()
         target_compile_options(kcp_proxy_lib PRIVATE
             /W4           # Higher warning level
@@ -102,6 +109,12 @@ else()
     if(KCP_PROXY_ENABLE_ASAN)
         add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address)
+        # 与 MSVC 分支同理：vendored kcp 创建于 add_compile_options 之前，不补
+        # 这行则 kcp.lib 的代码完全不经过 ASAN 插桩（GCC/Clang 不报链接错，只是
+        # 静默失去覆盖）。
+        if(TARGET kcp)
+            target_compile_options(kcp PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+        endif()
     endif()
     target_compile_options(kcp_proxy_lib PRIVATE
         -Wall -Wextra -Wpedantic

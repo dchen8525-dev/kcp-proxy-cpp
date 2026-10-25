@@ -4,6 +4,7 @@
 #include "crypto.hpp"
 #include "kcp_wrapper.hpp"
 #include "byte_view.hpp"
+#include "kcp/internal/constants.h"
 #include <asio.hpp>
 #include <array>
 #include <atomic>
@@ -24,6 +25,20 @@ class FecDecoder;
 }
 
 namespace kcp_proxy {
+
+// Is this decrypted plaintext the 6-byte FEC header of a peer whose -fec is
+// enabled? [seqid(4)][type(2, little-endian)], type in {0xf1 data, 0xf2 parity,
+// 0xf3 oob}. Shared by the server's per-session FEC auto-adaptation (see
+// KCPServer::get_or_create_session) and feed_kcp_input's mismatch diagnostic.
+// A bare KCP segment can never match: its bytes 4..5 are cmd (0x51..0x54) and
+// frg, so a healthy segment cannot land on 0xf1..0xf3.
+inline bool looks_like_fec_frame(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 8) return false;
+    const uint16_t type = static_cast<uint16_t>(data[4]) |
+                          static_cast<uint16_t>(data[5] << 8);
+    return type == kcp::kTypeData || type == kcp::kTypeParity ||
+           type == kcp::kTypeOob;
+}
 
 // Performance metrics for monitoring
 struct SessionMetrics {

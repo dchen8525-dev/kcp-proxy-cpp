@@ -12,26 +12,6 @@
 
 namespace kcp_proxy {
 
-namespace {
-
-// Is this the 6-byte FEC header of a peer that has -fec enabled?
-// [seqid(4)][type(2, little-endian)], type in {0xf1 data, 0xf2 parity, 0xf3 oob}.
-//
-// Only called on the local-FEC-off path, where a datagram should instead be a
-// bare KCP segment. For one of those, bytes 4..5 are cmd/frg, and a VALID segment
-// can never match: cmd must be 0x51..0x54 (IKCP_CMD_PUSH/ACK/WASK/WINS), while a
-// match needs bytes[4] == 0xf1..0xf3 AND bytes[5] == 0x00. The two sets are
-// disjoint, so this predicate can only fire on a datagram KCP was about to
-// reject anyway -- a false alarm there costs one throttled line about bytes that
-// were already garbage, never a false positive on healthy traffic.
-bool looks_like_fec_frame(const uint8_t* data, size_t size) {
-    if (size < 8) return false;
-    const uint16_t type = static_cast<uint16_t>(data[4]) |
-                          static_cast<uint16_t>(data[5] << 8);
-    return type == kcp::kTypeData || type == kcp::kTypeParity ||
-           type == kcp::kTypeOob;
-}
-
 // One throttle for the whole process. The condition it guards is a *static
 // misconfiguration*, so the goal is "impossible to miss, impossible to flood":
 // the first datagram of every peer warns immediately, and repeated datagrams
@@ -40,8 +20,6 @@ LogThrottle& fec_peer_only_log() {
     static LogThrottle throttle;
     return throttle;
 }
-
-} // namespace
 
 KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
                      std::shared_ptr<Crypto> crypto,
