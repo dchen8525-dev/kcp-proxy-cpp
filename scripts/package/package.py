@@ -277,6 +277,11 @@ fi
 exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL" $FEC_ARGS
 """
 
+# FEC shard pair auto-written to server.env when the line is missing (the
+# GUI/CLI default; the server's per-session auto-adaptation uses the same
+# values when -fec is absent entirely).
+DEFAULT_SERVER_FEC = "10:3"
+
 SERVER_ENV = f"""\
 # kcp-proxy-server configuration
 # Daily key = YYYYMMDD (Beijing time) + SUFFIX. Changes take effect on restart.
@@ -463,6 +468,21 @@ case "$1" in
         if [ -f "$env_file" ]; then
             cur_suffix=$(grep -E '^SUFFIX=' "$env_file" | head -n 1 | cut -d= -f2- | tr -d '\\r' || true)
         fi
+        # A missing server.env (deleted by hand, or a conffile the operator
+        # answered "delete" to during an upgrade -- dpkg never recreates a
+        # deleted conffile) must be restored as the FULL template, not a
+        # minimal SUFFIX-only file: the wrapper's own defaults would otherwise
+        # silently take over (port/host) and the log falls back to journald.
+        # The template is the same SERVER_ENV the package ships, injected by
+        # package.py, so there is one source of truth. FEC is appended by the
+        # ensure-block below, exactly as for an existing file.
+        restore_env_template() {{
+            cat > "$env_file.tmp" << 'ENVTEMPLATE'
+__SERVER_ENV_TEMPLATE__
+ENVTEMPLATE
+            mv -f "$env_file.tmp" "$env_file"
+            chmod 600 "$env_file"
+        }}
         if [ -z "$cur_suffix" ]; then
             # Random 24 hex chars with a retry loop + od fallback. A single
             # pipeline pass has been observed to return a SHORT output on a
@@ -492,14 +512,14 @@ case "$1" in
             fi
             if [ "${{#gen_suffix}}" -eq 24 ]; then
                 mkdir -p {ENV_DIR}
-                if [ -f "$env_file" ]; then
-                    # Rewrite via temp+mv: the only in-place form GNU and BSD
-                    # sed agree on.
-                    sed "s|^SUFFIX=.*|SUFFIX=$gen_suffix|" "$env_file" > "$env_file.tmp" \\
-                        && mv -f "$env_file.tmp" "$env_file"
-                else
-                    printf 'SUFFIX=%s\\n' "$gen_suffix" > "$env_file"
+                if [ ! -f "$env_file" ]; then
+                    restore_env_template
                 fi
+                # Rewrite via temp+mv: the only in-place form GNU and BSD
+                # sed agree on. Runs on both the pre-existing file and the
+                # freshly restored template.
+                sed "s|^SUFFIX=.*|SUFFIX=$gen_suffix|" "$env_file" > "$env_file.tmp" \\
+                    && mv -f "$env_file.tmp" "$env_file"
                 chmod 600 "$env_file"
                 echo "kcp-proxy-server: no SUFFIX configured -- generated a random" >&2
                 echo "  one in {ENV_FILE}. Full daily key = Beijing date (YYYYMMDD)" >&2
@@ -509,12 +529,12 @@ case "$1" in
         fi
 
         # Ensure the FEC line exists (upgrades from pre-FEC packages and fresh
-        # templates both land here). Empty value = per-session auto-adapt with
-        # the built-in 10:3 default; set it to "DATA:PARITY" (e.g. 10:3) to pin
-        # the shard parameters for FEC-speaking clients. Existing values are
-        # never touched. The wrapper validates the value fail-closed.
+        # templates both land here). Defaults to 10:3, the shard pair the GUI
+        # and CLI examples use; set it to another "DATA:PARITY" to pin the
+        # shard parameters for FEC-speaking clients. Existing values are never
+        # touched. The wrapper validates the value fail-closed.
         if ! grep -qE '^FEC=' "$env_file" 2>/dev/null; then
-            printf 'FEC=\\n' >> "$env_file"
+            printf 'FEC={DEFAULT_SERVER_FEC}\\n' >> "$env_file"
         fi
 
         # Clear a crash-loop latch from an earlier failed boot attempt: without
@@ -549,6 +569,12 @@ case "$1" in
 esac
 exit 0
 """
+
+# Inject the shipped env template into the postinst's restore path (see
+# restore_env_template): one source of truth for both a fresh install's
+# conffile and a missing-file restore. Placed after the f-string so the
+# literal marker survives {ENV_FILE}-style substitution untouched.
+DEB_POSTINST = DEB_POSTINST.replace("__SERVER_ENV_TEMPLATE__", SERVER_ENV)
 
 DEB_PRERM = f"""\
 #!/bin/sh

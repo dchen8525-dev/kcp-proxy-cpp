@@ -933,16 +933,27 @@ def test_deb_postinst_generates_suffix_and_resets_failed():
         require("SUFFIX=mysecret123" in content and "PORT=9000" in content,
                 "postinst must leave a configured SUFFIX untouched")
 
-        # Case C: missing conffile (dpkg conffile prompt declined, etc.) ->
-        # the file is created, not a silent no-op. The FEC-ensure block also
-        # lands here, so the created file is SUFFIX plus the (empty) FEC line
-        # the wrapper's auto-adapt default reads.
+        # Case C: missing conffile (deleted by hand, or the operator answered
+        # "delete" to a dpkg conffile prompt -> dpkg never recreates it) ->
+        # the postinst must restore the FULL template (port/host/log defaults,
+        # not a minimal SUFFIX-only file whose absence silently reverts the
+        # wrapper's config to defaults), fill in the generated suffix, and the
+        # FEC-ensure block appends its (empty) line.
         env_file.unlink()
         run(block)
-        require(env_file.exists()
-                and re.fullmatch(r"SUFFIX=[0-9a-f]{24}\n(FEC=\n)?",
-                                 env_file.read_text(encoding="utf-8")) is not None,
-                "postinst must create server.env when it is missing")
+        require(env_file.exists(), "postinst must create server.env when it is missing")
+        got_c = dict(
+            line.split("=", 1) for line in
+            env_file.read_text(encoding="utf-8").strip().splitlines()
+            if "=" in line and not line.startswith("#"))
+        require(re.fullmatch(r"[0-9a-f]{24}", got_c.get("SUFFIX", "")) is not None,
+                f"restored server.env must carry the generated 24-hex suffix, "
+                f"got file={env_file.read_text(encoding='utf-8')!r}")
+        require(got_c.get("PORT") == "8388" and got_c.get("HOST") == "0.0.0.0"
+                and got_c.get("LOG_LEVEL") == "INFO" and "LOG_FILE" in got_c
+                and got_c.get("FEC") == "10:3",
+                "restored server.env must contain the full default template "
+                f"plus the default FEC=10:3 line, got {got_c!r}")
 
         # The real postinst runs under dash on Debian (bashisms already bit
         # this repo once), so case A must also pass there when dash exists.

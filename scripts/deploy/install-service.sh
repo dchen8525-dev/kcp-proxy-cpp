@@ -50,7 +50,7 @@ else
     SYSCTL_CONF="/etc/sysctl.d/99-kcp-proxy.conf"
     UDP_RMEM_MAX=4194304
     UDP_WMEM_MAX=4194304
-    SERVER_FEC=""
+    SERVER_FEC="10:3"
 fi
 
 # Serialize concurrent installs when flock is available.
