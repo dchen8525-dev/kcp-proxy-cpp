@@ -12,6 +12,37 @@
 
 namespace kcp_proxy {
 
+namespace {
+
+// Is this the 6-byte FEC header of a peer that has -fec enabled?
+// [seqid(4)][type(2, little-endian)], type in {0xf1 data, 0xf2 parity, 0xf3 oob}.
+//
+// Only called on the local-FEC-off path, where a datagram should instead be a
+// bare KCP segment. For one of those, bytes 4..5 are cmd/frg, and a VALID segment
+// can never match: cmd must be 0x51..0x54 (IKCP_CMD_PUSH/ACK/WASK/WINS), while a
+// match needs bytes[4] == 0xf1..0xf3 AND bytes[5] == 0x00. The two sets are
+// disjoint, so this predicate can only fire on a datagram KCP was about to
+// reject anyway -- a false alarm there costs one throttled line about bytes that
+// were already garbage, never a false positive on healthy traffic.
+bool looks_like_fec_frame(const uint8_t* data, size_t size) {
+    if (size < 8) return false;
+    const uint16_t type = static_cast<uint16_t>(data[4]) |
+                          static_cast<uint16_t>(data[5] << 8);
+    return type == kcp::kTypeData || type == kcp::kTypeParity ||
+           type == kcp::kTypeOob;
+}
+
+// One throttle for the whole process. The condition it guards is a *static
+// misconfiguration*, so the goal is "impossible to miss, impossible to flood":
+// the first datagram of every peer warns immediately, and repeated datagrams
+// fold into a count, exactly like log_kcp_input_rejected.
+LogThrottle& fec_peer_only_log() {
+    static LogThrottle throttle;
+    return throttle;
+}
+
+} // namespace
+
 KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
                      std::shared_ptr<Crypto> crypto,
                      std::string log_module, std::string log_tag,
@@ -92,6 +123,28 @@ void KcpTunnel::on_kcp_datagram(byte_view data) {
 
 int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
     if (!fec_decoder_) {
+        // Local FEC is off, so the peer must be sending bare KCP segments. If
+        // the header instead carries a FEC type, the peer HAS -fec enabled and
+        // this side does not -- the mirror image of the ret_=-2 arm below.
+        // Without this check the mismatch was diagnosable only from the side
+        // that had FEC on; the FEC-off side just logged the generic
+        // "FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_-1" that ikcp_input produces
+        // for any malformed segment, which says nothing about the cause.
+        //
+        // Still hand the datagram to KCP: the bytes are real KCP segments
+        // wrapped in an 8-byte FEC prefix, and refusing early would change
+        // behaviour for a case that already cannot work. The reject line that
+        // ikcp_input generates stays as the FAIL_STAGE record of truth.
+        if (looks_like_fec_frame(data, size)) {
+            uint32_t suppressed = 0;
+            if (fec_peer_only_log().should_log(suppressed)) {
+                LOG_WARNING(log_module_, log_msg(
+                    "peer is sending FEC-framed datagrams but local -fec is off "
+                    "(enable -fec with the SAME DATA:PARITY, or clear it on the "
+                    "peer)" + (suppressed ? " (" + std::to_string(suppressed) +
+                                " more suppressed this interval)" : "")));
+            }
+        }
         return kcp_.input(byte_view(data, size));
     }
     // One decrypted FEC packet: [fec_hdr(6): seqid(4)+type(2)][len(2)][payload].

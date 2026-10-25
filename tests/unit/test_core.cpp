@@ -4,6 +4,7 @@
 #include "kcp_proxy/crypto.hpp"
 #include "kcp_proxy/kcp_client_session.hpp"
 #include "kcp_proxy/kcp_session.hpp"
+#include "kcp_proxy/kcp_tunnel.hpp"
 #include "kcp_proxy/kcp_wrapper.hpp"
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/server.hpp"
@@ -1025,6 +1026,159 @@ void test_fec_encoder_does_not_leak_stale_shard_bytes() {
         expect_true(no_stale_anywhere, "no 0xEE filler from set 1 may survive into set 2");
     }
     std::cout << "  [ok] fec encoder zero-fills reused shard slots across sets\n";
+}
+
+// Minimal concrete KcpTunnel. feed_kcp_input is the only member under test, so
+// every abstract hook is an inert stub: KcpTunnel's constructor is protected and
+// the class is abstract by design (the two real sessions own the wire), which is
+// exactly why a probe has to exist to reach the FEC-off branch at all.
+class InertTunnel : public KcpTunnel {
+public:
+    InertTunnel(asio::io_context& io, uint32_t conv, std::shared_ptr<Crypto> crypto,
+                const FecConfig& fec)
+        : KcpTunnel(io, conv, std::move(crypto), "inert_tunnel", "p", fec) {}
+
+    // feed_kcp_input is protected (strand-only by contract). Re-expose it under a
+    // distinct name rather than widening the base's interface for a test.
+    int feed(const uint8_t* data, size_t size) { return feed_kcp_input(data, size); }
+
+protected:
+    bool can_accept_data() const override { return false; }
+    bool is_active() const override { return false; }
+    void shut_down() override {}
+    void handle_kcp_output(byte_view) override {}
+};
+
+void test_fec_off_detects_a_fec_peer() {
+    // The mirror image of the ret_-2 arm in feed_kcp_input. When the LOCAL side
+    // has -fec off but the PEER has it on, the datagram is [fec_hdr(6)|len(2)|
+    // KCP segment] and this side strips nothing, so ikcp_input reads the FEC
+    // seqid as the conv and returns -1. That generic reject line is
+    // indistinguishable from any other malformed datagram: before this check the
+    // operator saw "FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_-1" and nothing else.
+    // Confirmed on the real server: server without -fec, client with -fec 10:3,
+    // server logged ret_-1 while the same failure from the other direction
+    // logged the explanatory ret_-2.
+    //
+    // The fix logs and must NOT change the return value: the datagram still goes
+    // to kcp_.input(), so the throttled reject line stays the FAIL_STAGE record
+    // of truth at the session layer.
+    asio::io_context io;
+    auto crypto = std::make_shared<Crypto>("test_key_0123456789", NONCE_DIR_SERVER);
+    InertTunnel off(io, 1, crypto, FecConfig{});
+    InertTunnel on(io, 1, crypto, FecConfig{10, 3});
+
+    // A peer-encoded FEC frame at the real crypto reserve offset: that is the
+    // shape the wire carries once salt+nonce are stripped, i.e. what
+    // feed_kcp_input receives. Encode() seals IN PLACE (the data packet is
+    // already in the [reserve|hdr|len|payload] layout) and only EMITS parity, so
+    // the frame under test is `frame`, not an entry in `emitted`.
+    auto encoder = kcp::internal::FecEncoder::New(
+        10, 3, static_cast<int>(FEC_CRYPTO_RESERVE));
+    expect_true(encoder != nullptr, "FecEncoder::New(10,3,reserve) must succeed");
+    const size_t kcp_len = static_cast<size_t>(KCP_MTU);
+    const size_t frame_size = FEC_CRYPTO_RESERVE + 8 + kcp_len;
+    std::vector<uint8_t> framed(frame_size, 0);
+    for (size_t j = 0; j < kcp_len; j++) {
+        framed[FEC_CRYPTO_RESERVE + 8 + j] = static_cast<uint8_t>((j * 17 + 1) & 0xff);
+    }
+    std::vector<std::vector<uint8_t>> emitted;
+    encoder->Encode(framed.data(), framed.size(), 1, &emitted);
+    const uint8_t* plain = framed.data() + FEC_CRYPTO_RESERVE;
+    const size_t plain_len = framed.size() - FEC_CRYPTO_RESERVE;
+    // Sanity: the seal must have written a data header at the reserve offset,
+    // otherwise the test would be asserting against the wrong bytes.
+    const uint16_t sealed_flag = static_cast<uint16_t>(plain[4]) |
+                                 static_cast<uint16_t>(plain[5] << 8);
+    expect_true(sealed_flag == kcp::kTypeData,
+                "the encoded frame must carry kTypeData at the reserve offset");
+
+    // ORDER MATTERS. fec_peer_only_log() is one process-wide LogThrottle, so a
+    // step that emits a line opens a 1s window during which every later step is
+    // silent no matter what the predicate does. A "must stay silent" assertion
+    // placed after an emitting step therefore passes even if the predicate is
+    // hard-wired to true -- it proves nothing. So the silence check runs FIRST,
+    // while the throttle is still virgin, and the emitting checks come after.
+
+    // 1. No false positive: an ordinary KCP segment on an FEC-off tunnel must
+    //    stay silent. Its bytes 4..5 are cmd/frg; cmd must be 0x51..0x54 while a
+    //    match needs 0xf1..0xf3, so a healthy segment can never trip the probe.
+    {
+        std::atomic<int> peer_lines{0};
+        set_log_sink_for_test([&](LogLevel level, std::string_view,
+                                  std::string_view message) {
+            if (level == LogLevel::Warning &&
+                message.find("local -fec is off") != std::string_view::npos) {
+                peer_lines.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        const LogLevel prev = current_log_level();
+        set_log_level(LogLevel::Debug);
+        // A real KCP segment: conv(4) + cmd(1)=PUSH(0x51) + frg(1)=0 + wnd(2)
+        // + ts/seq/una/len = the 24-byte header. Offsets 4..5 = 0x51,0x00.
+        std::vector<uint8_t> seg(24, 0);
+        seg[0] = 1;  // conv = 1, little-endian, matches the tunnel
+        seg[4] = static_cast<uint8_t>(kcp::kCmdPush);  // 0x51
+        seg[5] = 0;
+        off.feed(seg.data(), seg.size());
+        set_log_level(prev);
+        set_log_sink_for_test(LogSink{});
+        expect_true(peer_lines.load() == 0,
+                    "an unframed KCP segment must never trigger the FEC-peer warning");
+    }
+
+    // 2. FEC-off side: KCP still refuses (the bytes are not a valid segment),
+    //    but the mismatch must be named in a WARNING.
+    {
+        std::atomic<int> peer_lines{0};
+        std::atomic<int> reject_lines{0};
+        set_log_sink_for_test([&](LogLevel level, std::string_view,
+                                  std::string_view message) {
+            if (level != LogLevel::Warning) return;
+            if (message.find("local -fec is off") != std::string_view::npos) {
+                peer_lines.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (message.find("FAIL_STAGE=KCP_INPUT_FAILED") != std::string_view::npos) {
+                reject_lines.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        const LogLevel prev = current_log_level();
+        set_log_level(LogLevel::Debug);
+        const int ret = off.feed(plain, plain_len);
+        set_log_level(prev);
+        set_log_sink_for_test(LogSink{});
+        expect_true(ret < 0,
+                    "a FEC frame on an FEC-off tunnel must still be refused by KCP");
+        expect_true(peer_lines.load() == 1,
+                    "the peer-has-FEC mismatch must be reported exactly once, by name");
+        expect_true(reject_lines.load() == 0,
+                    "feed_kcp_input itself must not emit the FAIL_STAGE line; the "
+                    "session layer owns it");
+    }
+
+    // 3. Throttled: a burst must not turn into one line per datagram.
+    {
+        std::atomic<int> peer_lines{0};
+        set_log_sink_for_test([&](LogLevel level, std::string_view,
+                                  std::string_view message) {
+            if (level == LogLevel::Warning &&
+                message.find("local -fec is off") != std::string_view::npos) {
+                peer_lines.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        const LogLevel prev = current_log_level();
+        set_log_level(LogLevel::Debug);
+        constexpr int kDatagrams = 5000;
+        for (int i = 0; i < kDatagrams; ++i) {
+            off.feed(plain, plain_len);
+        }
+        set_log_level(prev);
+        set_log_sink_for_test(LogSink{});
+        expect_true(peer_lines.load() <= 2,
+                    "the mismatch warning must be throttled, not one line per datagram");
+    }
+
+    std::cout << "  [ok] fec-off tunnel names a FEC peer instead of a bare ret_-1\n";
 }
 
 void test_kcp_wrapper_oversized_message_is_not_truncated() {
@@ -2451,6 +2605,7 @@ void test_kcp_input_rejection_log_is_bounded_and_single_line() {
                 "one rejected datagram must produce exactly one warning line");
 }
 
+
 } // namespace
 
 int main() {
@@ -2472,6 +2627,7 @@ int main() {
         test_fec_codec_repairs_lost_shards();
         test_fec_frame_layout_at_crypto_reserve();
         test_fec_encoder_does_not_leak_stale_shard_bytes();
+        test_fec_off_detects_a_fec_peer();
         test_kcp_wrapper_applies_constants();
         test_kcp_wrapper_oversized_message_is_not_truncated();
         test_server_session_routing_and_auth();
