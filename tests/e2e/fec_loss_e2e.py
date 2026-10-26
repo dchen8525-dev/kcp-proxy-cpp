@@ -74,6 +74,25 @@ PAYLOAD_BYTES = 256 * 1024
 # interval after the transfer guarantees a stats line that covers it.
 STATS_INTERVAL_SEC = 30
 
+# One retry per phase. Tunnel establishment is a one-shot per phase: the KCP
+# HELLO handshake has a hard 3s budget (KCP_HANDSHAKE_TIMEOUT_SEC) with no
+# session-level retry, and the phase makes exactly one SOCKS5 connect. A
+# single scheduler stall on a shared CI runner (test harness + two
+# DEBUG-logging processes + this Python relay sharing 2 vCPUs) can therefore
+# kill the whole phase -- observed in CI as "connection closed after 0/4
+# bytes" with the SAME binary passing the identical phase minutes earlier.
+# A data-path regression fails every attempt, so the retry cannot mask one.
+PHASE_ATTEMPTS = 2
+
+
+def log_tail(path, limit=2500):
+    """Tail of a process log, attached to a phase failure for diagnosis."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()[-limit:].decode("utf-8", "replace")
+    except OSError:
+        return "<log unavailable>"
+
 
 class LossyUdpRelay(threading.Thread):
     """A transparent UDP relay that silently drops a fraction of datagrams.
@@ -198,54 +217,79 @@ def run_loss_phase(label, server_exe, client_exe, echo_port, fec_args):
 
     # stdout=DEBUG volume: redirect to files instead of PIPE, which would fill
     # the OS pipe buffer and block the child mid-transfer.
-    with open(server_log, "wb") as sf, open(client_log, "wb") as cf:
-        server_proc = subprocess.Popen(server_cmd, stdout=sf, stderr=subprocess.STDOUT)
-        client_proc = subprocess.Popen(client_cmd, stdout=cf, stderr=subprocess.STDOUT)
+    try:
+        with open(server_log, "wb") as sf, open(client_log, "wb") as cf:
+            server_proc = subprocess.Popen(server_cmd, stdout=sf, stderr=subprocess.STDOUT)
+            client_proc = subprocess.Popen(client_cmd, stdout=cf, stderr=subprocess.STDOUT)
 
-        relay = LossyUdpRelay(relay_port, ("127.0.0.1", udp_port), DROP_RATE, DROP_RATE)
-        relay.start()
-        try:
-            if not wait_for_port("127.0.0.1", socks_port, 20):
-                raise RuntimeError("%s: client SOCKS port never came up" % label)
-            time.sleep(0.3)
-            if server_proc.poll() is not None or client_proc.poll() is not None:
-                raise RuntimeError(
-                    "%s: a process exited early (server=%s client=%s)"
-                    % (label, server_proc.returncode, client_proc.returncode))
-
-            with socks5_connect("127.0.0.1", socks_port, "127.0.0.1", echo_port, 30) as s:
-                payload = os.urandom(PAYLOAD_BYTES)
-                s.sendall(payload)
-                got = recv_exact(s, len(payload), 60)
-            if got != payload:
-                raise AssertionError(
-                    "%s: payload mismatch through %d%% loss (sent %d, got %d bytes)"
-                    % (label, DROP_RATE * 100, len(payload), len(got)))
-            print("  [ok] %s: %d bytes round-tripped byte-exact through %.0f%% loss "
-                  "(relay dropped c2s=%d s2c=%d)"
-                  % (label, PAYLOAD_BYTES, DROP_RATE * 100,
-                     relay.dropped_c2s, relay.dropped_s2c))
-
-            # Keep every process ALIVE for one full stats interval: the
-            # counters this suite asserts on are only visible in stats lines
-            # (session close + the periodic line), and a terminated process
-            # stops logging. The transfer session either drains its FIN and
-            # logs its close stats, or the periodic line fires -- either way
-            # the post-transfer totals reach the log.
-            time.sleep(STATS_INTERVAL_SEC + 2)
-        finally:
-            relay.stop()
-            time.sleep(0.2)
-            client_proc.terminate()
-            server_proc.terminate()
+            relay = LossyUdpRelay(relay_port, ("127.0.0.1", udp_port), DROP_RATE, DROP_RATE)
+            relay.start()
             try:
-                client_proc.wait(timeout=5)
-                server_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                client_proc.kill()
-                server_proc.kill()
+                if not wait_for_port("127.0.0.1", socks_port, 20):
+                    raise RuntimeError("%s: client SOCKS port never came up" % label)
+                time.sleep(0.3)
+                if server_proc.poll() is not None or client_proc.poll() is not None:
+                    raise RuntimeError(
+                        "%s: a process exited early (server=%s client=%s)"
+                        % (label, server_proc.returncode, client_proc.returncode))
+
+                with socks5_connect("127.0.0.1", socks_port, "127.0.0.1", echo_port, 30) as s:
+                    payload = os.urandom(PAYLOAD_BYTES)
+                    s.sendall(payload)
+                    got = recv_exact(s, len(payload), 60)
+                if got != payload:
+                    raise AssertionError(
+                        "%s: payload mismatch through %d%% loss (sent %d, got %d bytes)"
+                        % (label, DROP_RATE * 100, len(payload), len(got)))
+                print("  [ok] %s: %d bytes round-tripped byte-exact through %.0f%% loss "
+                      "(relay dropped c2s=%d s2c=%d)"
+                      % (label, PAYLOAD_BYTES, DROP_RATE * 100,
+                         relay.dropped_c2s, relay.dropped_s2c))
+
+                # Keep every process ALIVE for one full stats interval: the
+                # counters this suite asserts on are only visible in stats lines
+                # (session close + the periodic line), and a terminated process
+                # stops logging. The transfer session either drains its FIN and
+                # logs its close stats, or the periodic line fires -- either way
+                # the post-transfer totals reach the log.
+                time.sleep(STATS_INTERVAL_SEC + 2)
+            finally:
+                relay.stop()
+                time.sleep(0.2)
+                client_proc.terminate()
+                server_proc.terminate()
+                try:
+                    client_proc.wait(timeout=5)
+                    server_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    client_proc.kill()
+                    server_proc.kill()
+    except Exception as exc:
+        # A bare failure is undiagnosable in CI: the DEBUG logs live in a temp
+        # dir nobody ever sees. Attach both tails so a failure names the stall
+        # (KCP handshake timeout vs SOCKS5 handshake timeout vs early exit).
+        raise RuntimeError(
+            "%s: %s\n--- client log tail ---\n%s--- server log tail ---\n%s"
+            % (label, exc, log_tail(client_log), log_tail(server_log))) from exc
 
     return read_log(client_log), read_log(server_log)
+
+
+def run_loss_phase_with_retry(label, server_exe, client_exe, echo_port, fec_args,
+                              attempts=PHASE_ATTEMPTS):
+    """run_loss_phase with a fresh-ports retry; see PHASE_ATTEMPTS for why."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_loss_phase(label, server_exe, client_exe, echo_port, fec_args)
+        except Exception as exc:  # noqa: BLE001 - retried below, re-raised at the end
+            last_error = exc
+            print("  [warn] %s: attempt %d/%d failed (%s)"
+                  % (label, attempt, attempts, exc))
+    raise AssertionError(
+        "%s: still failing after %d attempts (a data-path regression fails every "
+        "attempt; a host stall should not); last error: %s"
+        % (label, attempts, last_error))
 
 
 def main():
@@ -269,7 +313,7 @@ def main():
 
     try:
         # --- Phase 1: FEC 10:3 through 8% loss: transfer + observable repairs ---
-        client_log, server_log = run_loss_phase(
+        client_log, server_log = run_loss_phase_with_retry(
             "fec=10:3 under loss", args.server, args.client, echo_port,
             ["-fec", "10:3"])
         if "FEC config shards=10:3" not in client_log:
@@ -286,7 +330,7 @@ def main():
               % (max(repaired), len(repaired)))
 
         # --- Phase 2: FEC off through the same loss: default must not regress ---
-        client_log2, _ = run_loss_phase(
+        client_log2, _ = run_loss_phase_with_retry(
             "fec=off under loss", args.server, args.client, echo_port, [])
         if "FEC config shards=off" not in client_log2:
             raise AssertionError("client startup log lacks the disabled FEC line")
