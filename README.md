@@ -142,11 +142,11 @@ cmake --build --preset release --parallel
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载最新的deb包：
 
 ```bash
-# 下载deb包（以v0.1.4为例）
-wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.1.4/kcp-proxy-server_0.1.4_amd64.deb
+# 下载deb包（以v0.1.5为例）
+wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.1.5/kcp-proxy-server_0.1.5_amd64.deb
 
 # 安装
-sudo dpkg -i kcp-proxy-server_0.1.4_amd64.deb
+sudo dpkg -i kcp-proxy-server_0.1.5_amd64.deb
 
 # 启动服务
 sudo systemctl start kcp-proxy-server
@@ -232,8 +232,8 @@ KCP_PROXY_DEPLOY_SUFFIX='MyStrongSuffix' ./deploy.sh root@1.2.3.4   # 或用环�
 从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载Windows GUI客户端：
 
 ```
-KCP-Proxy-0.1.4-Setup.exe     # NSIS 安装包（推荐）
-KCP-Proxy-0.1.4-Portable.exe  # 免安装单文件版
+KCP-Proxy-0.1.5-Setup.exe     # NSIS 安装包（推荐）
+KCP-Proxy-0.1.5-Portable.exe  # 免安装单文件版
 ```
 
 运行安装包，或直接运行免安装版。
