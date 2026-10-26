@@ -17,6 +17,12 @@
   --cinnabar-hover: #9c3927;
   --pine: #47685a;
   --pine-hover: #3a5549;
+  /* Traffic direction colours: 朱砂 is reserved for stop/error states, so
+     download uses 黛蓝 instead — same lightness as 松绿, cool vs warm, and
+     still distinguishable for red-green colour blindness. Keep in sync with
+     SPARK.DOWN_COLOR / SPARK.UP_COLOR in renderer.js. */
+  --traffic-down: #2e5f74;
+  --traffic-up: #47685a;
 
   --mono: "Cascadia Mono", "SF Mono", Consolas, "Courier New", monospace;
   --sans: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
@@ -454,12 +460,12 @@ code {
 
 .traffic-down .traffic-dir,
 .traffic-down .traffic-rate {
-  color: var(--cinnabar);
+  color: var(--traffic-down);
 }
 
 .traffic-up .traffic-dir,
 .traffic-up .traffic-rate {
-  color: var(--pine);
+  color: var(--traffic-up);
 }
 
 /* ── Settings view ── */

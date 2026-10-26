@@ -468,8 +468,10 @@ function updateStatus(running) {
 const SPARK = {
   WIDTH: 100, HEIGHT: 30,
   PADDING: 2,                       // keep the stroke clear of the viewBox edge
-  UP_COLOR: '#47685a',              // 松绿 — matches --pine
-  DOWN_COLOR: '#b5432f'             // 朱砂 — matches --cinnabar
+  UP_COLOR: '#47685a',              // 松绿 — matches --traffic-up
+  DOWN_COLOR: '#2e5f74'             // 黛蓝 — matches --traffic-down (朱砂 is
+                                    // reserved for stop/error, so download
+                                    // must not use it)
 };
 
 function updateTraffic({ tx, rx, txRate, rxRate, txPeak, rxPeak, histUp, histDown }) {
