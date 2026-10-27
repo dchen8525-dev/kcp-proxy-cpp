@@ -12,11 +12,8 @@
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <mswsock.h>
-// Present in mswsock.h on modern SDKs; defined here so MinGW and older
-// toolchains still compile the SIO_UDP_CONNRESET call.
-#ifndef SIO_UDP_CONNRESET
-#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
-#endif
+// SIO_UDP_CONNRESET and the disable_udp_connreset() wrapper live in
+// socket_buffer.hpp, which both ends include (see its comment for why).
 #endif
 #include <algorithm>
 #include <chrono>
@@ -25,16 +22,6 @@
 #include <utility>
 
 namespace kcp_proxy {
-
-static std::string log_level_name() {
-    switch (current_log_level()) {
-        case LogLevel::Debug:   return "DEBUG";
-        case LogLevel::Info:    return "INFO";
-        case LogLevel::Warning: return "WARNING";
-        case LogLevel::Error:   return "ERROR";
-    }
-    return "INFO";
-}
 
 KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
                      std::string host, const FecConfig& fec)
@@ -112,67 +99,18 @@ void KCPServer::start() {
                                  std::to_string(port_) + ": " + ec.message());
     }
 
-    // Raise the kernel UDP send/receive buffers. Oversized kernel buffers prevent
-    // the OS from silently dropping datagrams during bursts (which KCP would
-    // otherwise misread as network loss and retransmit a whole window of).
-    std::error_code opt_ec;
-    udp_socket_.set_option(asio::socket_base::receive_buffer_size(
-                               UDP_SO_RCVBUF_BYTES), opt_ec);
-    if (opt_ec) {
-        LOG_WARNING("server", "failed to set SO_RCVBUF: " + opt_ec.message());
-    }
-    udp_socket_.set_option(asio::socket_base::send_buffer_size(
-                               UDP_SO_SNDBUF_BYTES), opt_ec);
-    if (opt_ec) {
-        LOG_WARNING("server", "failed to set SO_SNDBUF: " + opt_ec.message());
-    }
-    // Effective sizes (the OS may clamp to its own cap, so report what we got).
-    asio::socket_base::receive_buffer_size eff_rcv;
-    asio::socket_base::send_buffer_size eff_snd;
-    udp_socket_.get_option(eff_rcv, opt_ec);
-    const bool rcv_read_ok = !opt_ec;
-    const std::string eff_rcv_str = opt_ec ? "?" : std::to_string(eff_rcv.value());
-    udp_socket_.get_option(eff_snd, opt_ec);
-    const bool snd_read_ok = !opt_ec;
-    const std::string eff_snd_str = opt_ec ? "?" : std::to_string(eff_snd.value());
-    LOG_INFO("server", "UDP socket buffers so_rcvbuf=" + eff_rcv_str +
-             " so_sndbuf=" + eff_snd_str);
-
-    // The values above are the whole point of the set_option calls, so a silent
-    // clamp is a silent loss of the protection. setsockopt() reports success
-    // either way, which is why this comparison -- not the error code -- is what
-    // actually detects it.
-    if (rcv_read_ok) {
-        const std::string clamp = describe_buffer_clamp(
-            "so_rcvbuf", "net.core.rmem_max", UDP_SO_RCVBUF_BYTES, eff_rcv.value());
-        if (!clamp.empty()) LOG_WARNING("server", clamp);
-    }
-    if (snd_read_ok) {
-        const std::string clamp = describe_buffer_clamp(
-            "so_sndbuf", "net.core.wmem_max", UDP_SO_SNDBUF_BYTES, eff_snd.value());
-        if (!clamp.empty()) LOG_WARNING("server", clamp);
-    }
+    // Raise the kernel UDP send/receive buffers and report any silent clamp.
+    // Shared with the client (socket_buffer.hpp) so the two cannot drift; the
+    // server owns exactly one socket, so no once-per-process guard is needed.
+    apply_udp_buffer_sizes(udp_socket_, "server", /*report_once=*/false);
 
 #if defined(_WIN32)
-    // Root-cause fix for the ICMP port-unreachable error path: on Windows an
-    // unconnected UDP socket reports WSAECONNRESET on the next receive after
-    // every send to a dead peer port. A hostile or churning client could keep
-    // that error channel hot forever (each error is an ERROR/DEBUG log plus a
-    // re-arm). SIO_UDP_CONNRESET=FALSE turns the reporting off at the source;
-    // the tolerant handler below stays as the cross-platform safety net.
-    {
-        BOOLEAN disable_connreset = FALSE;
-        DWORD bytes_returned = 0;
-        // native_handle() already yields the SOCKET integer type on Windows.
-        const int wsa_rc = ::WSAIoctl(
-            udp_socket_.native_handle(),
-            SIO_UDP_CONNRESET,
-            &disable_connreset, sizeof(disable_connreset),
-            nullptr, 0,
-            &bytes_returned, nullptr, nullptr);
-        LOG_INFO("server", std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") +
-                 std::to_string(wsa_rc) + ")");
-    }
+    // Root-cause fix for the ICMP port-unreachable error path (see
+    // disable_udp_connreset). The tolerant handler below stays as the
+    // cross-platform safety net.
+    const int wsa_rc = disable_udp_connreset(udp_socket_);
+    LOG_INFO("server",
+             std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") + std::to_string(wsa_rc) + ")");
 #endif
 
     running_ = true;
@@ -192,12 +130,11 @@ void KCPServer::start() {
     const auto bound_ep = udp_socket_.local_endpoint(bind_ec);
     const uint16_t bound_port = bind_ec ? port_ : bound_ep.port();
     LOG_INFO("server", "listening on " + host_ + ":" + std::to_string(bound_port));
-    LOG_INFO("server", "diagnostics udp_bind=" + host_ +
-             " udp_port=" + std::to_string(bound_port) +
-             " udp_recv_slots=" + std::to_string(UDP_RECV_SLOTS) +
-             " crypto=AES-128-GCM/HKDF-SHA256" +
-             " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
-             " log_level=" + log_level_name());
+    LOG_INFO("server", "diagnostics udp_bind=" + host_ + " udp_port=" + std::to_string(bound_port) +
+                           " udp_recv_slots=" + std::to_string(UDP_RECV_SLOTS) +
+                           " crypto=AES-128-GCM/HKDF-SHA256" +
+                           " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
+                           " log_level=" + std::string(log_level_name(current_log_level())));
     LOG_INFO("server", kcp_config_line());
     LOG_INFO("server", fec_config_line(fec_));
     LOG_INFO("server", std::string("server FEC mode: auto-adapt per client framing") +

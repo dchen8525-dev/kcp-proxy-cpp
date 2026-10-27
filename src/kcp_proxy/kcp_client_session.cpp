@@ -6,11 +6,8 @@
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <mswsock.h>
-// Present in mswsock.h on modern SDKs; defined here so MinGW and older
-// toolchains still compile the SIO_UDP_CONNRESET call (same shim as server.cpp).
-#ifndef SIO_UDP_CONNRESET
-#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
-#endif
+// SIO_UDP_CONNRESET and the disable_udp_connreset() wrapper live in
+// socket_buffer.hpp, which the server includes too.
 #endif
 #include <algorithm>
 #include <cstring>
@@ -95,75 +92,21 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
         // This socket is connect()ed, so Windows delivers WSAECONNRESET on the
         // next receive after every send to a dead peer port -- the client is
         // MORE exposed to this than the server, whose socket is unconnected.
-        // Turn the reporting off at the source, exactly as the server does; the
-        // tolerant handler in do_udp_receive stays as the cross-platform safety
-        // net. Without this, a server that is down or restarting turns every
-        // HELLO retransmit and keepalive into an ERROR log line plus an
-        // unthrottled re-arm.
-        {
-            BOOLEAN disable_connreset = FALSE;
-            DWORD bytes_returned = 0;
-            const int wsa_rc = ::WSAIoctl(
-                udp_socket_->native_handle(), SIO_UDP_CONNRESET,
-                &disable_connreset, sizeof(disable_connreset),
-                nullptr, 0, &bytes_returned, nullptr, nullptr);
-            LOG_DEBUG("kcp_client", std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") +
-                      std::to_string(wsa_rc) + ")");
-        }
+        // Without this, a server that is down or restarting turns every HELLO
+        // retransmit and keepalive into an ERROR log line plus an unthrottled
+        // re-arm.
+        const int wsa_rc = disable_udp_connreset(*udp_socket_);
+        LOG_DEBUG("kcp_client", std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") +
+                                    std::to_string(wsa_rc) + ")");
 #endif
 
-        // Raise the kernel UDP send/receive buffers. Oversized kernel buffers
-        // prevent the OS from silently dropping datagrams during bursts (which
-        // KCP would otherwise misread as network loss and retransmit a window).
-        std::error_code opt_ec;
-        udp_socket_->set_option(asio::socket_base::receive_buffer_size(
-                                    UDP_SO_RCVBUF_BYTES), opt_ec);
-        if (opt_ec) {
-            LOG_WARNING("kcp_client", "failed to set SO_RCVBUF: " + opt_ec.message());
-        }
-        udp_socket_->set_option(asio::socket_base::send_buffer_size(
-                                    UDP_SO_SNDBUF_BYTES), opt_ec);
-        if (opt_ec) {
-            LOG_WARNING("kcp_client", "failed to set SO_SNDBUF: " + opt_ec.message());
-        }
-
-        // Read back what the kernel actually granted. setsockopt() reports
-        // success even when the kernel clamps the request to net.core.rmem_max /
-        // wmem_max, so this comparison -- not the error code -- is the only thing
-        // that detects a clamp, and a clamp here silently reintroduces the burst
-        // drops the set_option calls above exist to prevent.
+        // Raise the kernel UDP send/receive buffers and report any silent clamp.
         //
         // Once per process: the client creates one UDP socket per local TCP
         // connection, so logging this per session would spam an unbounded number
         // of identical lines about a value that cannot change while the process
-        // runs. Windows has no rmem_max/wmem_max to raise, so this is visibility
-        // only -- never an automatic repair.
-        static std::once_flag buffer_report_once;
-        std::call_once(buffer_report_once, [this]() {
-            std::error_code read_ec;
-            asio::socket_base::receive_buffer_size eff_rcv;
-            asio::socket_base::send_buffer_size eff_snd;
-            udp_socket_->get_option(eff_rcv, read_ec);
-            const bool rcv_ok = !read_ec;
-            const std::string rcv_str = read_ec ? "?" : std::to_string(eff_rcv.value());
-            udp_socket_->get_option(eff_snd, read_ec);
-            const bool snd_ok = !read_ec;
-            const std::string snd_str = read_ec ? "?" : std::to_string(eff_snd.value());
-            LOG_INFO("kcp_client", "UDP socket buffers so_rcvbuf=" + rcv_str +
-                     " so_sndbuf=" + snd_str);
-            if (rcv_ok) {
-                const std::string clamp = describe_buffer_clamp(
-                    "so_rcvbuf", "net.core.rmem_max", UDP_SO_RCVBUF_BYTES,
-                    eff_rcv.value());
-                if (!clamp.empty()) LOG_WARNING("kcp_client", clamp);
-            }
-            if (snd_ok) {
-                const std::string clamp = describe_buffer_clamp(
-                    "so_sndbuf", "net.core.wmem_max", UDP_SO_SNDBUF_BYTES,
-                    eff_snd.value());
-                if (!clamp.empty()) LOG_WARNING("kcp_client", clamp);
-            }
-        });
+        // runs.
+        apply_udp_buffer_sizes(*udp_socket_, "kcp_client", /*report_once=*/true);
 
         running_.store(true);
         connected_.store(false);
