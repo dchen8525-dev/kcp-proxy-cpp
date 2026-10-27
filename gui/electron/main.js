@@ -187,6 +187,11 @@ let probeProcess = null;
 // final app.quit() from the cleanup may proceed).
 let quitCleanupState = 'idle';
 let isRunning = false;
+// Wall-clock start of the current session, in ms since epoch; 0 when stopped.
+// It rides along with every status event so a renderer that loads late (or a
+// window that is re-created) shows the real elapsed time rather than restarting
+// the counter from zero. Reset on each spawn, so a reconnect starts a new one.
+let sessionStartedAt = 0;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let isManualStop = false; // Track if user manually stopped
@@ -280,6 +285,14 @@ function createWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     console.warn('blocked popup to', url);
     return { action: 'deny' };
+  });
+
+  // Re-send the current state once the page is live. An auto-connect on launch
+  // fires updateStatus(true) before the renderer has registered its listener,
+  // which used to leave a live tunnel labelled 未运行 until the next event.
+  mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow?.webContents.send('status-update',
+      { running: isRunning, startedAt: sessionStartedAt });
   });
 
   // Show the window when ready. A launch carrying --hidden starts minimized
@@ -672,7 +685,12 @@ function updateStatus(running) {
   // or a sparkline from the previous run must never leak into the new one
   // (the display clears on the renderer side via this same event).
   resetTrafficState();
-  mainWindow?.webContents.send('status-update', running);
+
+  // The renderer shows "已运行 HH:MM:SS" from this timestamp; keeping the clock
+  // here (not in the renderer) is what makes it survive a late page load.
+  sessionStartedAt = running ? Date.now() : 0;
+  mainWindow?.webContents.send('status-update',
+    { running, startedAt: sessionStartedAt });
 
   // Update tray tooltip. The tray IMAGE is static — it is the app icon set
   // once in createTray(); status is carried by the tooltip and the menu.

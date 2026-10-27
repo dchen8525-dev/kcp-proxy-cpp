@@ -241,6 +241,18 @@ h1.status {
   background: var(--cinnabar);
 }
 
+/* Session uptime, riding beside the 32px status word. tabular-nums keeps the
+   digits from shifting the line each second; the width is fixed by the always
+   two-digit HH:MM:SS format, so the status word never moves. */
+.uptime {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: .02em;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
 .status-sub {
   color: var(--ink-2);
   font-size: 13px;

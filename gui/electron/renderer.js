@@ -16,6 +16,7 @@ const elements = {
   btnClose: document.getElementById('btn-close'),
   statusDot: document.getElementById('status-dot'),
   statusText: document.getElementById('status-text'),
+  uptime: document.getElementById('uptime'),
   trafficIndicator: document.getElementById('traffic-indicator'),
   trafficDownRate: document.getElementById('traffic-down-rate'),
   trafficDownSpark: document.getElementById('traffic-down-spark'),
@@ -216,8 +217,8 @@ function scrollLogToTail() {
 
 // Setup IPC handlers
 function setupIPCHandlers() {
-  window.electronAPI.onStatusUpdate((running) => {
-    updateStatus(running);
+  window.electronAPI.onStatusUpdate(({ running, startedAt }) => {
+    updateStatus(running, startedAt);
   });
 
   window.electronAPI.onLog((data) => {
@@ -432,8 +433,49 @@ async function stopProxy() {
   }
 }
 
+// Session uptime, shown beside the status word once a tunnel is live. The start
+// timestamp comes from the main process (see status-update), so a page that
+// loads mid-session still counts from the real start rather than from paint.
+// Each tick recomputes from the clock instead of incrementing a counter: a
+// throttled background window or a paused interval cannot make it drift.
+let uptimeTimer = null;
+let uptimeStartedAt = 0;
+
+function formatUptime(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
+function paintUptime() {
+  if (!uptimeStartedAt) return;
+  elements.uptime.textContent = `已运行 ${formatUptime(Date.now() - uptimeStartedAt)}`;
+}
+
+function startUptime(startedAt) {
+  stopUptime();
+  // A missing timestamp (should not happen) degrades to "starts now" instead of
+  // hiding the line; the elapsed time is then relative to the event, not to zero.
+  uptimeStartedAt = Number(startedAt) > 0 ? Number(startedAt) : Date.now();
+  elements.uptime.hidden = false;
+  paintUptime();
+  uptimeTimer = setInterval(paintUptime, 1000);
+}
+
+function stopUptime() {
+  if (uptimeTimer) {
+    clearInterval(uptimeTimer);
+    uptimeTimer = null;
+  }
+  uptimeStartedAt = 0;
+  elements.uptime.hidden = true;
+}
+
 // Update UI status
-function updateStatus(running) {
+function updateStatus(running, startedAt) {
   isRunning = running;
 
   // The single toggle button is never disabled — its label and color carry
@@ -447,6 +489,7 @@ function updateStatus(running) {
     elements.btnToggle.classList.add('btn-fill');
     elements.statusDot.classList.add('running');
     elements.statusText.textContent = '运行中';
+    startUptime(startedAt);
     elements.trafficIndicator.hidden = false;
   } else {
     elements.btnToggle.textContent = '启动连接';
@@ -454,6 +497,7 @@ function updateStatus(running) {
     elements.btnToggle.classList.add('btn-pine');
     elements.statusDot.classList.remove('running');
     elements.statusText.textContent = '未运行';
+    stopUptime();
     elements.trafficIndicator.hidden = true;
     // Reset the display, not just hide it: the client only emits a TRAFFIC
     // line when the numbers change, so a restart would otherwise re-show the
