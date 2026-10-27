@@ -36,6 +36,10 @@ find_package(fmt REQUIRED)
 # so the consumer side must define it too.
 find_package(spdlog CONFIG REQUIRED)
 
+# Unit-test framework (tests/unit/test_core.cpp). Header-only with a single-TU
+# main, so the test target keeps its one-source shape.
+find_package(doctest CONFIG REQUIRED)
+
 # KCP: the `kcp::kcp` target is the C++17 port of kcp-go (dchen8525-dev/kcp-cpp)
 # that replaced the C ikcp vcpkg port. It is consumed two ways, both pinned to
 # the same upstream revision:
@@ -185,7 +189,7 @@ target_link_libraries(kcp-proxy-client PRIVATE kcp_proxy_lib)
 enable_testing()
 
 add_executable(kcp_proxy_test ${PROJECT_ROOT}/tests/unit/test_core.cpp)
-target_link_libraries(kcp_proxy_test PRIVATE kcp_proxy_lib)
+target_link_libraries(kcp_proxy_test PRIVATE kcp_proxy_lib doctest::doctest)
 add_test(
     NAME kcp_proxy_test
     COMMAND ${CMAKE_COMMAND}

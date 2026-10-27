@@ -24,8 +24,13 @@ if(_test_exe STREQUAL "")
     message(FATAL_ERROR "kcp_proxy_test executable was not found under ${TEST_BINARY_DIR}")
 endif()
 
+# --no-skip keeps a test marked skipped at runtime from passing silently, and
+# --no-introspection stops doctest from shelling out to the debugger for a
+# crash report (it would hang CI runners that have none). --success is
+# deliberately NOT passed: doctest already prints each failing assertion, and
+# the exit code is what CMake reads here.
 execute_process(
-    COMMAND "${_test_exe}"
+    COMMAND "${_test_exe}" --no-skip --no-introspection
     RESULT_VARIABLE _result
 )
 if(NOT _result EQUAL 0)

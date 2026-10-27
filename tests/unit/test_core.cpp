@@ -1,3 +1,5 @@
+#include "kcp/internal/constants.h"
+#include "kcp/internal/fec.h"
 #include "kcp_proxy/address.hpp"
 #include "kcp_proxy/client.hpp"
 #include "kcp_proxy/config.hpp"
@@ -8,44 +10,33 @@
 #include "kcp_proxy/kcp_wrapper.hpp"
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/server.hpp"
-#include "kcp_proxy/socks5.hpp"
 #include "kcp_proxy/socket_buffer.hpp"
+#include "kcp_proxy/socks5.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
-#include "kcp/internal/constants.h"
-#include "kcp/internal/fec.h"
+
 #include <asio.hpp>
-#include <cassert>
+
 #include <array>
 #include <atomic>
-#include <limits>
+#include <cassert>
 #include <chrono>
 #include <cstring>
-#include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+// Must stay the last include AND directly above doctest.h: the macro has to be
+// defined before doctest.h is first seen, or doctest compiles without its
+// single-TU implementation (and every TEST_CASE vanishes from the binary).
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest/doctest.h>
 
 using namespace kcp_proxy;
 
 namespace {
 
-void expect_true(bool value, const char* message) {
-    if (!value) {
-        throw std::runtime_error(message);
-    }
-}
 
-template <typename Fn>
-void expect_throw(Fn&& fn, const char* message) {
-    try {
-        fn();
-    } catch (...) {
-        return;
-    }
-    throw std::runtime_error(message);
-}
-
-void test_crypto_roundtrip_and_failures() {
+TEST_CASE("test_crypto_roundtrip_and_failures") {
     const std::string key = "remote_test_key_123456";
     const std::vector<uint8_t> plain{'h', 'e', 'l', 'l', 'o'};
 
@@ -56,34 +47,38 @@ void test_crypto_roundtrip_and_failures() {
     Crypto server(key, NONCE_DIR_SERVER);
     auto c2s = client.encrypt(byte_view(plain.data(), plain.size()));
     auto got = server.decrypt(byte_view(c2s.data(), c2s.size()));
-    expect_true(got == plain, "client encrypt -> server decrypt failed");
+    CHECK_MESSAGE(got == plain, "client encrypt -> server decrypt failed");
 
     auto s_salt = Crypto::generate_session_salt();
     Crypto server_sender(key, NONCE_DIR_SERVER, s_salt);
     Crypto client_receiver(key, NONCE_DIR_CLIENT);
     auto s2c = server_sender.encrypt(byte_view(plain.data(), plain.size()));
     got = client_receiver.decrypt(byte_view(s2c.data(), s2c.size()));
-    expect_true(got == plain, "server encrypt -> client decrypt failed");
+    CHECK_MESSAGE(got == plain, "server encrypt -> client decrypt failed");
 
     Crypto wrong_server("wrong_remote_test_key", NONCE_DIR_SERVER);
-    expect_throw([&] { (void)wrong_server.decrypt(byte_view(c2s.data(), c2s.size())); },
-                 "wrong key should fail");
+    INFO("wrong key should fail");
+    CHECK_THROWS_AS((void)(wrong_server.decrypt(byte_view(c2s.data(), c2s.size()))),
+                    std::runtime_error);
 
     auto tampered = c2s;
     tampered[tampered.size() - 1] ^= 0x01;
     Crypto tamper_server(key, NONCE_DIR_SERVER);
-    expect_throw([&] { (void)tamper_server.decrypt(byte_view(tampered.data(), tampered.size())); },
-                 "tampered ciphertext should fail");
+    INFO("tampered ciphertext should fail");
+    CHECK_THROWS_AS((void)(tamper_server.decrypt(byte_view(tampered.data(), tampered.size()))),
+                    std::runtime_error);
 
     Crypto replay_server(key, NONCE_DIR_SERVER);
     (void)replay_server.decrypt(byte_view(c2s.data(), c2s.size()));
-    expect_throw([&] { (void)replay_server.decrypt(byte_view(c2s.data(), c2s.size())); },
-                 "replayed packet should fail");
+    INFO("replayed packet should fail");
+    CHECK_THROWS_AS((void)(replay_server.decrypt(byte_view(c2s.data(), c2s.size()))),
+                    std::runtime_error);
 
     Crypto first_packet_session(key, NONCE_DIR_SERVER);
     (void)first_packet_session.decrypt(byte_view(c2s.data(), c2s.size()));
-    expect_throw([&] { (void)first_packet_session.decrypt(byte_view(c2s.data(), c2s.size())); },
-                 "first encrypted packet should be accepted only once per session");
+    INFO("first encrypted packet should be accepted only once per session");
+    CHECK_THROWS_AS((void)(first_packet_session.decrypt(byte_view(c2s.data(), c2s.size()))),
+                    std::runtime_error);
 
     // Per-session key isolation: two clients with different salts derive
     // different keys. A server Crypto that has bound to session A's salt must
@@ -96,17 +91,17 @@ void test_crypto_roundtrip_and_failures() {
     Crypto client_b(key, NONCE_DIR_CLIENT, salt_b);
     auto pkt_a = client_a.encrypt(byte_view(plain.data(), plain.size()));
     auto pkt_b = client_b.encrypt(byte_view(plain.data(), plain.size()));
-    expect_true(pkt_a != pkt_b,
-                "different session salts must produce different ciphertext");
+    CHECK_MESSAGE(pkt_a != pkt_b, "different session salts must produce different ciphertext");
 
     Crypto server_a(key, NONCE_DIR_SERVER);
     Crypto server_b(key, NONCE_DIR_SERVER);
-    expect_true(server_a.decrypt(byte_view(pkt_a.data(), pkt_a.size())) == plain,
+    CHECK_MESSAGE(server_a.decrypt(byte_view(pkt_a.data(), pkt_a.size())) == plain,
                 "server A decrypts session A packet");
-    expect_true(server_b.decrypt(byte_view(pkt_b.data(), pkt_b.size())) == plain,
+    CHECK_MESSAGE(server_b.decrypt(byte_view(pkt_b.data(), pkt_b.size())) == plain,
                 "server B decrypts session B packet");
-    expect_throw([&] { (void)server_a.decrypt(byte_view(pkt_b.data(), pkt_b.size())); },
-                 "server bound to session A must reject session B packet (salt mismatch)");
+    INFO("server bound to session A must reject session B packet (salt mismatch)");
+    CHECK_THROWS_AS((void)(server_a.decrypt(byte_view(pkt_b.data(), pkt_b.size()))),
+                    std::runtime_error);
 
     auto o_salt = Crypto::generate_session_salt();
     Crypto ordered_client(key, NONCE_DIR_CLIENT, o_salt);
@@ -115,8 +110,9 @@ void test_crypto_roundtrip_and_failures() {
     auto newer_packet = ordered_client.encrypt(byte_view(plain.data(), plain.size()));
     (void)ordered_server.decrypt(byte_view(old_packet.data(), old_packet.size()));
     (void)ordered_server.decrypt(byte_view(newer_packet.data(), newer_packet.size()));
-    expect_throw([&] { (void)ordered_server.decrypt(byte_view(old_packet.data(), old_packet.size())); },
-                 "old counter packet should be rejected after it was seen");
+    INFO("old counter packet should be rejected after it was seen");
+    CHECK_THROWS_AS((void)(ordered_server.decrypt(byte_view(old_packet.data(), old_packet.size()))),
+                    std::runtime_error);
 
     auto w_salt = Crypto::generate_session_salt();
     Crypto window_client(key, NONCE_DIR_CLIENT, w_salt);
@@ -127,8 +123,10 @@ void test_crypto_roundtrip_and_failures() {
         auto packet = window_client.encrypt(byte_view(plain.data(), plain.size()));
         (void)window_server.decrypt(byte_view(packet.data(), packet.size()));
     }
-    expect_throw([&] { (void)window_server.decrypt(byte_view(too_old_packet.data(), too_old_packet.size())); },
-                 "packet older than replay window should be rejected");
+    INFO("packet older than replay window should be rejected");
+    CHECK_THROWS_AS(
+        (void)(window_server.decrypt(byte_view(too_old_packet.data(), too_old_packet.size()))),
+        std::runtime_error);
 
     // Boundary regression: a single packet that advances the window by EXACTLY
     // REPLAY_WINDOW_BITS. The old highest is still inside the window
@@ -146,8 +144,9 @@ void test_crypto_roundtrip_and_failures() {
         }
         // Decrypt only the LAST packet: a single commit with shift == window bits.
         (void)edge_server.decrypt(byte_view(jump.data(), jump.size()));
-        expect_throw([&] { (void)edge_server.decrypt(byte_view(edge_pkt.data(), edge_pkt.size())); },
-                     "replay at exactly the window edge should be rejected");
+        INFO("replay at exactly the window edge should be rejected");
+        CHECK_THROWS_AS((void)(edge_server.decrypt(byte_view(edge_pkt.data(), edge_pkt.size()))),
+                        std::runtime_error);
     }
 
     auto oo_salt = Crypto::generate_session_salt();
@@ -159,7 +158,8 @@ void test_crypto_roundtrip_and_failures() {
     (void)packet0;
     (void)out_of_order_server.decrypt(byte_view(packet2.data(), packet2.size()));
     auto late_packet = out_of_order_server.decrypt(byte_view(packet1.data(), packet1.size()));
-    expect_true(late_packet == plain, "unseen out-of-order packet within replay window should work");
+    CHECK_MESSAGE(late_packet == plain,
+                  "unseen out-of-order packet within replay window should work");
 
     // Regression: an AUTH-FAILED packet must NOT advance the replay window.
     // Otherwise one forged high-counter datagram permanently desyncs the
@@ -170,19 +170,20 @@ void test_crypto_roundtrip_and_failures() {
         Crypto a_server(key, NONCE_DIR_SERVER);
         auto pkt0 = a_client.encrypt(byte_view(plain.data(), plain.size())); // counter 0
         auto pkt1 = a_client.encrypt(byte_view(plain.data(), plain.size())); // counter 1
-        expect_true(a_server.decrypt(byte_view(pkt0.data(), pkt0.size())) == plain,
+        CHECK_MESSAGE(a_server.decrypt(byte_view(pkt0.data(), pkt0.size())) == plain,
                     "pkt0 accepted (seeds window)");
 
         // Forge a packet with a huge counter (attacker-chosen) and a bad tag:
         // overwrite the nonce counter bytes; the wrong IV makes the GCM tag fail.
         auto forged = pkt0;
         for (int i = 0; i < 8; ++i) forged[SESSION_SALT_SIZE + i] = 0xFF;
-        expect_throw([&] { (void)a_server.decrypt(byte_view(forged.data(), forged.size())); },
-                     "forged high-counter packet must fail authentication");
+        INFO("forged high-counter packet must fail authentication");
+        CHECK_THROWS_AS((void)(a_server.decrypt(byte_view(forged.data(), forged.size()))),
+                        std::runtime_error);
 
         // pkt1 (counter 1) must still decrypt: the forged packet did not poison
         // the window (verify-then-commit).
-        expect_true(a_server.decrypt(byte_view(pkt1.data(), pkt1.size())) == plain,
+        CHECK_MESSAGE(a_server.decrypt(byte_view(pkt1.data(), pkt1.size())) == plain,
                     "pkt1 must still be accepted after a forged packet (window not poisoned)");
     }
 }
@@ -193,38 +194,38 @@ void test_crypto_roundtrip_and_failures() {
 // tag check is skipped there, an unauthenticated packet is accepted -- and in
 // server mode the first-packet bypass means it also gets committed to the replay
 // window and allocated a session.
-void test_crypto_empty_payload_is_authenticated() {
+TEST_CASE("test_crypto_empty_payload_is_authenticated") {
     const std::string key = "remote_test_key_123456";
     auto salt = Crypto::generate_session_salt();
     Crypto sender(key, NONCE_DIR_CLIENT, salt);
     auto wire = sender.encrypt(byte_view{});
-    expect_true(wire.size() == SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE,
+    CHECK_MESSAGE(wire.size() == SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE,
                 "empty plaintext must encrypt to salt+nonce+tag only");
 
     Crypto honest(key, NONCE_DIR_SERVER, {}, true);
-    expect_true(honest.decrypt(byte_view(wire)).empty(),
+    CHECK_MESSAGE(honest.decrypt(byte_view(wire)).empty(),
                 "honest empty packet decrypts to zero bytes");
 
     std::vector<uint8_t> forged = wire;
     for (size_t i = wire.size() - TAG_SIZE; i < forged.size(); ++i) forged[i] ^= 0xA5;
     Crypto victim(key, NONCE_DIR_SERVER, {}, true);
-    expect_throw([&] { (void)victim.decrypt(byte_view(forged)); },
-                 "forged empty-payload packet must fail authentication");
+    INFO("forged empty-payload packet must fail authentication");
+    CHECK_THROWS_AS((void)(victim.decrypt(byte_view(forged))), std::runtime_error);
 
     // A zero-length ciphertext still carries the counter in the nonce, so the
     // replay window must behave exactly as it does for a non-empty packet:
     // replaying the honest one is rejected.
     Crypto window(key, NONCE_DIR_SERVER, {}, true);
     (void)window.decrypt(byte_view(wire));
-    expect_throw([&] { (void)window.decrypt(byte_view(wire)); },
-                 "replayed empty packet must be rejected");
+    INFO("replayed empty packet must be rejected");
+    CHECK_THROWS_AS((void)(window.decrypt(byte_view(wire))), std::runtime_error);
 }
 
 // The server allocates a session from the first datagram, keyed by the salt it
 // carries. That allocation must never happen for a packet whose tag did not
 // verify -- otherwise one spoofed 44-byte datagram per (ip,port) is enough to
 // burn a session slot.
-void test_server_empty_packet_without_tag_does_not_create_session() {
+TEST_CASE("test_server_empty_packet_without_tag_does_not_create_session") {
     const std::string key = "remote_test_key_123456";
     asio::io_context io;
     auto server = std::make_shared<KCPServer>(io, 8389, key, "127.0.0.1");
@@ -237,9 +238,9 @@ void test_server_empty_packet_without_tag_does_not_create_session() {
     std::vector<uint8_t> forged = honest;
     for (size_t i = honest.size() - TAG_SIZE; i < forged.size(); ++i) forged[i] ^= 0xA5;
 
-    expect_true(server->route_datagram(ep, byte_view(forged)) == nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(forged)) == nullptr,
                 "forged empty-payload datagram must not create a session");
-    expect_true(server->route_datagram(ep, byte_view(honest)) != nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(honest)) != nullptr,
                 "honest empty-payload datagram should create a session");
 }
 
@@ -250,18 +251,18 @@ std::vector<uint8_t> build_request(std::string_view host, uint16_t port) {
     return req;
 }
 
-void test_socks5_parser() {
+TEST_CASE("test_socks5_parser") {
     auto ipv4 = build_request("1.2.3.4", 443);
     auto parsed = parse_socks5_request(ipv4);
-    expect_true(parsed.status == SOCKS5ParseStatus::Complete, "IPv4 request did not parse");
-    expect_true(parsed.request.has_value(), "IPv4 request missing");
-    expect_true(parsed.request->host == "1.2.3.4", "IPv4 host mismatch");
-    expect_true(parsed.request->port == 443, "IPv4 port mismatch");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Complete, "IPv4 request did not parse");
+    CHECK_MESSAGE(parsed.request.has_value(), "IPv4 request missing");
+    CHECK_MESSAGE(parsed.request->host == "1.2.3.4", "IPv4 host mismatch");
+    CHECK_MESSAGE(parsed.request->port == 443, "IPv4 port mismatch");
 
     for (size_t i = 0; i < ipv4.size(); ++i) {
         std::vector<uint8_t> partial(ipv4.begin(), ipv4.begin() + static_cast<std::ptrdiff_t>(i));
         auto r = parse_socks5_request(partial);
-        expect_true(r.status == SOCKS5ParseStatus::NeedMore, "partial IPv4 should need more");
+        CHECK_MESSAGE(r.status == SOCKS5ParseStatus::NeedMore, "partial IPv4 should need more");
     }
 
     auto domain = build_request("example.com", 80);
@@ -270,87 +271,93 @@ void test_socks5_parser() {
         std::vector<uint8_t> partial(domain_complete.begin(),
                                      domain_complete.begin() + static_cast<std::ptrdiff_t>(i));
         auto r = parse_socks5_request(partial);
-        expect_true(r.status == SOCKS5ParseStatus::NeedMore, "partial domain should need more");
+        CHECK_MESSAGE(r.status == SOCKS5ParseStatus::NeedMore, "partial domain should need more");
     }
     domain.push_back('G');
     domain.push_back('E');
     domain.push_back('T');
     parsed = parse_socks5_request(domain);
-    expect_true(parsed.status == SOCKS5ParseStatus::Complete, "domain request did not parse");
-    expect_true(parsed.request.has_value(), "domain request missing");
-    expect_true(parsed.request->host == "example.com", "domain host mismatch");
-    expect_true(parsed.request->initial_payload.size() == 3, "extra payload not preserved");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Complete, "domain request did not parse");
+    CHECK_MESSAGE(parsed.request.has_value(), "domain request missing");
+    CHECK_MESSAGE(parsed.request->host == "example.com", "domain host mismatch");
+    CHECK_MESSAGE(parsed.request->initial_payload.size() == 3, "extra payload not preserved");
 
     auto ipv6 = build_request("2001:db8::1", 8443);
     for (size_t i = 0; i < ipv6.size(); ++i) {
         std::vector<uint8_t> partial(ipv6.begin(), ipv6.begin() + static_cast<std::ptrdiff_t>(i));
         auto r = parse_socks5_request(partial);
-        expect_true(r.status == SOCKS5ParseStatus::NeedMore, "partial IPv6 should need more");
+        CHECK_MESSAGE(r.status == SOCKS5ParseStatus::NeedMore, "partial IPv6 should need more");
     }
     parsed = parse_socks5_request(ipv6);
-    expect_true(parsed.status == SOCKS5ParseStatus::Complete, "IPv6 request did not parse");
-    expect_true(parsed.request.has_value(), "IPv6 request missing");
-    expect_true(parsed.request->port == 8443, "IPv6 port mismatch");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Complete, "IPv6 request did not parse");
+    CHECK_MESSAGE(parsed.request.has_value(), "IPv6 request missing");
+    CHECK_MESSAGE(parsed.request->port == 8443, "IPv6 port mismatch");
 
     std::vector<uint8_t> unsupported{SOCKS5_VERSION, 0x02, 0x00, SOCKS5_ATYP_IPV4,
                                      127, 0, 0, 1, 0, 80};
     parsed = parse_socks5_request(unsupported);
-    expect_true(parsed.status == SOCKS5ParseStatus::Complete, "unsupported command should parse");
-    expect_true(parsed.request->cmd == 0x02, "unsupported command value lost");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Complete, "unsupported command should parse");
+    CHECK_MESSAGE(parsed.request->cmd == 0x02, "unsupported command value lost");
 
     std::vector<uint8_t> udp_assoc{SOCKS5_VERSION, SOCKS5_CMD_UDP_ASSOCIATE, 0x00,
                                    SOCKS5_ATYP_IPV4, 127, 0, 0, 1, 0, 53};
     parsed = parse_socks5_request(udp_assoc);
-    expect_true(parsed.status == SOCKS5ParseStatus::Complete, "UDP ASSOCIATE should parse before rejection");
-    expect_true(parsed.request->cmd == SOCKS5_CMD_UDP_ASSOCIATE, "UDP ASSOCIATE command value lost");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Complete,
+                  "UDP ASSOCIATE should parse before rejection");
+    CHECK_MESSAGE(parsed.request->cmd == SOCKS5_CMD_UDP_ASSOCIATE,
+                  "UDP ASSOCIATE command value lost");
 
     std::vector<uint8_t> bad_version = ipv4;
     bad_version[0] = 0x04;
     parsed = parse_socks5_request(bad_version);
-    expect_true(parsed.status == SOCKS5ParseStatus::Invalid, "bad version should be invalid");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Invalid, "bad version should be invalid");
 
     // RFC 1928 reserves the third byte and requires it to be 0x00. It used to be
     // read by nothing at all, so a request that set it was silently accepted.
-    expect_true(ipv4[2] == 0x00, "the request builder must emit RSV=0");
+    CHECK_MESSAGE(ipv4[2] == 0x00, "the request builder must emit RSV=0");
     std::vector<uint8_t> bad_rsv = ipv4;
     bad_rsv[2] = 0x01;
     parsed = parse_socks5_request(bad_rsv);
-    expect_true(parsed.status == SOCKS5ParseStatus::Invalid,
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Invalid,
                 "a non-zero SOCKS5 reserved byte should be invalid");
 
     std::vector<uint8_t> bad_atyp{SOCKS5_VERSION, SOCKS5_CMD_CONNECT, 0x00, 0x09, 0x00, 0x50};
     parsed = parse_socks5_request(bad_atyp);
-    expect_true(parsed.status == SOCKS5ParseStatus::Invalid, "unsupported ATYP should be invalid");
+    CHECK_MESSAGE(parsed.status == SOCKS5ParseStatus::Invalid,
+                  "unsupported ATYP should be invalid");
 }
 
-void test_socks5_reply_bind_address() {
+TEST_CASE("test_socks5_reply_bind_address") {
     SOCKS5Response resp;
     resp.reply = SOCKS5_REPLY_SUCCEEDED;
     auto zero = resp.build();
-    expect_true(zero.size() == 10, "zero bind reply size mismatch");
-    expect_true(zero[3] == SOCKS5_ATYP_IPV4, "zero bind should be IPv4");
+    CHECK_MESSAGE(zero.size() == 10, "zero bind reply size mismatch");
+    CHECK_MESSAGE(zero[3] == SOCKS5_ATYP_IPV4, "zero bind should be IPv4");
 
     resp.host = "127.0.0.1";
     resp.port = 54321;
     auto local = resp.build();
-    expect_true(local.size() == 10, "IPv4 bind reply size mismatch");
-    expect_true(local[4] == 127 && local[7] == 1, "IPv4 bind reply mismatch");
+    CHECK_MESSAGE(local.size() == 10, "IPv4 bind reply size mismatch");
+    // doctest decomposes binary comparisons only; a && chain would be reported
+    // as "Expression Too Complex", so each byte gets its own check.
+    CHECK_MESSAGE(local[4] == 127, "IPv4 bind reply mismatch (byte 4)");
+    CHECK_MESSAGE(local[7] == 1, "IPv4 bind reply mismatch (byte 7)");
 }
 
 // The client used to validate the server's CONNECT reply with a two-line check
 // (bytes >= 2 and byte[1] == 0), so a wrong-version, wrong-ATYP or truncated
 // reply was accepted as a live tunnel and any trailing payload was dropped.
-void test_socks5_reply_parser() {
+TEST_CASE("test_socks5_reply_parser") {
     // VER REP RSV ATYP BND.ADDR BND.PORT for a complete IPv4 reply.
     std::vector<uint8_t> ipv4{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00,
                               SOCKS5_ATYP_IPV4, 93, 184, 216, 34, 0x01, 0xBB};
     auto parsed = parse_socks5_reply(ipv4);
-    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "IPv4 reply did not parse");
-    expect_true(parsed.reply.has_value(), "IPv4 reply missing");
-    expect_true(parsed.reply->reply == SOCKS5_REPLY_SUCCEEDED, "IPv4 reply code mismatch");
-    expect_true(parsed.reply->host == "93.184.216.34", "IPv4 bind host mismatch");
-    expect_true(parsed.reply->port == 443, "IPv4 bind port mismatch");
-    expect_true(parsed.reply->length == 10, "IPv4 reply length mismatch");
+    CHECK_MESSAGE(parsed.status == SOCKS5ReplyStatus::Complete, "IPv4 reply did not parse");
+    CHECK_MESSAGE(parsed.reply.has_value(), "IPv4 reply missing");
+    CHECK_MESSAGE(parsed.reply->reply == SOCKS5_REPLY_SUCCEEDED, "IPv4 reply code mismatch");
+    CHECK_MESSAGE(parsed.reply->host == "93.184.216.34", "IPv4 bind host mismatch");
+    CHECK_MESSAGE(parsed.reply->port == 443, "IPv4 bind port mismatch");
+    CHECK_MESSAGE(parsed.reply->length == 10, "IPv4 reply length mismatch");
 
     // Every strict prefix must report NeedMore, never Complete: a reply split
     // across KCP messages has to be accumulated, not acted upon early.
@@ -358,13 +365,13 @@ void test_socks5_reply_parser() {
         std::vector<uint8_t> partial(ipv4.begin(),
                                      ipv4.begin() + static_cast<std::ptrdiff_t>(i));
         auto r = parse_socks5_reply(partial);
-        expect_true(r.status == SOCKS5ReplyStatus::NeedMore, "partial reply should need more");
-        expect_true(!r.reply.has_value(), "partial reply must not engage a reply");
+        CHECK_MESSAGE(r.status == SOCKS5ReplyStatus::NeedMore, "partial reply should need more");
+        CHECK_MESSAGE(!r.reply.has_value(), "partial reply must not engage a reply");
     }
 
     // The old check accepted a two-byte prefix as success.
     std::vector<uint8_t> two_bytes{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED};
-    expect_true(parse_socks5_reply(two_bytes).status == SOCKS5ReplyStatus::NeedMore,
+    CHECK_MESSAGE(parse_socks5_reply(two_bytes).status == SOCKS5ReplyStatus::NeedMore,
                 "a two-byte reply must not count as complete");
 
     // Target payload can ride along in the same KCP message. It must be left
@@ -374,16 +381,17 @@ void test_socks5_reply_parser() {
     with_payload.push_back('E');
     with_payload.push_back('T');
     parsed = parse_socks5_reply(with_payload);
-    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "reply with payload did not parse");
-    expect_true(parsed.reply->length == 10, "reply length must exclude trailing payload");
-    expect_true(with_payload.size() - parsed.reply->length == 3, "trailing payload not preserved");
+    CHECK_MESSAGE(parsed.status == SOCKS5ReplyStatus::Complete, "reply with payload did not parse");
+    CHECK_MESSAGE(parsed.reply->length == 10, "reply length must exclude trailing payload");
+    CHECK_MESSAGE(with_payload.size() - parsed.reply->length == 3,
+                  "trailing payload not preserved");
 
     // A non-zero REP still parses (the client maps it to an error reply).
     std::vector<uint8_t> refused = ipv4;
     refused[1] = SOCKS5_REPLY_CONNECTION_REFUSED;
     parsed = parse_socks5_reply(refused);
-    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "rejected reply did not parse");
-    expect_true(parsed.reply->reply == SOCKS5_REPLY_CONNECTION_REFUSED, "reply code lost");
+    CHECK_MESSAGE(parsed.status == SOCKS5ReplyStatus::Complete, "rejected reply did not parse");
+    CHECK_MESSAGE(parsed.reply->reply == SOCKS5_REPLY_CONNECTION_REFUSED, "reply code lost");
 
     // IPv6 bind address.
     std::vector<uint8_t> ipv6{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, SOCKS5_ATYP_IPV6};
@@ -394,13 +402,13 @@ void test_socks5_reply_parser() {
     for (size_t i = 0; i < ipv6.size(); ++i) {
         std::vector<uint8_t> partial(ipv6.begin(),
                                      ipv6.begin() + static_cast<std::ptrdiff_t>(i));
-        expect_true(parse_socks5_reply(partial).status == SOCKS5ReplyStatus::NeedMore,
+        CHECK_MESSAGE(parse_socks5_reply(partial).status == SOCKS5ReplyStatus::NeedMore,
                     "partial IPv6 reply should need more");
     }
     parsed = parse_socks5_reply(ipv6);
-    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "IPv6 reply did not parse");
-    expect_true(parsed.reply->length == 22, "IPv6 reply length mismatch");
-    expect_true(parsed.reply->port == 80, "IPv6 bind port mismatch");
+    CHECK_MESSAGE(parsed.status == SOCKS5ReplyStatus::Complete, "IPv6 reply did not parse");
+    CHECK_MESSAGE(parsed.reply->length == 22, "IPv6 reply length mismatch");
+    CHECK_MESSAGE(parsed.reply->port == 80, "IPv6 bind port mismatch");
 
     // Domain bind address, including its variable-length form.
     std::vector<uint8_t> domain{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00,
@@ -412,37 +420,37 @@ void test_socks5_reply_parser() {
     for (size_t i = 0; i < domain.size(); ++i) {
         std::vector<uint8_t> partial(domain.begin(),
                                      domain.begin() + static_cast<std::ptrdiff_t>(i));
-        expect_true(parse_socks5_reply(partial).status == SOCKS5ReplyStatus::NeedMore,
+        CHECK_MESSAGE(parse_socks5_reply(partial).status == SOCKS5ReplyStatus::NeedMore,
                     "partial domain reply should need more");
     }
     parsed = parse_socks5_reply(domain);
-    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "domain reply did not parse");
-    expect_true(parsed.reply->host == "example.com", "domain bind host mismatch");
-    expect_true(parsed.reply->port == 80, "domain bind port mismatch");
-    expect_true(parsed.reply->length == 18, "domain reply length mismatch");
+    CHECK_MESSAGE(parsed.status == SOCKS5ReplyStatus::Complete, "domain reply did not parse");
+    CHECK_MESSAGE(parsed.reply->host == "example.com", "domain bind host mismatch");
+    CHECK_MESSAGE(parsed.reply->port == 80, "domain bind port mismatch");
+    CHECK_MESSAGE(parsed.reply->length == 18, "domain reply length mismatch");
 
     // Malformed replies must be Invalid, not Complete and not NeedMore (a
     // NeedMore here would hang the handshake until the deadline).
     std::vector<uint8_t> bad_ver = ipv4;
     bad_ver[0] = 0x04;
-    expect_true(parse_socks5_reply(bad_ver).status == SOCKS5ReplyStatus::Invalid,
+    CHECK_MESSAGE(parse_socks5_reply(bad_ver).status == SOCKS5ReplyStatus::Invalid,
                 "bad reply version should be invalid");
 
     std::vector<uint8_t> bad_rsv = ipv4;
     bad_rsv[2] = 0x01;
-    expect_true(parse_socks5_reply(bad_rsv).status == SOCKS5ReplyStatus::Invalid,
+    CHECK_MESSAGE(parse_socks5_reply(bad_rsv).status == SOCKS5ReplyStatus::Invalid,
                 "a non-zero reply reserved byte should be invalid");
 
     std::vector<uint8_t> bad_atyp{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, 0x09, 0, 0};
-    expect_true(parse_socks5_reply(bad_atyp).status == SOCKS5ReplyStatus::Invalid,
+    CHECK_MESSAGE(parse_socks5_reply(bad_atyp).status == SOCKS5ReplyStatus::Invalid,
                 "unsupported reply ATYP should be invalid");
 
     std::vector<uint8_t> empty_domain{SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00,
                                       SOCKS5_ATYP_DOMAIN, 0x00};
-    expect_true(parse_socks5_reply(empty_domain).status == SOCKS5ReplyStatus::Invalid,
+    CHECK_MESSAGE(parse_socks5_reply(empty_domain).status == SOCKS5ReplyStatus::Invalid,
                 "empty reply domain should be invalid");
 
-    expect_true(parse_socks5_reply({}).status == SOCKS5ReplyStatus::NeedMore,
+    CHECK_MESSAGE(parse_socks5_reply({}).status == SOCKS5ReplyStatus::NeedMore,
                 "an empty buffer should ask for more");
 
     // Round-trip: what the server builds must parse back to the same values, so
@@ -452,42 +460,45 @@ void test_socks5_reply_parser() {
     wire.host = "127.0.0.1";
     wire.port = 54321;
     parsed = parse_socks5_reply(wire.build());
-    expect_true(parsed.status == SOCKS5ReplyStatus::Complete, "built reply did not parse");
-    expect_true(parsed.reply->host == "127.0.0.1", "built reply host mismatch");
-    expect_true(parsed.reply->port == 54321, "built reply port mismatch");
-    expect_true(parsed.reply->length == wire.build().size(), "built reply length mismatch");
+    CHECK_MESSAGE(parsed.status == SOCKS5ReplyStatus::Complete, "built reply did not parse");
+    CHECK_MESSAGE(parsed.reply->host == "127.0.0.1", "built reply host mismatch");
+    CHECK_MESSAGE(parsed.reply->port == 54321, "built reply port mismatch");
+    CHECK_MESSAGE(parsed.reply->length == wire.build().size(), "built reply length mismatch");
 }
 
-void test_restricted_targets() {
+TEST_CASE("test_restricted_targets") {
     // IPv4 basics.
-    expect_true(is_restricted_target(asio::ip::make_address("127.0.0.1")), "v4 loopback");
-    expect_true(is_restricted_target(asio::ip::make_address("10.1.2.3")), "v4 private 10/8");
-    expect_true(is_restricted_target(asio::ip::make_address("192.168.1.1")), "v4 private 192.168");
-    expect_true(!is_restricted_target(asio::ip::make_address("1.1.1.1")), "v4 public allowed");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("127.0.0.1")), "v4 loopback");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("10.1.2.3")), "v4 private 10/8");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("192.168.1.1")),
+                  "v4 private 192.168");
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("1.1.1.1")), "v4 public allowed");
 
     // IPv4-mapped ::ffff:a.b.c.d inherits the IPv4 classification.
-    expect_true(is_restricted_target(asio::ip::make_address("::ffff:127.0.0.1")), "v4-mapped loopback");
-    expect_true(!is_restricted_target(asio::ip::make_address("::ffff:1.1.1.1")), "v4-mapped public allowed");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("::ffff:127.0.0.1")),
+                  "v4-mapped loopback");
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("::ffff:1.1.1.1")),
+                  "v4-mapped public allowed");
 
     // Private/non-routable IPv6 ranges. fec0::/10 (site-local) is neither
     // fe80::/10 (link-local) nor fc00::/7 (unique-local), so it used to be the
     // one private IPv6 range the SSRF guard let through.
-    expect_true(is_restricted_target(asio::ip::make_address("fec0::1")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("fec0::1")),
                 "v6 site-local fec0::/10");
-    expect_true(is_restricted_target(asio::ip::make_address("feff::1")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("feff::1")),
                 "v6 site-local upper bound feff::");
-    expect_true(is_restricted_target(asio::ip::make_address("fc00::1")), "v6 unique-local");
-    expect_true(is_restricted_target(asio::ip::make_address("fe80::1")), "v6 link-local");
-    expect_true(!is_restricted_target(asio::ip::make_address("2001:4860:4860::8888")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("fc00::1")), "v6 unique-local");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("fe80::1")), "v6 link-local");
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("2001:4860:4860::8888")),
                 "v6 public allowed");
 
     // 6to4 (2002::/16) embeds the IPv4 address in bytes 2-5: it must not be
     // usable to tunnel into the blocked IPv4 ranges.
-    expect_true(is_restricted_target(asio::ip::make_address("2002:7f00:0001::1")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("2002:7f00:0001::1")),
                 "6to4 embedding 127.0.0.1");
-    expect_true(is_restricted_target(asio::ip::make_address("2002:0a00::1")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("2002:0a00::1")),
                 "6to4 embedding 10.0.0.1");
-    expect_true(!is_restricted_target(asio::ip::make_address("2002:0101:0101::1")),
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("2002:0101:0101::1")),
                 "6to4 embedding public 1.1.1.1 allowed");
 
     // Teredo (2001:0000::/32): server IPv4 in bytes 4-7, bit-inverted client
@@ -497,7 +508,7 @@ void test_restricted_targets() {
         asio::ip::address_v6::bytes_type b{};
         b[0] = 0x20; b[1] = 0x01; b[2] = 0x00; b[3] = 0x00;
         b[12] = 0x80; b[13] = 0xff; b[14] = 0xff; b[15] = 0xfe;
-        expect_true(is_restricted_target(asio::ip::address_v6(b)),
+        CHECK_MESSAGE(is_restricted_target(asio::ip::address_v6(b)),
                     "teredo embedding loopback client IPv4");
     }
     {
@@ -506,7 +517,7 @@ void test_restricted_targets() {
         b[0] = 0x20; b[1] = 0x01; b[2] = 0x00; b[3] = 0x00;
         b[4] = 0x7f; b[5] = 0x00; b[6] = 0x00; b[7] = 0x01;
         b[12] = 0xf7; b[13] = 0xf7; b[14] = 0xf7; b[15] = 0xf7;
-        expect_true(is_restricted_target(asio::ip::address_v6(b)),
+        CHECK_MESSAGE(is_restricted_target(asio::ip::address_v6(b)),
                     "teredo embedding loopback server IPv4");
     }
     {
@@ -515,37 +526,37 @@ void test_restricted_targets() {
         b[0] = 0x20; b[1] = 0x01; b[2] = 0x00; b[3] = 0x00;
         b[4] = 0x01; b[5] = 0x02; b[6] = 0x03; b[7] = 0x04;
         b[12] = 0xf7; b[13] = 0xf7; b[14] = 0xf7; b[15] = 0xf7;
-        expect_true(!is_restricted_target(asio::ip::address_v6(b)),
+        CHECK_MESSAGE(!is_restricted_target(asio::ip::address_v6(b)),
                     "teredo with public IPv4s allowed");
     }
 
     // IPv4-compatible ::a.b.c.d (deprecated ::/96): tail bytes are the IPv4.
-    expect_true(is_restricted_target(asio::ip::make_address("::c0a8:0101")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("::c0a8:0101")),
                 "v4-compatible embedding 192.168.1.1");
-    expect_true(!is_restricted_target(asio::ip::make_address("::0101:0101")),
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("::0101:0101")),
                 "v4-compatible embedding public 1.1.1.1 allowed");
 
     // NAT64 well-known prefix 64:ff9b::/96 (and local-use 64:ff9b:1::/48)
     // embed the translated IPv4 in the last 4 bytes.
-    expect_true(is_restricted_target(asio::ip::make_address("64:ff9b::7f00:0001")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("64:ff9b::7f00:0001")),
                 "NAT64 embedding 127.0.0.1");
-    expect_true(is_restricted_target(asio::ip::make_address("64:ff9b::c0a8:0101")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("64:ff9b::c0a8:0101")),
                 "NAT64 embedding 192.168.1.1");
-    expect_true(is_restricted_target(asio::ip::make_address("64:ff9b:1::0a00:0001")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("64:ff9b:1::0a00:0001")),
                 "NAT64 local-use embedding 10.0.0.1");
-    expect_true(!is_restricted_target(asio::ip::make_address("64:ff9b::0101:0101")),
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("64:ff9b::0101:0101")),
                 "NAT64 embedding public 1.1.1.1 allowed");
 
     // Regular IPv6 classes unchanged.
-    expect_true(is_restricted_target(asio::ip::make_address("::1")), "v6 loopback");
-    expect_true(is_restricted_target(asio::ip::make_address("fe80::1")), "v6 link-local");
-    expect_true(is_restricted_target(asio::ip::make_address("fd12:3456::1")), "v6 ULA");
-    expect_true(is_restricted_target(asio::ip::make_address("2001:db8::1")), "v6 documentation");
-    expect_true(!is_restricted_target(asio::ip::make_address("2606:4700:4700::1111")),
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("::1")), "v6 loopback");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("fe80::1")), "v6 link-local");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("fd12:3456::1")), "v6 ULA");
+    CHECK_MESSAGE(is_restricted_target(asio::ip::make_address("2001:db8::1")), "v6 documentation");
+    CHECK_MESSAGE(!is_restricted_target(asio::ip::make_address("2606:4700:4700::1111")),
                 "v6 global unicast allowed");
 }
 
-void test_async_read_some_rejects_stacked_reads() {
+TEST_CASE("test_async_read_some_rejects_stacked_reads") {
     asio::io_context io;
     auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
                                             Crypto::generate_session_salt());
@@ -565,7 +576,7 @@ void test_async_read_some_rejects_stacked_reads() {
     session->async_read_some(asio::buffer(first_buf),
         [&](std::error_code ec, size_t) {
             first_called = true;
-            expect_true(ec == asio::error::operation_aborted,
+            CHECK_MESSAGE(ec == asio::error::operation_aborted,
                         "first pending read should remain pending until stop");
         });
     session->async_read_some(asio::buffer(second_buf),
@@ -575,18 +586,18 @@ void test_async_read_some_rejects_stacked_reads() {
         });
 
     io.poll();
-    expect_true(!first_called, "first read handler should not be overwritten or completed");
-    expect_true(second_called, "second stacked read handler should be called");
-    expect_true(second_ec == asio::error::already_started,
+    CHECK_MESSAGE(!first_called, "first read handler should not be overwritten or completed");
+    CHECK_MESSAGE(second_called, "second stacked read handler should be called");
+    CHECK_MESSAGE(second_ec == asio::error::already_started,
                 "second stacked read should receive already_started");
 
     session->stop();
     io.restart();
     io.poll();
-    expect_true(first_called, "first read should be aborted during stop");
+    CHECK_MESSAGE(first_called, "first read should be aborted during stop");
 }
 
-void test_kcp_config_line() {
+TEST_CASE("test_kcp_config_line") {
     // The startup log line is the contract between the two ends of a tunnel:
     // both peers must print the same KCP settings or ikcp silently discards
     // the other's packets (the conv mismatch symptom). Pin the exact string so
@@ -599,7 +610,7 @@ void test_kcp_config_line() {
     // only ~14 Mbps at the 190ms RTT of a China -> US-west path, and measurement
     // on that path showed the window (not the link, which sustains >1 Gbps at
     // the VPS) as the per-tunnel ceiling. See the comment on KCP_SNDWND.
-    expect_true(line ==
+    CHECK_MESSAGE(line ==
                     "KCP config conv=1 mtu=1400 nodelay=1 interval=10 "
                     "resend=5 nc=1 sndWnd=1024 rcvWnd=1024 timeout=60s",
                 "kcp_config_line canonical baseline changed");
@@ -609,7 +620,7 @@ void test_kcp_config_line() {
     // themselves (not from a second copy of the format string) so this test
     // fails if a field is ever rendered from a stale literal.
     auto has = [&](const std::string& token) {
-        expect_true(line.find(token) != std::string::npos,
+        CHECK_MESSAGE(line.find(token) != std::string::npos,
                     ("kcp_config_line missing token: " + token).c_str());
     };
     has("conv=" + std::to_string(KCP_CONV));
@@ -623,7 +634,7 @@ void test_kcp_config_line() {
     has("timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s");
 }
 
-void test_socket_buffer_clamp_detection() {
+TEST_CASE("test_socket_buffer_clamp_detection") {
     // The clamp this detects is invisible at the call site: setsockopt() returns
     // success while the kernel silently caps the request at net.core.rmem_max /
     // wmem_max, so the only signal is the value getsockopt() reports back. If
@@ -636,36 +647,37 @@ void test_socket_buffer_clamp_detection() {
     // sysctl that caused it -- the numbers are what make the line actionable.
     const std::string clamped = describe_buffer_clamp(
         "so_rcvbuf", "net.core.rmem_max", 4 * 1024 * 1024, 212992);
-    expect_true(!clamped.empty(), "a clamped buffer must be reported");
-    expect_true(clamped.find("so_rcvbuf") != std::string::npos,
+    CHECK_MESSAGE(!clamped.empty(), "a clamped buffer must be reported");
+    CHECK_MESSAGE(clamped.find("so_rcvbuf") != std::string::npos,
                 "clamp message must name the socket option");
-    expect_true(clamped.find("4194304") != std::string::npos,
+    CHECK_MESSAGE(clamped.find("4194304") != std::string::npos,
                 "clamp message must carry the requested size");
-    expect_true(clamped.find("212992") != std::string::npos,
+    CHECK_MESSAGE(clamped.find("212992") != std::string::npos,
                 "clamp message must carry the effective size");
-    expect_true(clamped.find("net.core.rmem_max") != std::string::npos,
+    CHECK_MESSAGE(clamped.find("net.core.rmem_max") != std::string::npos,
                 "clamp message must name the sysctl to raise");
 
     // Equal is not clamped: that is the ordinary Windows / already-tuned case
     // and must stay silent, or every startup on a healthy host logs a warning.
-    expect_true(describe_buffer_clamp("so_sndbuf", "net.core.wmem_max",
-                                      4 * 1024 * 1024, 4 * 1024 * 1024).empty(),
-                "an exactly-honored request must not be reported");
+    CHECK_MESSAGE(
+        describe_buffer_clamp("so_sndbuf", "net.core.wmem_max", 4 * 1024 * 1024, 4 * 1024 * 1024)
+            .empty(),
+        "an exactly-honored request must not be reported");
 
     // Linux reports a buffer it doubled, so a value above the request is the
     // normal success path there too -- and it must not be reported as a clamp.
-    expect_true(describe_buffer_clamp("so_rcvbuf", "net.core.rmem_max",
-                                      4 * 1024 * 1024, 8 * 1024 * 1024).empty(),
-                "a buffer larger than requested must not be reported");
+    CHECK_MESSAGE(
+        describe_buffer_clamp("so_rcvbuf", "net.core.rmem_max", 4 * 1024 * 1024, 8 * 1024 * 1024)
+            .empty(),
+        "a buffer larger than requested must not be reported");
 
     // One byte short still counts: the predicate is the exact condition under
     // which there is nothing to say, not an approximate "close enough".
-    expect_true(!describe_buffer_clamp("so_rcvbuf", "net.core.rmem_max",
-                                       212992, 212991).empty(),
-                "any shortfall, however small, must be reported");
+    CHECK_MESSAGE(!describe_buffer_clamp("so_rcvbuf", "net.core.rmem_max", 212992, 212991).empty(),
+                  "any shortfall, however small, must be reported");
 }
 
-void test_kcp_wrapper_applies_constants() {
+TEST_CASE("test_kcp_wrapper_applies_constants") {
     // configure() must apply the KCP_* constants to the live KCP state. The
     // whole point of promoting the literals to named constants (b52a8bb) was
     // that the startup log (kcp_config_line) and the live KCP tuning can
@@ -675,34 +687,38 @@ void test_kcp_wrapper_applies_constants() {
     KcpWrapper wrapper(KCP_CONV);
     const kcp::Kcp& k = wrapper.kcp();
 
-    expect_true(k.conv() == KCP_CONV, "kcp conv mismatch");
-    expect_true(k.mtu() == static_cast<uint32_t>(KCP_MTU), "kcp mtu mismatch");
-    expect_true(k.snd_wnd() == static_cast<uint32_t>(KCP_SNDWND), "kcp snd_wnd mismatch");
-    expect_true(k.rcv_wnd() == static_cast<uint32_t>(KCP_RCVWND), "kcp rcv_wnd mismatch");
-    expect_true(k.nodelay() == static_cast<uint32_t>(KCP_NODELAY), "kcp nodelay mismatch");
-    expect_true(k.interval() == static_cast<uint32_t>(KCP_INTERVAL_MS), "kcp interval mismatch");
+    CHECK_MESSAGE(k.conv() == KCP_CONV, "kcp conv mismatch");
+    CHECK_MESSAGE(k.mtu() == static_cast<uint32_t>(KCP_MTU), "kcp mtu mismatch");
+    CHECK_MESSAGE(k.snd_wnd() == static_cast<uint32_t>(KCP_SNDWND), "kcp snd_wnd mismatch");
+    CHECK_MESSAGE(k.rcv_wnd() == static_cast<uint32_t>(KCP_RCVWND), "kcp rcv_wnd mismatch");
+    CHECK_MESSAGE(k.nodelay() == static_cast<uint32_t>(KCP_NODELAY), "kcp nodelay mismatch");
+    CHECK_MESSAGE(k.interval() == static_cast<uint32_t>(KCP_INTERVAL_MS), "kcp interval mismatch");
     // NoDelay() maps the resend argument to fastresend and nc to nocwnd.
-    expect_true(k.fastresend() == KCP_RESEND, "kcp fastresend (resend) mismatch");
-    expect_true(k.nocwnd() == KCP_NC, "kcp nocwnd (nc) mismatch");
+    CHECK_MESSAGE(k.fastresend() == KCP_RESEND, "kcp fastresend (resend) mismatch");
+    CHECK_MESSAGE(k.nocwnd() == KCP_NC, "kcp nocwnd (nc) mismatch");
 }
 
 // ---------------------------------------------------------------------------
 // FEC (forward error correction)
 // ---------------------------------------------------------------------------
 
-void test_parse_fec_config() {
+TEST_CASE("test_parse_fec_config") {
     // Enabled form: both shards parse, and the pair survives the codec's own
     // constraints (data >= 1, parity >= 1, data+parity <= 256, parity <= data).
     FecConfig fec;
-    expect_true(parse_fec_config("10:3", fec), "10:3 must parse");
-    expect_true(fec.enabled() && fec.data_shards == 10 && fec.parity_shards == 3,
-                "10:3 must yield enabled 10/3");
-    expect_true(fec.to_string() == "10:3", "to_string must render 10:3");
+    CHECK_MESSAGE(parse_fec_config("10:3", fec), "10:3 must parse");
+    // doctest decomposes binary comparisons only (see the && note above), and
+    // enabled() is a bool member -- so it gets its own check rather than a
+    // three-term &&.
+    CHECK_MESSAGE(fec.enabled(), "10:3 must yield an enabled config");
+    CHECK_MESSAGE(fec.data_shards == 10, "10:3 must yield 10 data shards");
+    CHECK_MESSAGE(fec.parity_shards == 3, "10:3 must yield 3 parity shards");
+    CHECK_MESSAGE(fec.to_string() == "10:3", "to_string must render 10:3");
 
     // Disabled form.
-    expect_true(parse_fec_config("0:0", fec), "0:0 must parse");
-    expect_true(!fec.enabled(), "0:0 must be disabled");
-    expect_true(fec.to_string() == "off", "disabled must render as off");
+    CHECK_MESSAGE(parse_fec_config("0:0", fec), "0:0 must parse");
+    CHECK_MESSAGE(!fec.enabled(), "0:0 must be disabled");
+    CHECK_MESSAGE(fec.to_string() == "off", "disabled must render as off");
 
     // Every reject case: no colon, empty halves, non-digits, trailing junk,
     // parity > data, the codec ceiling, and zero-data-nonzero-parity.
@@ -714,33 +730,32 @@ void test_parse_fec_config() {
                              "1000:1", "1:1000", "99999999999999999999:1"};
     for (const char* text : rejects) {
         FecConfig sink;
-        expect_true(!parse_fec_config(text, sink),
+        CHECK_MESSAGE(!parse_fec_config(text, sink),
                     (std::string("parse_fec_config must reject '") + text + "'").c_str());
     }
     // Leading zeros are a legitimate spelling of the same number; the gate must
     // count SIGNIFICANT digits, not characters.
     {
         FecConfig lead;
-        expect_true(parse_fec_config("010:03", lead),
+        CHECK_MESSAGE(parse_fec_config("010:03", lead),
                     "leading zeros must not be rejected by the digit-count gate");
-        expect_true(lead.data_shards == 10 && lead.parity_shards == 3,
-                    "010:03 must normalize to 10:3");
+        CHECK_MESSAGE(lead.data_shards == 10, "010:03 must normalize data to 10");
+        CHECK_MESSAGE(lead.parity_shards == 3, "010:03 must normalize parity to 3");
         FecConfig zeros;
-        expect_true(parse_fec_config("000:000", zeros),
+        CHECK_MESSAGE(parse_fec_config("000:000", zeros),
                     "all-zero halves must still parse as the disabled form");
-        expect_true(!zeros.enabled(), "000:000 must be disabled");
+        CHECK_MESSAGE(!zeros.enabled(), "000:000 must be disabled");
     }
-    std::cout << "  [ok] parse_fec_config accepts/rejects the documented pairs\n";
 }
 
-void test_fec_codec_repairs_lost_shards() {
+TEST_CASE("test_fec_codec_repairs_lost_shards") {
     using kcp::internal::FecDecoder;
     using kcp::internal::FecEncoder;
 
     auto encoder = FecEncoder::New(10, 3, 0);
     auto decoder = FecDecoder::New(10, 3);
-    expect_true(encoder != nullptr, "FecEncoder::New(10,3,0) must succeed");
-    expect_true(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
+    CHECK_MESSAGE(encoder != nullptr, "FecEncoder::New(10,3,0) must succeed");
+    CHECK_MESSAGE(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
 
     // One shard set of 10 data packets, each with a distinct payload pattern.
     // header_offset = 0: the frame is [fec_hdr(6)][len(2)][payload], i.e. the
@@ -763,19 +778,19 @@ void test_fec_codec_repairs_lost_shards() {
         payloads.push_back(std::vector<uint8_t>(frame.begin() + 8, frame.end()));
         for (auto& p : emitted) parity.push_back(std::move(p));
     }
-    expect_true(parity.size() == 3,
-                "a complete 10:3 set must emit exactly 3 parity packets");
+    CHECK_MESSAGE(parity.size() == 3, "a complete 10:3 set must emit exactly 3 parity packets");
 
     // The encoder seals each data packet: type flag = kTypeData at [4..6) and
     // the self-counting length field at [6..8).
     for (const auto& frame : wire_packets) {
         const uint16_t flag = static_cast<uint16_t>(frame[4]) |
                               static_cast<uint16_t>(frame[5] << 8);
-        expect_true(flag == kcp::kTypeData, "sealed data packet must carry kTypeData");
+        CHECK_MESSAGE(flag == kcp::kTypeData, "sealed data packet must carry kTypeData");
         const uint16_t declared = static_cast<uint16_t>(frame[6]) |
                                   static_cast<uint16_t>(frame[7] << 8);
-        expect_true(declared + 6 == frame.size(),
-                    "the FEC length field must count itself and span the packet minus its header");
+        CHECK_MESSAGE(
+            declared + 6 == frame.size(),
+            "the FEC length field must count itself and span the packet minus its header");
     }
 
     // Drop data shards 2, 5 and 9; feed the 7 survivors plus the 3 parity
@@ -789,7 +804,7 @@ void test_fec_codec_repairs_lost_shards() {
         auto got = decoder->Decode(wire_packets[i].data(), wire_packets[i].size());
         // Surviving native data packets are buffered by the decoder, never
         // handed back — only genuinely rebuilt shards are returned.
-        expect_true(got.empty(), "a surviving data packet must not be rebuilt");
+        CHECK_MESSAGE(got.empty(), "a surviving data packet must not be rebuilt");
         rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
                        std::make_move_iterator(got.end()));
     }
@@ -798,7 +813,7 @@ void test_fec_codec_repairs_lost_shards() {
         rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
                        std::make_move_iterator(got.end()));
     }
-    expect_true(rebuilt.size() == 3,
+    CHECK_MESSAGE(rebuilt.size() == 3,
                 (std::string("exactly the 3 lost shards must come back, got ") +
                  std::to_string(rebuilt.size())).c_str());
 
@@ -808,21 +823,20 @@ void test_fec_codec_repairs_lost_shards() {
     // (declared = 2 + payload). Shards come back in ascending seqid order.
     for (size_t k = 0; k < rebuilt.size(); k++) {
         const auto& shard = rebuilt[k];
-        expect_true(shard.size() >= 2, "rebuilt shard must carry its length field");
+        CHECK_MESSAGE(shard.size() >= 2, "rebuilt shard must carry its length field");
         const uint16_t declared = static_cast<uint16_t>(shard[0]) |
                                   static_cast<uint16_t>(shard[1] << 8);
         const auto& want = payloads[dropped[k]];
-        expect_true(declared == 2 + want.size(),
+        CHECK_MESSAGE(declared == 2 + want.size(),
                     "rebuilt shard length field must count itself plus the payload");
-        expect_true(declared <= shard.size(),
+        CHECK_MESSAGE(declared <= shard.size(),
                     "the declared payload must fit inside the possibly zero-extended shard");
-        expect_true(std::equal(want.begin(), want.end(), shard.begin() + 2),
+        CHECK_MESSAGE(std::equal(want.begin(), want.end(), shard.begin() + 2),
                     "rebuilt payload must match the lost original byte-for-byte");
     }
-    std::cout << "  [ok] fec codec rebuilds 3 lost shards of a 10:3 set\n";
 }
 
-void test_fec_frame_layout_at_crypto_reserve() {
+TEST_CASE("test_fec_frame_layout_at_crypto_reserve") {
     // The tunnel frames KCP datagrams at header_offset = FEC_CRYPTO_RESERVE,
     // i.e. the FEC header starts AFTER the 28-byte region the crypto layer
     // fills with salt+nonce. Only the e2e suite exercised that offset before,
@@ -834,8 +848,8 @@ void test_fec_frame_layout_at_crypto_reserve() {
 
     auto encoder = FecEncoder::New(10, 3, static_cast<int>(FEC_CRYPTO_RESERVE));
     auto decoder = FecDecoder::New(10, 3);
-    expect_true(encoder != nullptr, "FecEncoder::New(10,3,crypto_reserve) must succeed");
-    expect_true(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
+    CHECK_MESSAGE(encoder != nullptr, "FecEncoder::New(10,3,crypto_reserve) must succeed");
+    CHECK_MESSAGE(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
 
     // Exactly the largest datagram KCP can emit, which is the budget the
     // FEC_WIRE_DATAGRAM_MAX static_assert is built on.
@@ -861,7 +875,7 @@ void test_fec_frame_layout_at_crypto_reserve() {
         for (auto& p : emitted) parity.push_back(std::move(p));
     }
 
-    expect_true(parity.size() == 3, "a complete 10:3 set must emit exactly 3 parity packets");
+    CHECK_MESSAGE(parity.size() == 3, "a complete 10:3 set must emit exactly 3 parity packets");
 
     for (const auto& frame : frames) {
         // The reserve region stays byte-identical: the FEC seal only writes
@@ -870,16 +884,16 @@ void test_fec_frame_layout_at_crypto_reserve() {
         for (size_t j = 0; j < FEC_CRYPTO_RESERVE; j++) {
             reserve_untouched = reserve_untouched && frame[j] == 0xA5;
         }
-        expect_true(reserve_untouched,
+        CHECK_MESSAGE(reserve_untouched,
                     "the crypto reserve region must not be written by the FEC seal");
         const uint16_t flag = static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 4]) |
                               static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 5] << 8);
-        expect_true(flag == kcp::kTypeData, "sealed data packet must carry kTypeData");
+        CHECK_MESSAGE(flag == kcp::kTypeData, "sealed data packet must carry kTypeData");
         const uint16_t declared = static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 6]) |
                                   static_cast<uint16_t>(frame[FEC_CRYPTO_RESERVE + 7] << 8);
         // The length field counts itself: everything from payload_offset to
         // the end of the frame, which here is 2 + KCP_MTU.
-        expect_true(declared == 2 + kcp_len,
+        CHECK_MESSAGE(declared == 2 + kcp_len,
                     "declared must cover the length field plus the KCP datagram");
     }
 
@@ -902,7 +916,7 @@ void test_fec_frame_layout_at_crypto_reserve() {
         if (is_dropped) continue;
         auto got = decoder->Decode(frames[i].data() + FEC_CRYPTO_RESERVE,
                                    frames[i].size() - FEC_CRYPTO_RESERVE);
-        expect_true(got.empty(), "a surviving data packet must not be rebuilt");
+        CHECK_MESSAGE(got.empty(), "a surviving data packet must not be rebuilt");
     }
     for (const auto& p : parity) {
         auto got = decoder->Decode(p.data() + FEC_CRYPTO_RESERVE,
@@ -910,27 +924,26 @@ void test_fec_frame_layout_at_crypto_reserve() {
         rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
                        std::make_move_iterator(got.end()));
     }
-    expect_true(rebuilt.size() == 3,
+    CHECK_MESSAGE(rebuilt.size() == 3,
                 (std::string("exactly 3 shards must be rebuilt at the reserve offset, got ") +
                  std::to_string(rebuilt.size())).c_str());
 
     for (size_t k = 0; k < rebuilt.size(); k++) {
         const auto& shard = rebuilt[k];
-        expect_true(shard.size() >= 2, "rebuilt shard must carry its length field");
+        CHECK_MESSAGE(shard.size() >= 2, "rebuilt shard must carry its length field");
         const uint16_t declared = static_cast<uint16_t>(shard[0]) |
                                   static_cast<uint16_t>(shard[1] << 8);
         const auto& want = payloads[dropped[k]];
-        expect_true(declared == 2 + want.size(),
+        CHECK_MESSAGE(declared == 2 + want.size(),
                     "rebuilt shard must declare the length field plus the KCP datagram");
-        expect_true(declared <= shard.size(),
+        CHECK_MESSAGE(declared <= shard.size(),
                     "the declared prefix must fit inside the zero-extended shard");
-        expect_true(std::equal(want.begin(), want.end(), shard.begin() + 2),
+        CHECK_MESSAGE(std::equal(want.begin(), want.end(), shard.begin() + 2),
                     "rebuilt KCP datagram must match the lost original byte-for-byte");
     }
-    std::cout << "  [ok] fec frames keep the crypto reserve intact and rebuild at that offset\n";
 }
 
-void test_fec_encoder_does_not_leak_stale_shard_bytes() {
+TEST_CASE("test_fec_encoder_does_not_leak_stale_shard_bytes") {
     // shard_cache_ is reused across shard sets and only grows
     // (fec.cc:102-105, 124-126), so slot i keeps whatever the previous set put
     // there. GenerateParity zeroes [shard_length_, max_size_) for every data
@@ -945,7 +958,7 @@ void test_fec_encoder_does_not_leak_stale_shard_bytes() {
 
     constexpr int kDataShards = 4;
     auto encoder = FecEncoder::New(kDataShards, 2, 0);
-    expect_true(encoder != nullptr, "FecEncoder::New(4,2,0) must succeed");
+    CHECK_MESSAGE(encoder != nullptr, "FecEncoder::New(4,2,0) must succeed");
 
     // Set 1: every shard fills the full 1400-byte budget with a loud pattern.
     const size_t long_len = 8 + 1392;
@@ -971,18 +984,18 @@ void test_fec_encoder_does_not_leak_stale_shard_bytes() {
         short_payloads.push_back(std::vector<uint8_t>(frame.begin() + 8, frame.end()));
         for (auto& p : emitted) parity.push_back(std::move(p));
     }
-    expect_true(parity.size() == 2, "a complete 4:2 set must emit exactly 2 parity packets");
+    CHECK_MESSAGE(parity.size() == 2, "a complete 4:2 set must emit exactly 2 parity packets");
 
     // The parity packets of set 2 are max_size long (8 + 16 here), never the
     // 1400 bytes set 1 used -- GenerateParity truncates to max_size_.
     for (const auto& p : parity) {
-        expect_true(p.size() == short_len,
+        CHECK_MESSAGE(p.size() == short_len,
                     "parity length must follow the CURRENT set's max_size, not a stale one");
     }
 
     // Drop one shard of set 2 and rebuild it from the survivors plus parity.
     auto decoder = FecDecoder::New(kDataShards, 2);
-    expect_true(decoder != nullptr, "FecDecoder::New(4,2) must succeed");
+    CHECK_MESSAGE(decoder != nullptr, "FecDecoder::New(4,2) must succeed");
     const size_t dropped_index = 2;
     std::vector<std::vector<uint8_t>> rebuilt;
     for (size_t i = 0; i < short_frames.size(); i++) {
@@ -996,7 +1009,7 @@ void test_fec_encoder_does_not_leak_stale_shard_bytes() {
         rebuilt.insert(rebuilt.end(), std::make_move_iterator(got.begin()),
                        std::make_move_iterator(got.end()));
     }
-    expect_true(rebuilt.size() == 1,
+    CHECK_MESSAGE(rebuilt.size() == 1,
                 (std::string("the dropped short shard must be rebuilt, got ") +
                  std::to_string(rebuilt.size())).c_str());
 
@@ -1005,9 +1018,9 @@ void test_fec_encoder_does_not_leak_stale_shard_bytes() {
         const uint16_t declared = static_cast<uint16_t>(shard[0]) |
                                   static_cast<uint16_t>(shard[1] << 8);
         const auto& want = short_payloads[dropped_index];
-        expect_true(declared == 2 + want.size(),
+        CHECK_MESSAGE(declared == 2 + want.size(),
                     "rebuilt short shard must declare its own length, not set 1's");
-        expect_true(std::equal(want.begin(), want.end(), shard.begin() + 2),
+        CHECK_MESSAGE(std::equal(want.begin(), want.end(), shard.begin() + 2),
                     "rebuilt short shard payload must match its original");
         // The decisive assertion: nothing past the declared prefix may carry a
         // byte from set 1. With a 4:2 set the rebuild is zero-extended to
@@ -1017,15 +1030,14 @@ void test_fec_encoder_does_not_leak_stale_shard_bytes() {
         for (size_t j = declared; j < shard.size(); j++) {
             no_stale_byte = no_stale_byte && shard[j] == 0x00;
         }
-        expect_true(no_stale_byte,
+        CHECK_MESSAGE(no_stale_byte,
                     "a rebuilt shard must never expose bytes from a previous, longer set");
         bool no_stale_anywhere = true;
         for (uint8_t b : shard) {
             no_stale_anywhere = no_stale_anywhere && b != 0xEE;
         }
-        expect_true(no_stale_anywhere, "no 0xEE filler from set 1 may survive into set 2");
+        CHECK_MESSAGE(no_stale_anywhere, "no 0xEE filler from set 1 may survive into set 2");
     }
-    std::cout << "  [ok] fec encoder zero-fills reused shard slots across sets\n";
 }
 
 // Minimal concrete KcpTunnel. feed_kcp_input is the only member under test, so
@@ -1049,7 +1061,7 @@ protected:
     void handle_kcp_output(byte_view) override {}
 };
 
-void test_server_adapts_fec_per_client_framing() {
+TEST_CASE("test_server_adapts_fec_per_client_framing") {
     // The server's per-session FEC auto-adaptation (see
     // KCPServer::get_or_create_session): the first decrypted datagram decides
     // the session's framing in BOTH directions. A FEC-speaking client must get
@@ -1080,7 +1092,7 @@ void test_server_adapts_fec_per_client_framing() {
                                   Crypto& client_crypto,
                                   const char* what) {
         auto plain = client_crypto.decrypt(byte_view(wire.data(), wire.size()));
-        expect_true(plain.size() >= 8, what);
+        CHECK_MESSAGE(plain.size() >= 8, what);
         const uint16_t type = static_cast<uint16_t>(plain[4]) |
                               static_cast<uint16_t>(plain[5] << 8);
         return std::make_pair(std::move(plain), type);
@@ -1093,7 +1105,7 @@ void test_server_adapts_fec_per_client_framing() {
         auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
         auto fec_encoder =
             kcp::internal::FecEncoder::New(10, 3, static_cast<int>(FEC_CRYPTO_RESERVE));
-        expect_true(fec_encoder != nullptr, "adaptive-test FecEncoder must create");
+        CHECK_MESSAGE(fec_encoder != nullptr, "adaptive-test FecEncoder must create");
 
         const auto salt = Crypto::generate_session_salt();
         Crypto client_crypto(key, NONCE_DIR_CLIENT, salt, false);
@@ -1106,11 +1118,10 @@ void test_server_adapts_fec_per_client_framing() {
         peer.set_output_callback([&hello_seg](byte_view d) {
             hello_seg.assign(d.begin(), d.end());
         });
-        expect_true(peer.send(byte_view(hello.data(), hello.size())) >= 0,
-                    "peer HELLO send");
+        CHECK_MESSAGE(peer.send(byte_view(hello.data(), hello.size())) >= 0, "peer HELLO send");
         peer.update(10);
         peer.flush();
-        expect_true(!hello_seg.empty(),
+        CHECK_MESSAGE(!hello_seg.empty(),
                     "the flushed HELLO datagram must be captured for framing");
 
         const std::vector<uint8_t> framed_first = frame_segment(hello_seg, *fec_encoder);
@@ -1118,7 +1129,7 @@ void test_server_adapts_fec_per_client_framing() {
         const LogLevel dbg_prev = current_log_level();
         set_log_level(LogLevel::Debug);
         auto session = server->route_datagram(ep(42001), byte_view(first.data(), first.size()));
-        expect_true(session != nullptr, "a FEC-framed first packet must create a session");
+        CHECK_MESSAGE(session != nullptr, "a FEC-framed first packet must create a session");
 
         // Install the collector BEFORE polling: the strand handlers queued by
         // route_datagram (inject + handle_kcp_data) complete the whole
@@ -1138,29 +1149,31 @@ void test_server_adapts_fec_per_client_framing() {
         auto dup_seg = hello_seg;  // same sn -> KCP dedups, framing still drives
         const std::vector<uint8_t> framed_second = frame_segment(dup_seg, *fec_encoder);
         auto second = client_crypto.encrypt(byte_view(framed_second.data(), framed_second.size()));
-        expect_true(server->route_datagram(ep(42001), byte_view(second.data(), second.size())) != nullptr,
-                    "the second datagram must reuse the adapted session");
+        CHECK_MESSAGE(
+            server->route_datagram(ep(42001), byte_view(second.data(), second.size())) != nullptr,
+            "the second datagram must reuse the adapted session");
         io.restart();
         io.poll();
         set_log_level(dbg_prev);
 
-        expect_true(!replies.empty(), "the adapted session must answer the HELLO");
+        CHECK_MESSAGE(!replies.empty(), "the adapted session must answer the HELLO");
         auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
                                            "the reply must decrypt with the client's key");
-        expect_true(type == kcp::kTypeData,
+        CHECK_MESSAGE(type == kcp::kTypeData,
                     "a FEC-speaking client must receive FEC-framed replies");
         // Unwrap [fec_hdr(6)|len(2)|segment] and verify the ACK payload.
         const uint16_t declared = static_cast<uint16_t>(plain[6]) |
                                   static_cast<uint16_t>(plain[7] << 8);
-        expect_true(declared + 6 == plain.size(),
+        CHECK_MESSAGE(declared + 6 == plain.size(),
                     "the reply's FEC length field must match its size");
         KcpWrapper unwrapper(KCP_CONV);
-        expect_true(unwrapper.input(byte_view(plain.data() + 8, plain.size() - 8)) >= 0,
+        CHECK_MESSAGE(unwrapper.input(byte_view(plain.data() + 8, plain.size() - 8)) >= 0,
                     "the unwrapped reply must be a valid KCP segment");
         std::vector<uint8_t> ack;
-        expect_true(unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
-                    "the unwrapped reply must carry HELLO_ACK_V2");
-        expect_true(std::memcmp(ack.data(), KCP_CONTROL_HELLO_ACK_V2, ack.size()) == 0,
+        CHECK_MESSAGE(
+            unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
+            "the unwrapped reply must carry HELLO_ACK_V2");
+        CHECK_MESSAGE(std::memcmp(ack.data(), KCP_CONTROL_HELLO_ACK_V2, ack.size()) == 0,
                     "the ACK payload must be exactly HELLO_ACK_V2");
 
         session->stop();
@@ -1182,14 +1195,14 @@ void test_server_adapts_fec_per_client_framing() {
         peer.set_output_callback([&hello_seg](byte_view d) {
             hello_seg.assign(d.begin(), d.end());
         });
-        expect_true(peer.send(byte_view(hello.data(), hello.size())) >= 0, "bare HELLO send");
+        CHECK_MESSAGE(peer.send(byte_view(hello.data(), hello.size())) >= 0, "bare HELLO send");
         peer.update(10);
         peer.flush();
-        expect_true(!hello_seg.empty(), "the bare HELLO datagram must be captured");
+        CHECK_MESSAGE(!hello_seg.empty(), "the bare HELLO datagram must be captured");
 
         auto first = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
         auto session = server->route_datagram(ep(42002), byte_view(first.data(), first.size()));
-        expect_true(session != nullptr, "a bare first packet must create a session");
+        CHECK_MESSAGE(session != nullptr, "a bare first packet must create a session");
         // Collector installed before polling (same ordering as part A).
         std::vector<std::vector<uint8_t>> replies;
         session->set_send_callback([&replies](std::vector<uint8_t> wire) {
@@ -1199,24 +1212,26 @@ void test_server_adapts_fec_per_client_framing() {
         io.poll();
 
         auto second = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
-        expect_true(server->route_datagram(ep(42002), byte_view(second.data(), second.size())) != nullptr,
-                    "the second bare datagram must reuse the session");
+        CHECK_MESSAGE(
+            server->route_datagram(ep(42002), byte_view(second.data(), second.size())) != nullptr,
+            "the second bare datagram must reuse the session");
         io.restart();
         io.poll();
 
-        expect_true(!replies.empty(), "the bare session must answer the HELLO");
+        CHECK_MESSAGE(!replies.empty(), "the bare session must answer the HELLO");
         auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
                                            "the bare reply must decrypt with the client's key");
         (void)type;
-        expect_true(!looks_like_fec_frame(plain.data(), plain.size()),
+        CHECK_MESSAGE(!looks_like_fec_frame(plain.data(), plain.size()),
                     "a bare client must keep receiving bare datagrams");
         // The bare plaintext IS the KCP segment: it must unwrap to HELLO_ACK_V2.
         KcpWrapper unwrapper(KCP_CONV);
-        expect_true(unwrapper.input(byte_view(plain.data(), plain.size())) >= 0,
+        CHECK_MESSAGE(unwrapper.input(byte_view(plain.data(), plain.size())) >= 0,
                     "the bare reply must be a valid KCP segment");
         std::vector<uint8_t> ack;
-        expect_true(unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
-                    "the bare reply must carry HELLO_ACK_V2");
+        CHECK_MESSAGE(
+            unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
+            "the bare reply must carry HELLO_ACK_V2");
         session->stop();
     }
 
@@ -1238,14 +1253,14 @@ void test_server_adapts_fec_per_client_framing() {
         peer.set_output_callback([&hello_seg](byte_view d) {
             hello_seg.assign(d.begin(), d.end());
         });
-        expect_true(peer.send(byte_view(hello.data(), hello.size())) >= 0, "bare HELLO send (C)");
+        CHECK_MESSAGE(peer.send(byte_view(hello.data(), hello.size())) >= 0, "bare HELLO send (C)");
         peer.update(10);
         peer.flush();
-        expect_true(!hello_seg.empty(), "the bare HELLO datagram must be captured (C)");
+        CHECK_MESSAGE(!hello_seg.empty(), "the bare HELLO datagram must be captured (C)");
 
         auto first = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
         auto session = server->route_datagram(ep(42003), byte_view(first.data(), first.size()));
-        expect_true(session != nullptr, "a bare first packet must create a session (C)");
+        CHECK_MESSAGE(session != nullptr, "a bare first packet must create a session (C)");
         // Collector installed before polling (same ordering as part A).
         std::vector<std::vector<uint8_t>> replies;
         session->set_send_callback([&replies](std::vector<uint8_t> wire) {
@@ -1255,24 +1270,24 @@ void test_server_adapts_fec_per_client_framing() {
         io.poll();
 
         auto second = client_crypto.encrypt(byte_view(hello_seg.data(), hello_seg.size()));
-        expect_true(server->route_datagram(ep(42003), byte_view(second.data(), second.size())) != nullptr,
-                    "the second bare datagram must reuse the session (C)");
+        CHECK_MESSAGE(
+            server->route_datagram(ep(42003), byte_view(second.data(), second.size())) != nullptr,
+            "the second bare datagram must reuse the session (C)");
         io.restart();
         io.poll();
 
-        expect_true(!replies.empty(), "the session must answer the HELLO (C)");
+        CHECK_MESSAGE(!replies.empty(), "the session must answer the HELLO (C)");
         auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
                                            "the reply must decrypt (C)");
         (void)type;
-        expect_true(!looks_like_fec_frame(plain.data(), plain.size()),
+        CHECK_MESSAGE(!looks_like_fec_frame(plain.data(), plain.size()),
                     "an explicit server -fec must not frame towards a bare client");
         session->stop();
     }
 
-    std::cout << "  [ok] server FEC framing follows the client per session\n";
 }
 
-void test_fec_off_detects_a_fec_peer() {
+TEST_CASE("test_fec_off_detects_a_fec_peer") {
     // The mirror image of the ret_-2 arm in feed_kcp_input. When the LOCAL side
     // has -fec off but the PEER has it on, the datagram is [fec_hdr(6)|len(2)|
     // KCP segment] and this side strips nothing, so ikcp_input reads the FEC
@@ -1298,7 +1313,7 @@ void test_fec_off_detects_a_fec_peer() {
     // the frame under test is `frame`, not an entry in `emitted`.
     auto encoder = kcp::internal::FecEncoder::New(
         10, 3, static_cast<int>(FEC_CRYPTO_RESERVE));
-    expect_true(encoder != nullptr, "FecEncoder::New(10,3,reserve) must succeed");
+    CHECK_MESSAGE(encoder != nullptr, "FecEncoder::New(10,3,reserve) must succeed");
     const size_t kcp_len = static_cast<size_t>(KCP_MTU);
     const size_t frame_size = FEC_CRYPTO_RESERVE + 8 + kcp_len;
     std::vector<uint8_t> framed(frame_size, 0);
@@ -1313,7 +1328,7 @@ void test_fec_off_detects_a_fec_peer() {
     // otherwise the test would be asserting against the wrong bytes.
     const uint16_t sealed_flag = static_cast<uint16_t>(plain[4]) |
                                  static_cast<uint16_t>(plain[5] << 8);
-    expect_true(sealed_flag == kcp::kTypeData,
+    CHECK_MESSAGE(sealed_flag == kcp::kTypeData,
                 "the encoded frame must carry kTypeData at the reserve offset");
 
     // ORDER MATTERS. fec_peer_only_log() is one process-wide LogThrottle, so a
@@ -1331,7 +1346,7 @@ void test_fec_off_detects_a_fec_peer() {
         set_log_sink_for_test([&](LogLevel level, std::string_view,
                                   std::string_view message) {
             if (level == LogLevel::Warning &&
-                message.find("local -fec is off") != std::string_view::npos) {
+                message.find("local --fec is off") != std::string_view::npos) {
                 peer_lines.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -1346,7 +1361,7 @@ void test_fec_off_detects_a_fec_peer() {
         off.feed(seg.data(), seg.size());
         set_log_level(prev);
         set_log_sink_for_test(LogSink{});
-        expect_true(peer_lines.load() == 0,
+        CHECK_MESSAGE(peer_lines.load() == 0,
                     "an unframed KCP segment must never trigger the FEC-peer warning");
     }
 
@@ -1358,7 +1373,7 @@ void test_fec_off_detects_a_fec_peer() {
         set_log_sink_for_test([&](LogLevel level, std::string_view,
                                   std::string_view message) {
             if (level != LogLevel::Warning) return;
-            if (message.find("local -fec is off") != std::string_view::npos) {
+            if (message.find("local --fec is off") != std::string_view::npos) {
                 peer_lines.fetch_add(1, std::memory_order_relaxed);
             }
             if (message.find("FAIL_STAGE=KCP_INPUT_FAILED") != std::string_view::npos) {
@@ -1370,11 +1385,10 @@ void test_fec_off_detects_a_fec_peer() {
         const int ret = off.feed(plain, plain_len);
         set_log_level(prev);
         set_log_sink_for_test(LogSink{});
-        expect_true(ret < 0,
-                    "a FEC frame on an FEC-off tunnel must still be refused by KCP");
-        expect_true(peer_lines.load() == 1,
-                    "the peer-has-FEC mismatch must be reported exactly once, by name");
-        expect_true(reject_lines.load() == 0,
+        CHECK_MESSAGE(ret < 0, "a FEC frame on an FEC-off tunnel must still be refused by KCP");
+        CHECK_MESSAGE(peer_lines.load() == 1,
+                      "the peer-has-FEC mismatch must be reported exactly once, by name");
+        CHECK_MESSAGE(reject_lines.load() == 0,
                     "feed_kcp_input itself must not emit the FAIL_STAGE line; the "
                     "session layer owns it");
     }
@@ -1385,7 +1399,7 @@ void test_fec_off_detects_a_fec_peer() {
         set_log_sink_for_test([&](LogLevel level, std::string_view,
                                   std::string_view message) {
             if (level == LogLevel::Warning &&
-                message.find("local -fec is off") != std::string_view::npos) {
+                message.find("local --fec is off") != std::string_view::npos) {
                 peer_lines.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -1397,14 +1411,13 @@ void test_fec_off_detects_a_fec_peer() {
         }
         set_log_level(prev);
         set_log_sink_for_test(LogSink{});
-        expect_true(peer_lines.load() <= 2,
+        CHECK_MESSAGE(peer_lines.load() <= 2,
                     "the mismatch warning must be throttled, not one line per datagram");
     }
 
-    std::cout << "  [ok] fec-off tunnel names a FEC peer instead of a bare ret_-1\n";
 }
 
-void test_kcp_wrapper_oversized_message_is_not_truncated() {
+TEST_CASE("test_kcp_wrapper_oversized_message_is_not_truncated") {
     // FWD_BUF_SIZE is the per-message cap every forwarding loop relies on. A
     // sender that exceeds it is a protocol violation, and the fixed-buffer
     // recv() must report KCP_RECV_MSG_TOO_BIG *without consuming* the message:
@@ -1424,7 +1437,7 @@ void test_kcp_wrapper_oversized_message_is_not_truncated() {
     for (size_t i = 0; i < payload.size(); ++i) {
         payload[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
     }
-    expect_true(sender.send(byte_view(payload.data(), payload.size())) >= 0,
+    CHECK_MESSAGE(sender.send(byte_view(payload.data(), payload.size())) >= 0,
                 "sender.send must accept the oversized payload");
 
     // Drive both sides until the message is fully reassembled.
@@ -1436,29 +1449,29 @@ void test_kcp_wrapper_oversized_message_is_not_truncated() {
         receiver.update(now);
         receiver.flush();
     }
-    expect_true(receiver.peek_size() == static_cast<int>(payload_size),
+    CHECK_MESSAGE(receiver.peek_size() == static_cast<int>(payload_size),
                 "receiver must reassemble the whole message");
 
     // A buffer that cannot hold it is rejected instead of truncated...
     std::vector<uint8_t> too_small(FWD_BUF_SIZE);
-    expect_true(receiver.recv(too_small.data(), too_small.size()) ==
-                    KcpWrapper::KCP_RECV_MSG_TOO_BIG,
-                "oversized message must be reported, never truncated");
+    CHECK_MESSAGE(
+        receiver.recv(too_small.data(), too_small.size()) == KcpWrapper::KCP_RECV_MSG_TOO_BIG,
+        "oversized message must be reported, never truncated");
     // ...and it stays queued, which is what makes recovery possible.
-    expect_true(receiver.peek_size() == static_cast<int>(payload_size),
+    CHECK_MESSAGE(receiver.peek_size() == static_cast<int>(payload_size),
                 "the rejected message must still be queued");
 
     // The vector overload is the documented recovery path: it must hand back
     // the full message, byte-exact.
     std::vector<uint8_t> recovered;
-    expect_true(receiver.recv(recovered) == static_cast<int>(payload_size),
+    CHECK_MESSAGE(receiver.recv(recovered) == static_cast<int>(payload_size),
                 "vector recv must return the whole message");
-    expect_true(recovered == payload, "the recovered payload must be byte-exact");
+    CHECK_MESSAGE(recovered == payload, "the recovered payload must be byte-exact");
     // ikcp_peeksize() reports -1 (not 0) once nothing is queued.
-    expect_true(receiver.peek_size() <= 0, "the queue must be drained after recovery");
+    CHECK_MESSAGE(receiver.peek_size() <= 0, "the queue must be drained after recovery");
 }
 
-void test_server_session_routing_and_auth() {
+TEST_CASE("test_server_session_routing_and_auth") {
     // get_or_create_session holds the server's only real branching logic (auth,
     // auth rate limit, duplicate-salt rejection, session cap) and the E2E
     // suites only reach it incidentally. route_datagram drives it directly --
@@ -1479,19 +1492,20 @@ void test_server_session_routing_and_auth() {
     Crypto client_a(key, NONCE_DIR_CLIENT, salt_a, false);
     auto first = client_a.encrypt(req_view);
     auto session_a = server->route_datagram(ep_a, byte_view(first.data(), first.size()));
-    expect_true(session_a != nullptr, "a valid first packet must create a session");
+    CHECK_MESSAGE(session_a != nullptr, "a valid first packet must create a session");
 
     // A second packet from the same endpoint reuses that session instead of
     // creating a new one.
     auto second = client_a.encrypt(req_view);
-    expect_true(server->route_datagram(ep_a, byte_view(second.data(), second.size())) == session_a,
-                "a repeat packet must reuse the endpoint's session");
+    CHECK_MESSAGE(
+        server->route_datagram(ep_a, byte_view(second.data(), second.size())) == session_a,
+        "a repeat packet must reuse the endpoint's session");
 
     // Wrong key: the AEAD tag cannot verify, so no session may be created.
     Crypto wrong_key("wrong_key_0000000000", NONCE_DIR_CLIENT,
                      Crypto::generate_session_salt(), false);
     auto bad = wrong_key.encrypt(req_view);
-    expect_true(server->route_datagram(ep_b, byte_view(bad.data(), bad.size())) == nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep_b, byte_view(bad.data(), bad.size())) == nullptr,
                 "a wrong-key packet must be rejected");
 
     // Duplicate salt: another endpoint must not be able to force a session that
@@ -1499,7 +1513,7 @@ void test_server_session_routing_and_auth() {
     // nonce base across two sessions, which is catastrophic for GCM.
     Crypto replayed_salt(key, NONCE_DIR_CLIENT, salt_a, false);
     auto dup = replayed_salt.encrypt(req_view);
-    expect_true(server->route_datagram(ep_b, byte_view(dup.data(), dup.size())) == nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep_b, byte_view(dup.data(), dup.size())) == nullptr,
                 "a duplicate session salt must be rejected");
 
     const std::vector<uint8_t> garbage(64, 0xAB);
@@ -1518,8 +1532,9 @@ void test_server_session_routing_and_auth() {
     // failures).
     Crypto client_e(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
     auto valid_e = client_e.encrypt(req_view);
-    expect_true(server->route_datagram(ep_e, byte_view(valid_e.data(), valid_e.size())) != nullptr,
-                "a valid packet must be accepted (a success never counts toward the failure gate)");
+    CHECK_MESSAGE(
+        server->route_datagram(ep_e, byte_view(valid_e.data(), valid_e.size())) != nullptr,
+        "a valid packet must be accepted (a success never counts toward the failure gate)");
 
     Crypto client_g(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
     auto valid_g = client_g.encrypt(req_view);
@@ -1536,7 +1551,7 @@ void test_server_session_routing_and_auth() {
         // Now even a VALID packet from the same address is dropped pre-decrypt.
         const bool rejected = server->route_datagram(ep_g, byte_view(valid_g.data(), valid_g.size())) == nullptr;
         set_log_level(prev_level);
-        expect_true(rejected,
+        CHECK_MESSAGE(rejected,
                     "a valid packet must be dropped once its source address's per-second FAILURE budget is spent");
     }
 
@@ -1558,7 +1573,7 @@ void test_server_session_routing_and_auth() {
                 break;
             }
         }
-        expect_true(all_ok,
+        CHECK_MESSAGE(all_ok,
                     "many concurrent successful sessions from one address must not be throttled");
     }
 
@@ -1595,12 +1610,12 @@ void test_server_session_routing_and_auth() {
         const auto ep_h = asio::ip::udp::endpoint(asio::ip::make_address("10.200.200.200"), 40009);
         const bool rejected = server->route_datagram(ep_h, byte_view(valid_h.data(), valid_h.size())) == nullptr;
         set_log_level(prev_level);
-        expect_true(rejected,
+        CHECK_MESSAGE(rejected,
                     "a valid packet must be dropped once the global per-second auth budget is spent");
     }
 }
 
-void test_server_unauth_packet_cannot_evict_live_session() {
+TEST_CASE("test_server_unauth_packet_cannot_evict_live_session") {
     // Regression: get_or_create_session used to answer "is this a reconnect?"
     // with salt_matches(), i.e. from unauthenticated cleartext, and to act on it
     // BEFORE the auth decrypt. So any datagram from a live endpoint whose first
@@ -1621,7 +1636,7 @@ void test_server_unauth_packet_cannot_evict_live_session() {
     Crypto client(key, NONCE_DIR_CLIENT, salt, false);
     auto first = client.encrypt(req_view);
     auto live = server->route_datagram(ep, byte_view(first.data(), first.size()));
-    expect_true(live != nullptr, "a valid first packet must create a session");
+    CHECK_MESSAGE(live != nullptr, "a valid first packet must create a session");
 
     const auto prev_level = current_log_level();
     set_log_level(LogLevel::Error);
@@ -1629,12 +1644,12 @@ void test_server_unauth_packet_cannot_evict_live_session() {
     // (1) A sub-salt-length datagram: salt_matches() is false by construction,
     // and no decrypt can ever succeed on it.
     const std::vector<uint8_t> tiny{0x00};
-    expect_true(server->route_datagram(ep, byte_view(tiny.data(), tiny.size())) == nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(tiny.data(), tiny.size())) == nullptr,
                 "a sub-salt-length datagram must be rejected");
 
     // (2) A full-length forged datagram whose salt prefix is wrong.
     const std::vector<uint8_t> forged(64, 0x5A);
-    expect_true(server->route_datagram(ep, byte_view(forged.data(), forged.size())) == nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(forged.data(), forged.size())) == nullptr,
                 "a forged-salt datagram must be rejected");
 
     set_log_level(prev_level);
@@ -1642,7 +1657,7 @@ void test_server_unauth_packet_cannot_evict_live_session() {
     // The live session must have survived both: the next genuine packet, still
     // carrying the ORIGINAL salt, has to land on the very same session object.
     auto again = client.encrypt(req_view);
-    expect_true(server->route_datagram(ep, byte_view(again.data(), again.size())) == live,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(again.data(), again.size())) == live,
                 "an unauthenticated datagram must not evict the live session");
 
     // ...while a genuine reconnect -- a NEW salt that actually authenticates --
@@ -1652,16 +1667,17 @@ void test_server_unauth_packet_cannot_evict_live_session() {
     Crypto reconnected(key, NONCE_DIR_CLIENT, salt2, false);
     auto re_first = reconnected.encrypt(req_view);
     auto replaced = server->route_datagram(ep, byte_view(re_first.data(), re_first.size()));
-    expect_true(replaced != nullptr, "an authenticated reconnect must create a session");
-    expect_true(replaced != live, "an authenticated reconnect must replace the old session");
+    CHECK_MESSAGE(replaced != nullptr, "an authenticated reconnect must create a session");
+    CHECK_MESSAGE(replaced != live, "an authenticated reconnect must replace the old session");
 
     // And the replacement is genuinely usable: its own next packet reuses it.
     auto re_second = reconnected.encrypt(req_view);
-    expect_true(server->route_datagram(ep, byte_view(re_second.data(), re_second.size())) == replaced,
-                "the reconnected session must serve subsequent packets");
+    CHECK_MESSAGE(
+        server->route_datagram(ep, byte_view(re_second.data(), re_second.size())) == replaced,
+        "the reconnected session must serve subsequent packets");
 }
 
-void test_server_rejects_replayed_salt_after_session_death() {
+TEST_CASE("test_server_rejects_replayed_salt_after_session_death") {
     // A recorded first datagram replayed after its session has died must be
     // rejected. Without the salt tombstone the server's first-packet
     // replay-window bypass would decrypt it (same salt -> same derived key)
@@ -1681,24 +1697,24 @@ void test_server_rejects_replayed_salt_after_session_death() {
     auto first = client.encrypt(req_view);  // the datagram an attacker records
 
     auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
-    expect_true(session != nullptr, "the first packet must create a session");
+    CHECK_MESSAGE(session != nullptr, "the first packet must create a session");
 
     // Kill it, then drain the io_context so stop() actually clears RUNNING
     // (stop() dispatches onto the session strand).
     session->stop();
     io.poll();
-    expect_true(!session->is_running(), "the session must be stopped before the replay");
+    CHECK_MESSAGE(!session->is_running(), "the session must be stopped before the replay");
 
     // Replay the recorded datagram verbatim, from the same source endpoint
     // (the realistic case: the attacker reuses the recorded source port).
-    expect_true(server->route_datagram(ep, byte_view(first.data(), first.size())) == nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(first.data(), first.size())) == nullptr,
                 "a replayed first datagram of a dead session must be rejected");
 
     // The tombstone must not break normal operation: a genuine reconnect with
     // a FRESH salt is still accepted (real clients generate one per session).
     Crypto reconnected(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
     auto fresh = reconnected.encrypt(req_view);
-    expect_true(server->route_datagram(ep, byte_view(fresh.data(), fresh.size())) != nullptr,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(fresh.data(), fresh.size())) != nullptr,
                 "a fresh-salt session must still be accepted after a tombstone");
 }
 
@@ -1708,13 +1724,13 @@ void test_server_rejects_replayed_salt_after_session_death() {
 // SALT_TOMBSTONE_TTL_SEC new sessions per second -- could lock every new client
 // out for the remainder of the TTL, to protect a salt that was about to expire
 // anyway. remember_salt_locked() now evicts the OLDEST entry instead.
-void test_server_tombstone_cap_evicts_instead_of_locking_out() {
+TEST_CASE("test_server_tombstone_cap_evicts_instead_of_locking_out") {
     asio::io_context io;
     const std::string key = "tombstone_cap_test_key_1";
     auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
 
     server->fill_salt_tombstones_for_test(MAX_SALT_TOMBSTONES);
-    expect_true(server->salt_tombstone_count_for_test() == MAX_SALT_TOMBSTONES,
+    CHECK_MESSAGE(server->salt_tombstone_count_for_test() == MAX_SALT_TOMBSTONES,
                 "the table must be exactly at its cap");
 
     const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41088);
@@ -1724,14 +1740,14 @@ void test_server_tombstone_cap_evicts_instead_of_locking_out() {
     Crypto client(key, NONCE_DIR_CLIENT, Crypto::generate_session_salt(), false);
     auto first = client.encrypt(req_view);
     auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
-    expect_true(session != nullptr, "a new salt must be accepted when the table is full");
-    expect_true(server->salt_tombstone_count_for_test() == MAX_SALT_TOMBSTONES,
+    CHECK_MESSAGE(session != nullptr, "a new salt must be accepted when the table is full");
+    CHECK_MESSAGE(server->salt_tombstone_count_for_test() == MAX_SALT_TOMBSTONES,
                 "accepting it must evict an old tombstone, not grow past the cap");
 
     // The session created on the eviction path is genuinely usable, not a
     // half-initialised one.
     auto second = client.encrypt(req_view);
-    expect_true(server->route_datagram(ep, byte_view(second.data(), second.size())) == session,
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(second.data(), second.size())) == session,
                 "the accepted session must keep serving its own salt");
 }
 
@@ -1746,7 +1762,7 @@ void test_server_tombstone_cap_evicts_instead_of_locking_out() {
 // handlers touch the server through raw `this`, so they must hold a strong
 // reference themselves, or breaking the cycle would turn a leak into a
 // use-after-free of the server object.
-void test_server_is_released_when_its_owner_drops_it() {
+TEST_CASE("test_server_is_released_when_its_owner_drops_it") {
     asio::io_context io;
     const std::string key = "release_cycle_test_key_123";
     std::weak_ptr<KCPServer> weak_server;
@@ -1760,7 +1776,7 @@ void test_server_is_released_when_its_owner_drops_it() {
         auto first = client.encrypt(byte_view(connect_req.data(), connect_req.size()));
 
         auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
-        expect_true(session != nullptr, "the first packet must create a session");
+        CHECK_MESSAGE(session != nullptr, "the first packet must create a session");
 
         // Nothing but the server's own map (and the handler queued above) keeps
         // them alive from here on.
@@ -1768,7 +1784,7 @@ void test_server_is_released_when_its_owner_drops_it() {
         server.reset();
         io.poll();
     }
-    expect_true(weak_server.expired(),
+    CHECK_MESSAGE(weak_server.expired(),
                 "dropping the last external reference must destroy the server");
 }
 
@@ -1778,7 +1794,7 @@ void test_server_is_released_when_its_owner_drops_it() {
 // true forever and pins one of the MAX_CONCURRENT_SESSIONS slots (plus its
 // FWD_BUF_SIZE buffers) indefinitely. do_cleanup now also reaps on
 // handshake_stalled(), which is measured from creation and never refreshed.
-void test_server_session_handshake_stall_is_bounded() {
+TEST_CASE("test_server_session_handshake_stall_is_bounded") {
     asio::io_context io;
     const std::string key = "handshake_stall_test_key_1";
     auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
@@ -1791,25 +1807,26 @@ void test_server_session_handshake_stall_is_bounded() {
     auto first = client.encrypt(byte_view(partial.data(), partial.size()));
 
     auto session = server->route_datagram(ep, byte_view(first.data(), first.size()));
-    expect_true(session != nullptr, "the first packet must create a session");
-    expect_true(!session->is_handshake_done(), "a truncated request cannot complete the handshake");
+    CHECK_MESSAGE(session != nullptr, "the first packet must create a session");
+    CHECK_MESSAGE(!session->is_handshake_done(),
+                  "a truncated request cannot complete the handshake");
     // The blind spot itself: a stalled session still looks alive to the old
     // sweep condition, so nothing but the new bound reclaims it.
-    expect_true(session->is_alive(), "a handshake-stalled session must still report alive");
+    CHECK_MESSAGE(session->is_alive(), "a handshake-stalled session must still report alive");
 
-    expect_true(!session->handshake_stalled(SERVER_SOCKS5_HANDSHAKE_TIMEOUT_SEC),
+    CHECK_MESSAGE(!session->handshake_stalled(SERVER_SOCKS5_HANDSHAKE_TIMEOUT_SEC),
                 "a just-created session must not be reaped");
     // Zero grace: the clock runs from creation, so steady dribbling cannot
     // postpone the reap the way it postpones the idle sweep.
-    expect_true(session->handshake_stalled(0), "an overdue handshake must be detected");
+    CHECK_MESSAGE(session->handshake_stalled(0), "an overdue handshake must be detected");
 
     // Completion clears it, so a healthy tunnel can never be reaped this way.
     session->mark_handshake_done();
-    expect_true(!session->handshake_stalled(0),
+    CHECK_MESSAGE(!session->handshake_stalled(0),
                 "a completed handshake must never count as stalled");
 }
 
-void test_session_oversized_kcp_message_fails_read() {
+TEST_CASE("test_session_oversized_kcp_message_fails_read") {
     // try_fulfill_read() has two distinct reject paths, neither of which was
     // covered: a KCP message larger than FWD_BUF_SIZE (a protocol violation --
     // consumed so KCP stays consistent, then the read is failed) and a message
@@ -1873,11 +1890,11 @@ void test_session_oversized_kcp_message_fails_read() {
     io.poll();  // let the read registration reach the strand
 
     std::vector<uint8_t> payload1(200, 0x11);
-    expect_true(peer.send(byte_view(payload1.data(), payload1.size())) >= 0,
+    CHECK_MESSAGE(peer.send(byte_view(payload1.data(), payload1.size())) >= 0,
                 "peer.send must accept the path-1 payload");
     pump_until(small_failed, 60);
-    expect_true(small_failed, "a message larger than the caller's buffer must fail the read");
-    expect_true(small_ec == asio::error::message_size,
+    CHECK_MESSAGE(small_failed, "a message larger than the caller's buffer must fail the read");
+    CHECK_MESSAGE(small_ec == asio::error::message_size,
                 "path 1 must report message_size, not a truncated success");
 
     // --- path 2: message larger than FWD_BUF_SIZE (protocol violation) -------
@@ -1892,15 +1909,15 @@ void test_session_oversized_kcp_message_fails_read() {
     io.poll();
 
     std::vector<uint8_t> payload2(FWD_BUF_SIZE + 256, 0x22);
-    expect_true(peer.send(byte_view(payload2.data(), payload2.size())) >= 0,
+    CHECK_MESSAGE(peer.send(byte_view(payload2.data(), payload2.size())) >= 0,
                 "peer.send must accept the path-2 payload");
     pump_until(big_failed, 120);
-    expect_true(big_failed, "a message larger than FWD_BUF_SIZE must fail the read");
-    expect_true(big_ec == asio::error::message_size,
+    CHECK_MESSAGE(big_failed, "a message larger than FWD_BUF_SIZE must fail the read");
+    CHECK_MESSAGE(big_ec == asio::error::message_size,
                 "path 2 must report message_size, not a truncated success");
 }
 
-void test_session_stop_makes_inert() {
+TEST_CASE("test_session_stop_makes_inert") {
     // Regression for the session-cleanup audit: once stop() runs, the session
     // must be fully inert so a dead session can safely linger in the server's
     // sessions_ map (reclaimed by the 30s sweep) without spinning, sending, or
@@ -1916,30 +1933,30 @@ void test_session_stop_makes_inert() {
     io.poll();
     io.restart();
 
-    expect_true(session->is_running(), "session should run after start");
-    expect_true(session->is_alive(), "session should be alive after start");
+    CHECK_MESSAGE(session->is_running(), "session should run after start");
+    CHECK_MESSAGE(session->is_alive(), "session should be alive after start");
 
     session->stop();
     io.restart();
     io.poll();
 
-    expect_true(!session->is_running(), "session must not run after stop");
-    expect_true(!session->is_alive(), "session must not be alive after stop");
+    CHECK_MESSAGE(!session->is_running(), "session must not run after stop");
+    CHECK_MESSAGE(!session->is_alive(), "session must not be alive after stop");
 
     // on_update_tick is driven by the server's shared tick for EVERY session in
     // the map, including stopped ones. On a stopped session it must be a no-op
     // and must NOT invoke the send path.
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.poll();
-    expect_true(!sent, "on_update_tick on a stopped session must not send");
+    CHECK_MESSAGE(!sent, "on_update_tick on a stopped session must not send");
 
     // Idempotent: a second stop must be safe and leave state unchanged.
     session->stop();
-    expect_true(!session->is_running(), "second stop must stay not-running");
-    expect_true(!session->is_alive(), "second stop must stay not-alive");
+    CHECK_MESSAGE(!session->is_running(), "second stop must stay not-running");
+    CHECK_MESSAGE(!session->is_alive(), "second stop must stay not-alive");
 }
 
-void test_session_drained_callback_on_target_closed() {
+TEST_CASE("test_session_drained_callback_on_target_closed") {
     // Regression for graceful upstream teardown: when the target TCP closes
     // while KCP still has queued data, the session stays alive until wait_send()
     // reaches 0, then the drained callback fires exactly once and tears the
@@ -1962,16 +1979,16 @@ void test_session_drained_callback_on_target_closed() {
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.poll();
     io.restart();
-    expect_true(drained, "drained callback must fire when target closed and buffer empty");
+    CHECK_MESSAGE(drained, "drained callback must fire when target closed and buffer empty");
 
     // Must not re-fire on a subsequent tick (callback was moved out and nulled).
     drained = false;
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.poll();
-    expect_true(!drained, "drained callback must not re-fire");
+    CHECK_MESSAGE(!drained, "drained callback must not re-fire");
 }
 
-void test_session_drained_deferred_while_send_buffer_nonempty() {
+TEST_CASE("test_session_drained_deferred_while_send_buffer_nonempty") {
     // The anti-truncation half of the drained contract, and the one that keeps
     // large responses intact: when the target closes while KCP still holds
     // undelivered bytes, the session must NOT be torn down yet. Doing so would
@@ -1995,7 +2012,7 @@ void test_session_drained_deferred_while_send_buffer_nonempty() {
     session->send_data(byte_view(payload.data(), payload.size()));
     io.poll();
     io.restart();
-    expect_true(session->wait_send() > 0, "send_data must leave bytes queued in KCP");
+    CHECK_MESSAGE(session->wait_send() > 0, "send_data must leave bytes queued in KCP");
 
     bool drained = false;
     session->set_drained_callback([&]() { drained = true; });
@@ -2004,16 +2021,16 @@ void test_session_drained_deferred_while_send_buffer_nonempty() {
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.poll();
     io.restart();
-    expect_true(!drained,
+    CHECK_MESSAGE(!drained,
                 "drained callback fired while KCP still held undelivered data "
                 "(an early teardown would truncate the stream)");
-    expect_true(session->is_alive(),
+    CHECK_MESSAGE(session->is_alive(),
                 "session must stay alive until its send buffer drains");
 
     session->stop();
 }
 
-void test_session_half_close_fin_gate_and_delivery() {
+TEST_CASE("test_session_half_close_fin_gate_and_delivery") {
     // The FIN (half-close) contract, in three parts.
     //
     // 1. GATE. A FIN is only sent to a peer that negotiated it (HELLO_V2 /
@@ -2068,7 +2085,7 @@ void test_session_half_close_fin_gate_and_delivery() {
             session->receive_data(byte_view(wire.data(), wire.size()));
         });
         std::vector<uint8_t> seed(8, 0x42);
-        expect_true(peer.send(byte_view(seed.data(), seed.size())) >= 0, "peer seed send");
+        CHECK_MESSAGE(peer.send(byte_view(seed.data(), seed.size())) >= 0, "peer seed send");
         uint32_t now = 0;
         // ikcp_flush() is a no-op until ikcp_update() has run once, so every
         // pump below advances the peer's clock before flushing.
@@ -2079,7 +2096,7 @@ void test_session_half_close_fin_gate_and_delivery() {
             io.restart();
             io.poll();
         }
-        expect_true(server_crypto->session_salt().size() == salt.size(),
+        CHECK_MESSAGE(server_crypto->session_salt().size() == salt.size(),
                     "the session must learn the peer's salt from its first datagram");
 
         // Not negotiated: a V1 peer must never see one.
@@ -2087,7 +2104,7 @@ void test_session_half_close_fin_gate_and_delivery() {
         session->send_fin();
         io.restart();
         io.poll();
-        expect_true(emitted.empty(), "send_fin must be a no-op until FIN is negotiated");
+        CHECK_MESSAGE(emitted.empty(), "send_fin must be a no-op until FIN is negotiated");
 
         // Negotiated: exactly one FIN, however many times it is requested.
         session->enable_fin();
@@ -2111,7 +2128,7 @@ void test_session_half_close_fin_gate_and_delivery() {
                 ++fin_segments;
             }
         }
-        expect_true(fin_segments == 1,
+        CHECK_MESSAGE(fin_segments == 1,
                     "an enabled session must emit exactly one FIN, scoped with its salt");
         session->stop();
     }
@@ -2143,7 +2160,7 @@ void test_session_half_close_fin_gate_and_delivery() {
         io.poll();
 
         const auto payload = fin_payload_with(salt);
-        expect_true(peer.send(byte_view(payload.data(), payload.size())) >= 0, "peer FIN send");
+        CHECK_MESSAGE(peer.send(byte_view(payload.data(), payload.size())) >= 0, "peer FIN send");
         uint32_t now = 0;
         for (int i = 0; i < 60 && !completed; ++i) {
             now += KCP_INTERVAL_MS;
@@ -2152,10 +2169,11 @@ void test_session_half_close_fin_gate_and_delivery() {
             io.restart();
             io.poll();
         }
-        expect_true(completed, "a FIN must complete the parked read instead of hanging it");
-        expect_true(read_ec == asio::error::eof,
-                    "a FIN must complete the read with eof, the signal the forwarding loops act on");
-        expect_true(session->peer_fin_received(), "a FIN must latch peer_fin_received()");
+        CHECK_MESSAGE(completed, "a FIN must complete the parked read instead of hanging it");
+        CHECK_MESSAGE(
+            read_ec == asio::error::eof,
+            "a FIN must complete the read with eof, the signal the forwarding loops act on");
+        CHECK_MESSAGE(session->peer_fin_received(), "a FIN must latch peer_fin_received()");
         session->stop();
     }
 
@@ -2191,7 +2209,8 @@ void test_session_half_close_fin_gate_and_delivery() {
         // Same magic, different salt: only a peer holding THIS session's salt
         // may half-close it.
         const auto foreign = fin_payload_with(Crypto::generate_session_salt());
-        expect_true(peer.send(byte_view(foreign.data(), foreign.size())) >= 0, "peer foreign send");
+        CHECK_MESSAGE(peer.send(byte_view(foreign.data(), foreign.size())) >= 0,
+                      "peer foreign send");
         uint32_t now = 0;
         for (int i = 0; i < 60 && !completed; ++i) {
             now += KCP_INTERVAL_MS;
@@ -2200,11 +2219,11 @@ void test_session_half_close_fin_gate_and_delivery() {
             io.restart();
             io.poll();
         }
-        expect_true(completed, "a foreign-salt FIN must be delivered as data, not dropped");
-        expect_true(!read_ec, "a foreign-salt FIN must not be reported as eof");
-        expect_true(read_bytes == foreign.size(),
+        CHECK_MESSAGE(completed, "a foreign-salt FIN must be delivered as data, not dropped");
+        CHECK_MESSAGE(!read_ec, "a foreign-salt FIN must not be reported as eof");
+        CHECK_MESSAGE(read_bytes == foreign.size(),
                     "a foreign-salt FIN must arrive as ordinary stream bytes");
-        expect_true(!session->peer_fin_received(),
+        CHECK_MESSAGE(!session->peer_fin_received(),
                     "a foreign-salt FIN must not latch the half-close flag");
         session->stop();
     }
@@ -2244,7 +2263,7 @@ std::shared_ptr<KCPClientSession> make_client_session(asio::io_context& io,
     return std::make_shared<KCPClientSession>(io, endpoint, crypto);
 }
 
-void test_client_session_close_before_connect_is_safe_and_idempotent() {
+TEST_CASE("test_client_session_close_before_connect_is_safe_and_idempotent") {
     // abort_handshake() can run before the session ever reached connect(): the
     // local app may disconnect (or send a bad greeting) while the SOCKS5 step is
     // still in flight, and the handshake deadline can fire first. close() must
@@ -2253,17 +2272,17 @@ void test_client_session_close_before_connect_is_safe_and_idempotent() {
     asio::io_context io;
     auto session = make_client_session(io, free_udp_port());
 
-    expect_true(!session->is_connected(), "fresh client session must not look connected");
+    CHECK_MESSAGE(!session->is_connected(), "fresh client session must not look connected");
 
     session->close();
     io.poll();
     io.restart();
-    expect_true(!session->is_connected(), "close before connect must not connect the session");
+    CHECK_MESSAGE(!session->is_connected(), "close before connect must not connect the session");
 
     session->close();
     io.restart();
     io.poll();
-    expect_true(!session->is_connected(), "second close must stay a no-op");
+    CHECK_MESSAGE(!session->is_connected(), "second close must stay a no-op");
 
     // KCPProxyClient's shared 10ms tick calls on_update_tick() for every
     // registered session; on a closed one it must be inert (no crash, no queued
@@ -2271,11 +2290,12 @@ void test_client_session_close_before_connect_is_safe_and_idempotent() {
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.restart();
     io.poll();
-    expect_true(!session->is_connected(), "on_update_tick on a closed session must not revive it");
-    expect_true(session->wait_send() == 0, "closed session must not queue KCP data");
+    CHECK_MESSAGE(!session->is_connected(),
+                  "on_update_tick on a closed session must not revive it");
+    CHECK_MESSAGE(session->wait_send() == 0, "closed session must not queue KCP data");
 }
 
-void test_client_session_close_mid_handshake_makes_it_inert() {
+TEST_CASE("test_client_session_close_mid_handshake_makes_it_inert") {
     // The state abort_handshake() has to leave the session in. While the
     // handshake read is parked the session is live, so a caller's read is
     // rejected instead of stacked (observable proof of the parked read); after
@@ -2300,15 +2320,15 @@ void test_client_session_close_mid_handshake_makes_it_inert() {
     });
     io.poll();
     io.restart();
-    expect_true(stacked_called, "read issued while the handshake read is parked must not hang");
-    expect_true(stacked_ec == asio::error::already_started,
+    CHECK_MESSAGE(stacked_called, "read issued while the handshake read is parked must not hang");
+    CHECK_MESSAGE(stacked_ec == asio::error::already_started,
                 "a stacked read must be rejected with already_started");
 
     session->close();
     io.poll();
     io.restart();
     io.poll();
-    expect_true(!session->is_connected(), "closed session must not report connected");
+    CHECK_MESSAGE(!session->is_connected(), "closed session must not report connected");
 
     bool read_called = false;
     std::error_code read_ec;
@@ -2319,13 +2339,13 @@ void test_client_session_close_mid_handshake_makes_it_inert() {
     io.poll();
     io.restart();
     io.poll();
-    expect_true(read_called, "read on a closed session must complete, not hang");
-    expect_true(read_ec == asio::error::operation_aborted,
+    CHECK_MESSAGE(read_called, "read on a closed session must complete, not hang");
+    CHECK_MESSAGE(read_ec == asio::error::operation_aborted,
                 "read on a closed session must report operation_aborted");
-    expect_true(!session->is_connected(), "session must stay closed");
+    CHECK_MESSAGE(!session->is_connected(), "session must stay closed");
 }
 
-void test_client_session_close_releases_parked_handler() {
+TEST_CASE("test_client_session_close_releases_parked_handler") {
     // The leak regression, made observable. connect() parks a read handler that
     // captures the session's own shared_ptr; if close() did not release it, the
     // session -- and with it the UDP socket -- would outlive every owner, which
@@ -2350,12 +2370,12 @@ void test_client_session_close_releases_parked_handler() {
     // UDP receive): each of those handlers holds a self-reference until it runs.
     io.restart();
     io.poll();
-    expect_true(weak.expired(),
+    CHECK_MESSAGE(weak.expired(),
                 "closed client session was still referenced by a parked handler "
                 "(session + UDP socket leak)");
 }
 
-void test_client_session_keepalive_released_with_session() {
+TEST_CASE("test_client_session_keepalive_released_with_session") {
     // set_keepalive() carries the client's session-cap ticket (see
     // handle_client_connection in client.cpp): the counter must drop exactly
     // when the session object dies, on every teardown path, which is what lets
@@ -2366,9 +2386,9 @@ void test_client_session_keepalive_released_with_session() {
     {
         auto session = make_client_session(io, free_udp_port());
         session->set_keepalive(probe);
-        expect_true(probe.use_count() == 2, "the session must hold the keepalive resource");
+        CHECK_MESSAGE(probe.use_count() == 2, "the session must hold the keepalive resource");
     }
-    expect_true(probe.use_count() == 1,
+    CHECK_MESSAGE(probe.use_count() == 1,
                 "keepalive resource must be released when the session is destroyed");
 }
 
@@ -2384,7 +2404,7 @@ struct ClientIoGuard {
     }
 };
 
-void test_client_abort_handshake_closes_local_socket() {
+TEST_CASE("test_client_abort_handshake_closes_local_socket") {
     // Regression for abort_handshake() (see client.hpp). The KCP handshake to an
     // unreachable server never completes, so the failure path must close BOTH
     // the local app socket and the KCP session. Before the fix only the deadline
@@ -2425,7 +2445,7 @@ void test_client_abort_handshake_closes_local_socket() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-    expect_true(up, "client SOCKS5 listener never came up");
+    CHECK_MESSAGE(up, "client SOCKS5 listener never came up");
 
     // A local app opens a tunnel. The KCP handshake times out after
     // KCP_HANDSHAKE_TIMEOUT_SEC, after which abort_handshake() must close this
@@ -2434,7 +2454,7 @@ void test_client_abort_handshake_closes_local_socket() {
     asio::ip::tcp::socket app(app_io);
     std::error_code ec;
     app.connect(listen_ep, ec);
-    expect_true(!ec, "local app could not connect to the client listener");
+    CHECK_MESSAGE(!ec, "local app could not connect to the client listener");
     const std::array<uint8_t, 3> greeting{0x05, 0x01, 0x00};
     asio::write(app, asio::buffer(greeting), ec);
 
@@ -2456,10 +2476,10 @@ void test_client_abort_handshake_closes_local_socket() {
         });
     app_io.run();
 
-    expect_true(!timed_out,
+    CHECK_MESSAGE(!timed_out,
                 "abort_handshake left the local app hanging after the KCP "
                 "handshake failed (socket neither closed nor reset)");
-    expect_true(peer_closed,
+    CHECK_MESSAGE(peer_closed,
                 "abort_handshake must close the local socket when the KCP handshake fails");
 
     // The client must still be serving afterwards: a fresh local connection is
@@ -2467,7 +2487,7 @@ void test_client_abort_handshake_closes_local_socket() {
     // held against the session cap.
     asio::ip::tcp::socket app2(app_io);
     app2.connect(listen_ep, ec);
-    expect_true(!ec, "client stopped accepting connections after a failed handshake");
+    CHECK_MESSAGE(!ec, "client stopped accepting connections after a failed handshake");
     app2.close(ec);
     app.close(ec);
 }
@@ -2492,7 +2512,7 @@ void test_client_abort_handshake_closes_local_socket() {
 // A live in-process KCP server is required because the greeting is only read
 // after the KCP handshake succeeds (see handle_client_connection): against a
 // dead server port the greeting is never consumed and nothing is replied.
-void test_client_malformed_greeting_keeps_its_reply() {
+TEST_CASE("test_client_malformed_greeting_keeps_its_reply") {
     asio::io_context io;
     const std::string key = "remote_test_key_123456";
     const uint16_t server_port = free_udp_port();
@@ -2524,7 +2544,7 @@ void test_client_malformed_greeting_keeps_its_reply() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-    expect_true(up, "client SOCKS5 listener never came up");
+    CHECK_MESSAGE(up, "client SOCKS5 listener never came up");
 
     // 20 iterations: without the fix the per-iteration loss probability was
     // ~25%, so a broken close is caught with probability 1 - 0.75^20 > 99.6%.
@@ -2541,7 +2561,7 @@ void test_client_malformed_greeting_keeps_its_reply() {
         asio::ip::tcp::socket app(app_io);
         std::error_code ec;
         app.connect(listen_ep, ec);
-        expect_true(!ec, "local app could not connect to the client listener");
+        CHECK_MESSAGE(!ec, "local app could not connect to the client listener");
 
         // Malformed greeting (version 0x04) with one pipelined extra byte.
         const std::array<uint8_t, 3> greeting{0x04, 0x01, 0x00};
@@ -2577,10 +2597,10 @@ void test_client_malformed_greeting_keeps_its_reply() {
     }
     set_log_level(prev_level);
 
-    expect_true(lost_replies == 0,
+    CHECK_MESSAGE(lost_replies == 0,
                 "a malformed greeting must always be answered before the close "
                 "(an RST discards the reply -- see close_local_socket)");
-    expect_true(resets == 0, "the rejection close must be a FIN, not an RST");
+    CHECK_MESSAGE(resets == 0, "the rejection close must be a FIN, not an RST");
 
     // The client must still be serving afterwards, and the rejected sessions
     // must have been released rather than held against the session cap.
@@ -2588,7 +2608,7 @@ void test_client_malformed_greeting_keeps_its_reply() {
     asio::ip::tcp::socket app2(app_io);
     std::error_code ec;
     app2.connect(listen_ep, ec);
-    expect_true(!ec, "client stopped accepting connections after rejections");
+    CHECK_MESSAGE(!ec, "client stopped accepting connections after rejections");
     app2.close(ec);
 
     server->stop();
@@ -2605,36 +2625,34 @@ void test_client_malformed_greeting_keeps_its_reply() {
 // robustness suite greps the flood log for exactly those messages, so a
 // throttle that swallowed the first occurrence would turn a flood into a
 // silent one -- and silently losing the diagnostic is worse than the spam.
-void test_log_throttle() {
+TEST_CASE("test_log_throttle") {
     LogThrottle throttle(std::chrono::milliseconds(40));
     uint32_t suppressed = 0;
 
     // The first call always emits, reporting nothing suppressed.
     suppressed = 12345;  // must be overwritten on the emitting path
-    expect_true(throttle.should_log(suppressed), "first call must emit");
-    expect_true(suppressed == 0, "first emission reports nothing suppressed");
+    CHECK_MESSAGE(throttle.should_log(suppressed), "first call must emit");
+    CHECK_MESSAGE(suppressed == 0, "first emission reports nothing suppressed");
 
     // Everything inside the window is folded in instead of logged.
     for (uint32_t i = 0; i < 3; ++i) {
         suppressed = 12345;
-        expect_true(!throttle.should_log(suppressed),
+        CHECK_MESSAGE(!throttle.should_log(suppressed),
                     "a call inside the window must be suppressed");
-        expect_true(suppressed == 12345,
-                    "a suppressed call must not touch the out-param");
-        expect_true(throttle.pending() == i + 1,
-                    "pending() tracks the suppressed occurrences");
+        CHECK_MESSAGE(suppressed == 12345, "a suppressed call must not touch the out-param");
+        CHECK_MESSAGE(throttle.pending() == i + 1, "pending() tracks the suppressed occurrences");
     }
 
     // After the window elapses the next call emits and reports the tally, which
     // then resets -- so a flood yields one line per interval carrying the count.
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     suppressed = 0;
-    expect_true(throttle.should_log(suppressed), "post-window call must emit");
-    expect_true(suppressed == 3, "emission must report the suppressed count");
-    expect_true(throttle.pending() == 0, "the tally resets after an emission");
+    CHECK_MESSAGE(throttle.should_log(suppressed), "post-window call must emit");
+    CHECK_MESSAGE(suppressed == 3, "emission must report the suppressed count");
+    CHECK_MESSAGE(throttle.pending() == 0, "the tally resets after an emission");
 }
 
-void test_log_throttle_concurrent_calls_balance() {
+TEST_CASE("test_log_throttle_concurrent_calls_balance") {
     // LogThrottle is now internally synchronized because Crypto::decrypt_impl's
     // rejection paths share process-wide instances across the server's UDP
     // strand AND every session strand (see crypto.cpp). The invariant that
@@ -2665,12 +2683,12 @@ void test_log_throttle_concurrent_calls_balance() {
 
     const uint32_t total = static_cast<uint32_t>(kThreads * kCallsPerThread);
     const uint32_t folded_away = total - static_cast<uint32_t>(emissions.load());
-    expect_true(reported.load() + throttle.pending() == folded_away,
+    CHECK_MESSAGE(reported.load() + throttle.pending() == folded_away,
                 "concurrent LogThrottle calls lost occurrences "
                 "(suppressed tally does not balance: unsynchronized?)");
 }
 
-void test_allowlist_matching() {
+TEST_CASE("test_allowlist_matching") {
     using kcp_proxy::parse_allow_target_entry;
     using kcp_proxy::target_matches_allowlist;
 
@@ -2679,43 +2697,45 @@ void test_allowlist_matching() {
     uint16_t port = 0;
 
     // Exact host+port entries.
-    expect_true(parse_allow_target_entry("127.0.0.1:9000", host, has_port, port),
+    CHECK_MESSAGE(parse_allow_target_entry("127.0.0.1:9000", host, has_port, port),
                 "host:port entry should parse");
-    expect_true(host == "127.0.0.1" && has_port && port == 9000,
-                "host:port parsed values");
-    expect_true(target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.1", 9000),
+    CHECK_MESSAGE(host == "127.0.0.1", "host:port parsed host");
+    CHECK_MESSAGE(has_port, "host:port entry must set has_port");
+    CHECK_MESSAGE(port == 9000, "host:port parsed port");
+    CHECK_MESSAGE(target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.1", 9000),
                 "exact entry matches its host and port");
-    expect_true(!target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.1", 9001),
+    CHECK_MESSAGE(!target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.1", 9001),
                 "exact entry must not match a different port");
-    expect_true(!target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.2", 9000),
+    CHECK_MESSAGE(!target_matches_allowlist({"127.0.0.1:9000"}, "127.0.0.2", 9000),
                 "exact entry must not match a different host");
 
     // Host-only entries match every port on that host (documented semantics).
-    expect_true(target_matches_allowlist({"127.0.0.1"}, "127.0.0.1", 1),
+    CHECK_MESSAGE(target_matches_allowlist({"127.0.0.1"}, "127.0.0.1", 1),
                 "host-only entry matches low port");
-    expect_true(target_matches_allowlist({"127.0.0.1"}, "127.0.0.1", 65535),
+    CHECK_MESSAGE(target_matches_allowlist({"127.0.0.1"}, "127.0.0.1", 65535),
                 "host-only entry matches high port");
-    expect_true(!target_matches_allowlist({"127.0.0.1"}, "127.0.0.2", 1),
+    CHECK_MESSAGE(!target_matches_allowlist({"127.0.0.1"}, "127.0.0.2", 1),
                 "host-only entry must not match another host");
-    expect_true(target_matches_allowlist({"example.com"}, "example.com", 443),
+    CHECK_MESSAGE(target_matches_allowlist({"example.com"}, "example.com", 443),
                 "hostname-only entry matches any port");
-    expect_true(target_matches_allowlist({"example.com:443"}, "example.com", 443),
+    CHECK_MESSAGE(target_matches_allowlist({"example.com:443"}, "example.com", 443),
                 "hostname:port entry matches");
 
     // IPv6 forms.
-    expect_true(parse_allow_target_entry("[::1]:9000", host, has_port, port),
+    CHECK_MESSAGE(parse_allow_target_entry("[::1]:9000", host, has_port, port),
                 "bracketed IPv6 with port should parse");
-    expect_true(host == "::1" && has_port && port == 9000,
-                "bracketed IPv6 parsed values");
-    expect_true(target_matches_allowlist({"[::1]:9000"}, "::1", 9000),
+    CHECK_MESSAGE(host == "::1", "bracketed IPv6 parsed host");
+    CHECK_MESSAGE(has_port, "bracketed IPv6 entry must set has_port");
+    CHECK_MESSAGE(port == 9000, "bracketed IPv6 parsed port");
+    CHECK_MESSAGE(target_matches_allowlist({"[::1]:9000"}, "::1", 9000),
                 "bracketed IPv6 entry matches");
-    expect_true(target_matches_allowlist({"[::1]"}, "::1", 1234),
+    CHECK_MESSAGE(target_matches_allowlist({"[::1]"}, "::1", 1234),
                 "bracketed host-only IPv6 matches any port");
-    expect_true(target_matches_allowlist({"::1"}, "::1", 1234),
+    CHECK_MESSAGE(target_matches_allowlist({"::1"}, "::1", 1234),
                 "bare multi-colon IPv6 is a host-only entry");
-    expect_true(target_matches_allowlist({"2001:db8::1"}, "2001:db8::1", 80),
+    CHECK_MESSAGE(target_matches_allowlist({"2001:db8::1"}, "2001:db8::1", 80),
                 "bare IPv6 literal host-only matches");
-    expect_true(!target_matches_allowlist({"[::1]:9000"}, "::1", 9001),
+    CHECK_MESSAGE(!target_matches_allowlist({"[::1]:9000"}, "::1", 9001),
                 "bracketed entry must not match another port");
 
     // Malformed entries are rejected by the parser and match nothing.
@@ -2735,39 +2755,39 @@ void test_allowlist_matching() {
         "host:3000000000", "[::1]:3000000000", "host:99999999999999999999999"
     };
     for (const char* entry : malformed) {
-        expect_true(!parse_allow_target_entry(entry, host, has_port, port),
+        CHECK_MESSAGE(!parse_allow_target_entry(entry, host, has_port, port),
                     "malformed entry must be rejected");
-        expect_true(!target_matches_allowlist({entry}, "host", 9000) &&
-                    !target_matches_allowlist({entry}, "::1", 9000),
-                    "malformed entry must match nothing");
+        CHECK_MESSAGE(!target_matches_allowlist({entry}, "host", 9000),
+                    "malformed entry must not match host:9000");
+        CHECK_MESSAGE(!target_matches_allowlist({entry}, "::1", 9000),
+                    "malformed entry must not match [::1]:9000");
     }
     // The wrapping regressions: these ports must not have been silently
     // allowlisted by the typo'd entries above.
-    expect_true(!target_matches_allowlist({"host:99999"}, "host", 34463),
+    CHECK_MESSAGE(!target_matches_allowlist({"host:99999"}, "host", 34463),
                 "port 99999 must not wrap to 34463");
-    expect_true(!target_matches_allowlist({"host:-1"}, "host", 65535),
+    CHECK_MESSAGE(!target_matches_allowlist({"host:-1"}, "host", 65535),
                 "port -1 must not wrap to 65535");
 
     // No wildcard support: '*' (and any glob-ish entry) is inert.
-    expect_true(!target_matches_allowlist({"*"}, "anything", 80),
+    CHECK_MESSAGE(!target_matches_allowlist({"*"}, "anything", 80),
                 "wildcard entry must not match everything");
-    expect_true(!target_matches_allowlist({"*:80"}, "anything", 80),
+    CHECK_MESSAGE(!target_matches_allowlist({"*:80"}, "anything", 80),
                 "wildcard host with port must not match");
 
     // A malformed entry is skipped without hiding a later valid one, and the
     // matcher is safe against an empty allowlist (production default).
-    expect_true(target_matches_allowlist({"host:", "127.0.0.1:9000"},
-                                         "127.0.0.1", 9000),
-                "valid entry after a malformed one still matches");
-    expect_true(!target_matches_allowlist({}, "127.0.0.1", 9000),
-                "empty allowlist matches nothing");
+    CHECK_MESSAGE(target_matches_allowlist({"host:", "127.0.0.1:9000"}, "127.0.0.1", 9000),
+                  "valid entry after a malformed one still matches");
+    CHECK_MESSAGE(!target_matches_allowlist({}, "127.0.0.1", 9000),
+                  "empty allowlist matches nothing");
 }
 
 // --------------------------------------------------------------------------- //
 // Round 1-5: adversarial review follow-ups
 // --------------------------------------------------------------------------- //
 
-void test_log_throttle_saturates_instead_of_wrapping() {
+TEST_CASE("test_log_throttle_saturates_instead_of_wrapping") {
     constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
     // The tally is what an operator reads to size a flood. A counter that wraps
     // at 2^32 reports a count LOWER than what was actually dropped -- and does
@@ -2777,22 +2797,22 @@ void test_log_throttle_saturates_instead_of_wrapping() {
     // Far past the uint32 range: a saturated counter must still report the
     // maximum, never wrap around to a small (or zero) number.
     throttle.add_suppressed_for_test(static_cast<uint64_t>(kU32Max) + 1000ull);
-    expect_true(throttle.pending() == kU32Max,
+    CHECK_MESSAGE(throttle.pending() == kU32Max,
                 "suppressed tally must saturate at kU32Max");
 
     // And it must stay there, not decay past the cap on further occurrences.
     throttle.add_suppressed_for_test(1);
-    expect_true(throttle.pending() == kU32Max,
+    CHECK_MESSAGE(throttle.pending() == kU32Max,
                 "saturated tally must not move on further occurrences");
 
     // The reported value on emission is the saturated one.
     uint32_t suppressed = 0;
-    expect_true(throttle.should_log(suppressed), "first emission should fire");
-    expect_true(suppressed == kU32Max, "emission reports the saturated tally");
-    expect_true(throttle.pending() == 0, "tally resets after an emission");
+    CHECK_MESSAGE(throttle.should_log(suppressed), "first emission should fire");
+    CHECK_MESSAGE(suppressed == kU32Max, "emission reports the saturated tally");
+    CHECK_MESSAGE(throttle.pending() == 0, "tally resets after an emission");
 }
 
-void test_kcp_input_rejection_log_is_bounded_and_single_line() {
+TEST_CASE("test_kcp_input_rejection_log_is_bounded_and_single_line") {
     // Two defects in one path, both attacker-paced:
     //   * KcpWrapper::input() logged its own WARNING AND every caller logged a
     //     second one, so one rejected datagram cost two lines.
@@ -2818,17 +2838,16 @@ void test_kcp_input_rejection_log_is_bounded_and_single_line() {
     set_log_sink_for_test(LogSink{});
 
     // Bounded: one line per interval, not one per datagram.
-    expect_true(kcp_input_lines.load() >= 1,
-                "the first rejection must always be visible");
-    expect_true(kcp_input_lines.load() <= 2,
-                "ikcp_input rejections must be throttled, not one line per datagram");
+    CHECK_MESSAGE(kcp_input_lines.load() >= 1, "the first rejection must always be visible");
+    CHECK_MESSAGE(kcp_input_lines.load() <= 2,
+                  "ikcp_input rejections must be throttled, not one line per datagram");
     // Single line per event: no second WARNING from the wrapper for the same
     // datagram (that duplication doubled the cost of the DoS).
-    expect_true(warnings.load() == kcp_input_lines.load(),
+    CHECK_MESSAGE(warnings.load() == kcp_input_lines.load(),
                 "one rejected datagram must produce exactly one warning line");
 }
 
-void test_session_target_close_drops_parked_write_hook() {
+TEST_CASE("test_session_target_close_drops_parked_write_hook") {
     // Regression: when the target TCP closed while the server's tcp->kcp loop
     // was parked on backpressure, the parked hook survived the close. The next
     // window drain (an ACK arrival, or the update tick's safety net) then
@@ -2890,7 +2909,7 @@ void test_session_target_close_drops_parked_write_hook() {
     }
     io.restart();
     io.poll();
-    expect_true(session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD,
+    CHECK_MESSAGE(session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD,
                 "the queued response must exceed the backpressure park threshold");
 
     // Park the tcp->kcp loop's hook exactly like forward_tcp_to_kcp does, then
@@ -2900,13 +2919,12 @@ void test_session_target_close_drops_parked_write_hook() {
         throw std::runtime_error(
             "stale tcp->kcp hook must never resume after the target closed");
     });
-    expect_true(session->write_parked(),
-                "the parked hook must be registered before the close");
+    CHECK_MESSAGE(session->write_parked(), "the parked hook must be registered before the close");
     session->mark_target_closed();
     io.restart();
     io.poll();
-    expect_true(!session->write_parked(),
-                "mark_target_closed must drop the parked tcp->kcp hook");
+    CHECK_MESSAGE(!session->write_parked(),
+                  "mark_target_closed must drop the parked tcp->kcp hook");
 
     // Drain the window with real peer ACKs until the resume watermark is
     // crossed -- the exact condition under which maybe_resume_write used to
@@ -2926,7 +2944,7 @@ void test_session_target_close_drops_parked_write_hook() {
         io.restart();
         io.poll();                  // session flushes more of the queued tail
     }
-    expect_true(session->wait_send() <= KCP_BACKPRESSURE_RESUME_THRESHOLD,
+    CHECK_MESSAGE(session->wait_send() <= KCP_BACKPRESSURE_RESUME_THRESHOLD,
                 "the peer ACKs must have drained the window below the resume "
                 "watermark (a vacuous drain would leave it above)");
 
@@ -2936,9 +2954,9 @@ void test_session_target_close_drops_parked_write_hook() {
     asio::dispatch(session->strand(), [&]() { session->on_update_tick(); });
     io.restart();
     io.poll();
-    expect_true(session->is_running(),
+    CHECK_MESSAGE(session->is_running(),
                 "the draining session must not have been stopped by a stale resume");
-    expect_true(session->is_alive(),
+    CHECK_MESSAGE(session->is_alive(),
                 "the draining session must stay alive after the target closed");
 
     session->stop();
@@ -2947,54 +2965,3 @@ void test_session_target_close_drops_parked_write_hook() {
 }
 
 } // namespace
-
-int main() {
-    try {
-        test_crypto_roundtrip_and_failures();
-        test_crypto_empty_payload_is_authenticated();
-        test_server_empty_packet_without_tag_does_not_create_session();
-        test_socks5_parser();
-        test_socks5_reply_bind_address();
-        test_socks5_reply_parser();
-        test_restricted_targets();
-        test_log_throttle();
-        test_log_throttle_concurrent_calls_balance();
-        test_allowlist_matching();
-        test_async_read_some_rejects_stacked_reads();
-        test_kcp_config_line();
-        test_socket_buffer_clamp_detection();
-        test_parse_fec_config();
-        test_fec_codec_repairs_lost_shards();
-        test_fec_frame_layout_at_crypto_reserve();
-        test_fec_encoder_does_not_leak_stale_shard_bytes();
-        test_fec_off_detects_a_fec_peer();
-        test_kcp_wrapper_applies_constants();
-        test_kcp_wrapper_oversized_message_is_not_truncated();
-        test_server_session_routing_and_auth();
-        test_server_unauth_packet_cannot_evict_live_session();
-        test_server_rejects_replayed_salt_after_session_death();
-        test_server_tombstone_cap_evicts_instead_of_locking_out();
-        test_server_is_released_when_its_owner_drops_it();
-        test_server_session_handshake_stall_is_bounded();
-        test_session_oversized_kcp_message_fails_read();
-        test_session_stop_makes_inert();
-        test_session_drained_callback_on_target_closed();
-        test_session_drained_deferred_while_send_buffer_nonempty();
-        test_session_target_close_drops_parked_write_hook();
-        test_server_adapts_fec_per_client_framing();
-        test_session_half_close_fin_gate_and_delivery();
-        test_client_session_close_before_connect_is_safe_and_idempotent();
-        test_client_session_close_mid_handshake_makes_it_inert();
-        test_client_session_close_releases_parked_handler();
-        test_client_session_keepalive_released_with_session();
-        test_client_abort_handshake_closes_local_socket();
-        test_client_malformed_greeting_keeps_its_reply();
-        test_log_throttle_saturates_instead_of_wrapping();
-        test_kcp_input_rejection_log_is_bounded_and_single_line();
-    } catch (const std::exception& e) {
-        std::cerr << "test failed: " << e.what() << "\n";
-        return 1;
-    }
-    std::cout << "all core tests passed\n";
-    return 0;
-}
