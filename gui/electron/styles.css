@@ -259,6 +259,8 @@ h1.status {
 }
 
 .kv > div {
+  /* Anchors .hint-tip to its own row (see .kv .hint-tip). */
+  position: relative;
   display: flex;
   align-items: baseline;
   gap: 18px;
@@ -282,11 +284,16 @@ h1.status {
   gap: 3px;
 }
 
-/* One-line explanation under each overview value. */
-.kv .kv-desc {
-  font-size: 12px;
-  color: var(--ink-3);
-  line-height: 1.5;
+/* The overview rows carry the same ? as the connection form, so their one-line
+   explanations live in the bubble instead of pushing a second text row under
+   every value. These rows are flex boxes, so the bubble is anchored to the row
+   and sized to its own text (capped at the row width) — the shared
+   left:0 / right:0 rule would stretch it across the entire row. */
+.kv .hint-tip {
+  left: 0;
+  right: auto;
+  width: max-content;
+  max-width: 100%;
 }
 
 code {
@@ -489,6 +496,12 @@ h2.view-title {
   gap: 22px 28px;
 }
 
+.fld {
+  /* Anchors .hint-tip to the field, so the bubble can span the field width and
+     never push the form into horizontal overflow. */
+  position: relative;
+}
+
 .fld label {
   display: block;
   font-size: 12px;
@@ -517,6 +530,64 @@ h2.view-title {
 .fld input:disabled {
   background: var(--line-2);
   color: var(--ink-3);
+}
+
+/* Field hint. The two sentences that used to sit in a block under the save
+   button now hang off the field they describe, behind a ? the reader can
+   ignore. The bubble spans the field width (see .fld position: relative)
+   instead of sizing to its text, so it can never overflow .main and turn it
+   into a horizontal scroller at narrow widths. */
+.hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-left: 5px;
+  border: 1px solid var(--ink-3);
+  border-radius: 50%;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--ink-3);
+  cursor: help;
+  vertical-align: 1px;
+  user-select: none;
+}
+
+.hint:hover,
+.hint:focus-visible {
+  color: var(--ink);
+  border-color: var(--ink-2);
+  outline: none;
+}
+
+.hint-tip {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--paper-2);
+  box-shadow: 0 6px 18px rgba(38, 34, 26, .13);
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: 1.75;
+  text-align: left;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity .15s;
+  pointer-events: none;
+}
+
+.hint:hover .hint-tip,
+.hint:focus-visible .hint-tip {
+  visibility: visible;
+  opacity: 1;
 }
 
 .checks {
@@ -563,20 +634,6 @@ h2.view-title {
   color: var(--paper-2);
   font-size: 12px;
   font-weight: bold;
-}
-
-.note {
-  margin-top: 24px;
-  padding: 14px 16px;
-  border-left: 2px solid var(--line);
-  background: var(--paper-2);
-  color: var(--ink-2);
-  font-size: 12.5px;
-  line-height: 1.9;
-}
-
-.note code {
-  font-size: 12px;
 }
 
 /* ── Log view ── */

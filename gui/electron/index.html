@@ -53,10 +53,10 @@
           <div class="status-sub">SOCKS5 over KCP 加密隧道 · 每日密钥自动轮换</div>
           <hr class="rule"/>
           <dl class="kv">
-            <div><dt>本地 SOCKS5</dt><dd><code id="ov-socks">socks5://127.0.0.1:1080</code><span class="kv-desc">浏览器与程序接入代理的入口地址</span></dd></div>
-            <div><dt>上游服务器</dt><dd><code id="ov-upstream">—</code><span class="kv-desc">KCP 加密隧道对端（地址:端口）</span></dd></div>
-            <div><dt>绑定地址</dt><dd><code id="ov-bind">127.0.0.1</code><span class="kv-desc">127.0.0.1 仅本机；0.0.0.0 允许局域网</span></dd></div>
-            <div><dt>今日密钥日期</dt><dd><code id="ov-keydate">—</code><span class="kv-desc">完整密钥 = 北京日期 + 密钥后缀，每日自动轮换</span></dd></div>
+            <div><dt>本地 SOCKS5<span class="hint" tabindex="0">?<span class="hint-tip" role="tooltip">浏览器与程序接入代理的入口地址：在系统或浏览器的代理设置里填这个 socks5:// 地址，流量就会走下面的加密隧道。</span></span></dt><dd><code id="ov-socks">socks5://127.0.0.1:1080</code></dd></div>
+            <div><dt>上游服务器<span class="hint" tabindex="0">?<span class="hint-tip" role="tooltip">KCP 加密隧道对端（地址:端口），即 kcp-proxy-server 所在主机的 IP 或域名与监听端口。</span></span></dt><dd><code id="ov-upstream">—</code></dd></div>
+            <div><dt>绑定地址<span class="hint" tabindex="0">?<span class="hint-tip" role="tooltip">本地 SOCKS5 监听在哪块网卡：127.0.0.1 仅本机；0.0.0.0 允许局域网内其它设备接入。</span></span></dt><dd><code id="ov-bind">127.0.0.1</code></dd></div>
+            <div><dt>今日密钥日期<span class="hint" tabindex="0">?<span class="hint-tip" role="tooltip">完整密钥 = 北京日期 (YYYYMMDD) + 密钥后缀，每日自动轮换；客户端与服务端必须一致。</span></span></dt><dd><code id="ov-keydate">—</code></dd></div>
           </dl>
           <div class="actions">
             <button class="btn btn-pine" id="btn-toggle">启动连接</button>
@@ -90,8 +90,14 @@
           <div class="grid2">
             <div class="fld"><label for="serverHost">服务器地址 (IP/域名)</label><input type="text" id="serverHost" placeholder="例如: example.com" spellcheck="false"/></div>
             <div class="fld"><label for="serverPort">服务器端口</label><input type="text" id="serverPort" placeholder="8388" inputmode="numeric"/></div>
-            <div class="fld"><label for="keySuffix">密钥后缀</label><input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线" spellcheck="false"/></div>
-            <div class="fld"><label for="fecPair">FEC 分片 (数据:校验)</label><input type="text" id="fecPair" placeholder="10:3" disabled/></div>
+            <div class="fld">
+              <label for="keySuffix">密钥后缀<span class="hint" tabindex="0">?<span class="hint-tip" role="tooltip">完整密钥 = 北京日期 (YYYYMMDD) + 密钥后缀，每日自动轮换，客户端与服务端需一致。</span></span></label>
+              <input type="text" id="keySuffix" placeholder="8-128 位字母、数字、点、下划线或短横线" spellcheck="false"/>
+            </div>
+            <div class="fld">
+              <label for="fecPair">FEC 分片 (数据:校验)<span class="hint" tabindex="0">?<span class="hint-tip" role="tooltip">默认 10:3，必须与服务器端一致，否则 FEC 会静默失效。服务器端改 /etc/kcp-proxy/server.env 里的 FEC=数据:校验 并重启 kcp-proxy-server。</span></span></label>
+              <input type="text" id="fecPair" placeholder="10:3" disabled/>
+            </div>
             <div class="fld"><label for="localPort">本地 SOCKS 端口</label><input type="text" id="localPort" placeholder="1080" inputmode="numeric"/></div>
           </div>
           <div class="checks">
@@ -104,7 +110,6 @@
             <button class="btn btn-fill" id="btn-save">保存设置</button>
             <span class="test-result" id="save-result" aria-live="polite"></span>
           </div>
-          <div class="note">完整密钥 = 北京日期 (YYYYMMDD) + 密钥后缀，每日自动轮换，客户端与服务端需一致。<br/>FEC 分片参数（默认 10:3）必须与服务器端一致，否则 FEC 会静默失效；服务器端改 /etc/kcp-proxy/server.env 里的 FEC=数据:校验 并重启 kcp-proxy-server。</div>
         </section>
 
         <!-- 运行日志 -->
