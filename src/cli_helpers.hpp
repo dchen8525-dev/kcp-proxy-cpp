@@ -1,66 +1,25 @@
 #pragma once
 
+#include "kcp_proxy/config.hpp"
 #include "kcp_proxy/logger.hpp"
+
 #include <asio.hpp>
+
+#include <CLI/CLI.hpp>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace kcp_proxy {
 namespace cli {
 
-inline std::string get_arg(int argc, char* argv[], int& i) {
-    if (i + 1 < argc) {
-        return argv[++i];
-    }
-    return "";
-}
-
-// `option` names the flag in the diagnostics: the client passes "-l/--listen-port"
-// for its local port, so a missing value cannot be reported as the unrelated
-// "-p/--port" (the message used to be hard-coded to the server's flag spelling).
-inline bool get_port_arg(int argc, char* argv[], int& i, uint16_t& out,
-                         const std::string& option = "-p/--port") {
-    std::string val = get_arg(argc, argv, i);
-    // Covers both the flag as the last argument and an explicitly empty value:
-    // both leave the port unset, and exiting 1 with no diagnostic (the old
-    // behavior) made a mistyped invocation look like a crash.
-    if (val.empty()) {
-        std::cerr << "Error: " << option << " requires a port number\n";
-        return false;
-    }
-    // Strict decimal parse: std::stoul alone accepts leading whitespace and a
-    // "0x" prefix, and silently ignores trailing junk ("8388x" -> 8388, so the
-    // proxy would start on a port different from what the operator typed, with
-    // the log confidently reporting the wrong one). The digits-only gate makes
-    // the subsequent stoul provably junk-free; the -T/--threads and
-    // --allow-target parsers are strict for the same reason.
-    if (val.find_first_not_of("0123456789") != std::string::npos) {
-        std::cerr << "Error: invalid port '" << val << "'\n";
-        return false;
-    }
-    try {
-        unsigned long v = std::stoul(val);
-        if (v > 65535) {
-            std::cerr << "Error: port out of range\n";
-            return false;
-        }
-        out = static_cast<uint16_t>(v);
-        return true;
-    } catch (const std::exception&) {
-        std::cerr << "Error: invalid port '" << val << "'\n";
-        return false;
-    }
-}
-
-// Read an environment variable ("" when unset). Used as an alternative
-// channel for --key: a secret passed as argv is visible to every local user
-// (Task Manager / wmic on Windows, /proc/<pid>/cmdline on Linux), while the
-// process environment is readable only by the same user (or root). GUIs
-// should therefore set KCP_PROXY_KEY instead of spawning with -k <key>.
+// Read an environment variable ("" when unset). Kept for the callers that need
+// a raw lookup; the option tables below reach it through CLI11's envname().
 inline std::string get_env(const char* name) {
 #ifdef _WIN32
     // MSVC deprecates getenv (C4996); _dupenv_s is the sanctioned form and is
@@ -79,29 +38,111 @@ inline std::string get_env(const char* name) {
 #endif
 }
 
+// Overwrite a secret before it leaves scope. The key reaches the process via
+// argv or the environment and both outlive the string that holds it here, so
+// zeroing only shortens the window -- but it is the window under our control.
 inline void secure_wipe(std::string& s) {
     volatile unsigned char* p = reinterpret_cast<volatile unsigned char*>(s.data());
-    for (size_t i = 0; i < s.size(); ++i) p[i] = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+        p[i] = 0;
 }
 
+// Strict decimal validator for numeric options.
+//
+// CLI11's default conversion goes through std::stoi, which accepts trailing
+// junk ("8388x" -> 8388), a "0x" prefix and leading whitespace. Every one of
+// those silently starts the proxy on a different port / thread count than the
+// operator typed, with the startup banner confidently reporting the wrong one
+// -- a regression this project has already fixed once by hand. The gate makes
+// the value provably digits-only, so the conversion behind it cannot truncate.
+//
+// Chained BEFORE CLI::Range so a typo reports "must be a decimal number"
+// rather than a range complaint about a number nobody typed.
+inline CLI::Validator positive_decimal(std::string name) {
+    return CLI::Validator(
+        [](std::string& v) -> std::string {
+            if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) {
+                return "must be a non-negative decimal number";
+            }
+            return {};
+        },
+        std::move(name));
+}
+
+// The key is a secret and has a minimum length; both are checked here so the
+// two binaries cannot disagree about what an acceptable key is.
+//
+// The empty check is not redundant with ->required(): `-k ""` is a PRESENT
+// option with an empty value, so CLI11 considers the requirement satisfied and
+// -- because the option was given -- never consults KCP_PROXY_KEY. The process
+// would then start with a zero-length key. The old hand-rolled parser looked at
+// key.empty() after the argv loop, which is why an empty -k used to fall back
+// to the environment. Every shipped launcher uses the environment and never
+// passes -k at all, so this is a regression guard rather than a live fix.
+inline CLI::Validator key_validator() {
+    return CLI::Validator(
+        [](std::string& v) -> std::string {
+            if (v.empty()) {
+                return "must not be empty";
+            }
+            if (v.size() < 16) {
+                return "must be at least 16 characters";
+            }
+            return {};
+        },
+        "KEY");
+}
+
+// Accept any spelling of the four level names, case-insensitively.
+//
+// The previous hand-rolled parser lowercased before comparing, so "-L WARNING"
+// (the spelling this project prints in every log line and in --help) was
+// accepted. A plain CLI::IsMember would reject it, which breaks the e2e suite
+// and every operator who copied the name from the banner. The declaration
+// accepts the canonical lowercase form; this validator decides by lowercasing.
+inline CLI::Validator log_level_validator() {
+    return CLI::Validator(
+        [](std::string& v) -> std::string {
+            std::string lower = v;
+            for (auto& c : lower) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (lower != "debug" && lower != "info" && lower != "warning" && lower != "error") {
+                return "must be one of DEBUG, INFO, WARNING, ERROR";
+            }
+            return {};
+        },
+        "LEVEL");
+}
+
+// Apply a log level by name, case-insensitively. An unknown name is a warning,
+// not a failure: the operator keeps the default level and still gets a server.
 inline void parse_log_level(const std::string& log_level) {
     std::string lower = log_level;
-    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (lower == "debug") set_log_level(LogLevel::Debug);
-    else if (lower == "info") set_log_level(LogLevel::Info);
-    else if (lower == "warning") set_log_level(LogLevel::Warning);
-    else if (lower == "error") set_log_level(LogLevel::Error);
-    else std::cerr << "Warning: unknown log level '" << log_level << "'\n";
+    for (auto& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "debug")
+        set_log_level(LogLevel::Debug);
+    else if (lower == "info")
+        set_log_level(LogLevel::Info);
+    else if (lower == "warning")
+        set_log_level(LogLevel::Warning);
+    else if (lower == "error")
+        set_log_level(LogLevel::Error);
+    else
+        std::cerr << "Warning: unknown log level '" << log_level << "'\n";
 }
 
 template <typename StopFn>
 inline void setup_signal_handler(asio::io_context& io, StopFn stop_fn) {
     auto signals = std::make_shared<asio::signal_set>(io, SIGINT
 #ifdef SIGTERM
-        , SIGTERM
+                                                      ,
+                                                      SIGTERM
 #endif
 #ifdef SIGBREAK
-        , SIGBREAK
+                                                      ,
+                                                      SIGBREAK
 #endif
     );
     signals->async_wait([&io, signals, stop = std::move(stop_fn)](const std::error_code&, int) {

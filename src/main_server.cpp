@@ -1,165 +1,132 @@
+#include "cli_helpers.hpp"
 #include "kcp_proxy/server.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
-#include "cli_helpers.hpp"
+
 #include <asio.hpp>
+
+#include <CLI/CLI.hpp>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace kcp_proxy;
 
-static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " [options]\n"
-              << "Options:\n"
-              << "  -p, --port PORT        UDP listen port (default: 8388)\n"
-              << "  -H, --host HOST        Bind address (default: 0.0.0.0)\n"
-              << "  -k, --key KEY          Encryption key (min 16 chars; alternatively\n"
-              << "                         set the KCP_PROXY_KEY environment variable)\n"
-              << "  -fec DATA:PARITY       Reed-Solomon FEC, e.g. -fec 10:3 (default: off).\n"
-              << "                         The server auto-adapts per session: a client that\n"
-              << "                         speaks FEC gets FEC back, a client that does not gets\n"
-              << "                         bare datagrams. This value sets the shard parameters\n"
-              << "                         used for adapting clients (default 10:3 when unset);\n"
-              << "                         keep the client's value equal to it so parity repair\n"
-              << "                         works in both directions.\n"
-              << "  -T, --threads N        io_context worker threads (default: 1).\n"
-              << "                         KCP updates run on a single shared 10ms tick;\n"
-              << "                         extra threads spread UDP/TCP I/O across cores.\n"
-              << "                         Thread safety comes from per-session strands\n"
-              << "                         and the shared_mutex-protected session map.\n"
-              << "  -L, --log-level LEVEL  Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)\n"
-              << "  --allow-target HOST[:PORT]  Allow a specific lab/test target to bypass\n"
-              << "                         the SSRF guard (repeatable). Off by default; never\n"
-              << "                         expose this in production. e.g. --allow-target 127.0.0.1:9000\n";
-}
+namespace {
 
-int main(int argc, char* argv[]) {
+struct ServerCliOptions {
     uint16_t port = 8388;
     std::string host = "0.0.0.0";
     std::string key;
-    std::string log_level = "INFO";
+    std::string fec_text;
     unsigned int threads = 1;
+    std::string log_level = "INFO";
     std::vector<std::string> allowed_targets;
-    FecConfig fec;
+};
 
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        // A value-taking flag left dangling at the end of argv must report the
-        // missing value, not "Unknown option" (which reads as if the flag did
-        // not exist -- the same reasoning that split the -fec arm below).
-        if ((arg == "-p" || arg == "--port" || arg == "-H" || arg == "--host" ||
-             arg == "-k" || arg == "--key" || arg == "-T" || arg == "--threads" ||
-             arg == "-L" || arg == "--log-level" || arg == "--allow-target") &&
-            i + 1 >= argc) {
-            std::cerr << "Error: " << arg << " requires a value" << std::endl;
-            return 1;
-        }
-        if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-            if (!cli::get_port_arg(argc, argv, i, port, "-p/--port")) return 1;
-        } else if ((arg == "-H" || arg == "--host") && i + 1 < argc) {
-            host = cli::get_arg(argc, argv, i);
-        } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
-            key = cli::get_arg(argc, argv, i);
-        } else if (arg == "-fec" || arg == "--fec") {
-            // Split from the "-fec VALUE" arm above so a bare trailing "-fec"
-            // reports what is actually wrong instead of "Unknown option: -fec"
-            // (which reads as if the flag did not exist at all).
-            if (i + 1 >= argc) {
-                std::cerr << "Error: --fec requires a DATA:PARITY value (e.g. 10:3), "
-                          << "or 0:0 to disable" << std::endl;
-                return 1;
+std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code) {
+    ServerCliOptions o;
+
+    CLI::App app{"kcp-proxy-server: SOCKS5-over-KCP tunnel server", "kcp-proxy-server"};
+    app.option_defaults()->configurable(false);
+
+    app.add_option("-p,--port", o.port, "UDP listen port")
+        ->check(cli::positive_decimal("PORT"))
+        ->check(CLI::Range(1, 65535))
+        ->capture_default_str();
+    app.add_option("-H,--host", o.host, "Bind address")->capture_default_str();
+    app.add_option("-k,--key", o.key, "Encryption key (min 16 chars)")
+        ->envname("KCP_PROXY_KEY")
+        ->check(cli::key_validator())
+        ->required();
+    app.add_option("--fec", o.fec_text,
+                   "Reed-Solomon FEC as DATA:PARITY, e.g. 10:3 (0:0 disables). "
+                   "The server auto-adapts per session: a client that speaks FEC "
+                   "gets FEC back, a client that does not gets bare datagrams. "
+                   "This value sets the shard parameters used for adapting "
+                   "clients (default 10:3 when unset); keep the client's value "
+                   "equal to it so parity repair works in both directions.")
+        ->default_str("off")
+        ->check([](const std::string& v) -> std::string {
+            // Fail-closed, exactly as parse_fec_config documents: anything but
+            // 0:0 or a valid shard pair refuses to start, so a typo can never
+            // open a server whose framing silently mismatches its clients.
+            FecConfig parsed;
+            if (!parse_fec_config(v, parsed)) {
+                return "must be DATA:PARITY (e.g. 10:3) with 1 <= PARITY <= DATA <= 255, "
+                       "or 0:0 to disable";
             }
-            // Fail-closed parse (see parse_fec_config): anything but 0:0 or a
-            // valid shard pair refuses to start, so a typo can never open a
-            // server whose framing silently mismatches its clients.
-            if (!parse_fec_config(cli::get_arg(argc, argv, i), fec)) {
-                std::cerr << "Error: --fec expects DATA:PARITY (e.g. 10:3), "
-                          << "with 1 <= PARITY <= DATA <= 255, or 0:0 to disable"
-                          << std::endl;
-                return 1;
-            }
-        } else if ((arg == "-T" || arg == "--threads") && i + 1 < argc) {
-            // Strict digits-only parse, deliberately stricter than std::stoul.
-            // stoul throws on "-T abc" / an over-long number, and this argv loop
-            // runs OUTSIDE main()'s try block, so the exception escaped as an
-            // uncaught exception: the process aborted with no diagnostic instead
-            // of printing an error. It also accepts trailing junk ("-T 4abc"
-            // silently meant 4). The allowlist parser rejects "80x" for exactly
-            // that reason, so stay consistent. The length gate (2 digits covers
-            // the 1..64 range) keeps the conversion provably in range on every
-            // platform, so nothing can throw here.
-            const std::string value = cli::get_arg(argc, argv, i);
-            if (value.empty() || value.size() > 2 ||
-                value.find_first_not_of("0123456789") != std::string::npos) {
-                std::cerr << "Error: --threads must be between 1 and 64" << std::endl;
-                return 1;
-            }
-            // Range-check BEFORE narrowing: assigning std::stoul's result
-            // straight to `unsigned int` truncated it first, so "-T 4294967297"
-            // wrapped to 1 and was accepted as a single-threaded server.
-            const unsigned long parsed = std::stoul(value);
-            if (parsed == 0 || parsed > 64) {
-                std::cerr << "Error: --threads must be between 1 and 64" << std::endl;
-                return 1;
-            }
-            threads = static_cast<unsigned int>(parsed);
-        } else if ((arg == "-L" || arg == "--log-level") && i + 1 < argc) {
-            log_level = cli::get_arg(argc, argv, i);
-        } else if (arg == "--allow-target" && i + 1 < argc) {
-            const std::string value = cli::get_arg(argc, argv, i);
-            std::string parsed_host;
+            return {};
+        });
+    app.add_option("-T,--threads", o.threads, "io_context worker threads")
+        ->check(cli::positive_decimal("N"))
+        ->check(CLI::Range(1, 64))
+        ->capture_default_str();
+    app.add_option("-L,--log-level", o.log_level, "Log level: DEBUG, INFO, WARNING, ERROR")
+        ->check(cli::log_level_validator())
+        ->capture_default_str();
+    app.add_option("--allow-target", o.allowed_targets,
+                   "Allow a specific lab/test target past the SSRF guard "
+                   "(repeatable; never use in production), e.g. 127.0.0.1:9000")
+        ->check([](const std::string& v) -> std::string {
+            std::string h;
             bool has_port = false;
-            uint16_t parsed_port = 0;
-            // Fail loudly: a malformed entry (e.g. "host:99999" or a missing
-            // value) is a typo an operator must see, not a silently inert
-            // allowlist row. The parser is fail-closed either way.
-            if (!kcp_proxy::parse_allow_target_entry(value, parsed_host,
-                                                     has_port, parsed_port)) {
-                std::cerr << "Error: invalid --allow-target entry '" << value
-                          << "' (expected HOST[:PORT] or [IPv6][:PORT])"
-                          << std::endl;
-                return 1;
+            uint16_t p = 0;
+            if (!parse_allow_target_entry(v, h, has_port, p)) {
+                return "must be HOST[:PORT] or [IPv6][:PORT]";
             }
-            allowed_targets.push_back(value);
-        } else {
-            std::cerr << "Unknown option: " << arg << std::endl;
-            print_usage(argv[0]);
-            return 1;
-        }
-    }
+            return {};
+        });
 
-    if (key.empty()) {
-        // Fallback channel for tooling: the environment keeps the secret out
-        // of the command line, which is visible to every local user.
-        key = cli::get_env("KCP_PROXY_KEY");
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        // app.exit() prints the diagnostic (to stderr for errors, stdout for
+        // --help/--version) and yields CLI11's own exit code, which the caller
+        // returns verbatim.
+        exit_code = app.exit(e);
+        return std::nullopt;
     }
-    if (key.empty()) {
-        std::cerr << "Error: --key is required (or set KCP_PROXY_KEY)" << std::endl;
-        print_usage(argv[0]);
+    return o;
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    int cli_exit = 0;
+    auto parsed_cli = parse_cli(argc, argv, cli_exit);
+    if (!parsed_cli) return cli_exit == 0 ? 1 : cli_exit;
+    ServerCliOptions opts = std::move(*parsed_cli);
+
+    // parse_fec_config already accepted this text in the validator; parsing it
+    // again here is what turns it into the shard pair (fails closed).
+    FecConfig fec;
+    if (!opts.fec_text.empty() && !parse_fec_config(opts.fec_text, fec)) {
+        std::cerr << "Error: --fec " << opts.fec_text << " is invalid" << std::endl;
         return 1;
     }
-    if (key.size() < 16) {
-        std::cerr << "Error: key must be at least 16 characters" << std::endl;
-        return 1;
-    }
 
-    cli::parse_log_level(log_level);
+    std::string& key = opts.key;
+    cli::parse_log_level(opts.log_level);
 
     try {
         asio::io_context io;
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
-        auto server = std::make_shared<KCPServer>(io, port, key, host, fec);
+        auto server = std::make_shared<KCPServer>(io, opts.port, key, opts.host, fec);
         cli::secure_wipe(key);
-        server->set_allowed_targets(allowed_targets);
+        server->set_allowed_targets(opts.allowed_targets);
         server->start();
 
-        LOG_INFO("main", "KCP proxy server started on " + host + ":" +
-                 std::to_string(server->bound_port()) + " fec=" + fec.to_string());
+        LOG_INFO("main", "KCP proxy server started on " + opts.host + ":" +
+                             std::to_string(server->bound_port()) + " fec=" + fec.to_string());
 
-        cli::setup_signal_handler(io, [server]() { server->stop(); });
+        cli::setup_signal_handler(io, [server]() {
+            server->stop();
+        });
 
         // An exception escaping an io_context handler is fatal -- the server is
         // left in an unknown state -- but it must not be allowed to unwind
@@ -171,7 +138,7 @@ int main(int argc, char* argv[]) {
         // stop the io_context so the others return, and rethrow only after the
         // join, where the stack is safe to unwind.
         std::vector<std::thread> io_threads;
-        io_threads.reserve(threads);
+        io_threads.reserve(opts.threads);
         std::exception_ptr handler_error;
         std::mutex handler_error_mutex;
         auto run_io = [&io, &handler_error, &handler_error_mutex]() {
@@ -187,11 +154,12 @@ int main(int argc, char* argv[]) {
                 io.stop();
             }
         };
-        for (unsigned int t = 1; t < threads; ++t) {
+        for (unsigned int t = 1; t < opts.threads; ++t) {
             io_threads.emplace_back(run_io);
         }
         run_io();
-        for (auto& t : io_threads) t.join();
+        for (auto& t : io_threads)
+            t.join();
         if (handler_error) {
             std::rethrow_exception(handler_error);
         }

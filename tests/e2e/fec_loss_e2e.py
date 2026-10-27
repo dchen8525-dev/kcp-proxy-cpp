@@ -9,7 +9,7 @@ latency). Nothing else about the stack changes -- the relay is transparent,
 so the pair negotiates and carries traffic exactly as it would over a
 lossy link.
 
-Phase 1 (FEC on, 8% loss both ways): server and client run -fec 10:3, so
+Phase 1 (FEC on, 8% loss both ways): server and client run --fec 10:3, so
   roughly 3 lost datagrams per shard set are repaired instead of retransmitted.
   The payload must round-trip byte-exact, and the client's stats line must
   report fec_repaired > 0 -- the codec's repairs must be observable, not
@@ -198,7 +198,7 @@ def extract_fec_repaired(log_text):
 
 
 def run_loss_phase(label, server_exe, client_exe, echo_port, fec_args):
-    """One relayed phase: start pair (with/without -fec), transfer, assert.
+    """One relayed phase: start pair (with/without --fec), transfer, assert.
 
     Returns the client log text (the caller asserts on the counters).
     """
@@ -315,7 +315,7 @@ def main():
         # --- Phase 1: FEC 10:3 through 8% loss: transfer + observable repairs ---
         client_log, server_log = run_loss_phase_with_retry(
             "fec=10:3 under loss", args.server, args.client, echo_port,
-            ["-fec", "10:3"])
+            ["--fec", "10:3"])
         if "FEC config shards=10:3" not in client_log:
             raise AssertionError("client startup log lacks the FEC config line")
         if "FEC config shards=10:3" not in server_log:

@@ -118,7 +118,7 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
             if (fec_peer_only_log().should_log(suppressed)) {
                 LOG_WARNING(log_module_,
                             log_msg("peer is sending FEC-framed datagrams but local --fec is off "
-                                    "(enable -fec with the SAME DATA:PARITY, or clear it on the "
+                                    "(enable --fec with the SAME DATA:PARITY, or clear it on the "
                                     "peer)" +
                                     (suppressed ? " (" + std::to_string(suppressed) +
                                                       " more suppressed this interval)"

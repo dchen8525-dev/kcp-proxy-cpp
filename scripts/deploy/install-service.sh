@@ -95,7 +95,7 @@ check_key_len "$(printf '%*s' "$KEY_LEN" '' | tr ' ' x)"
 # Value is "DATA:PARITY" (e.g. 10:3), "0:0" (explicit off) or empty. The server
 # auto-adapts its per-session FEC framing to each client either way (see
 # config.hpp); this setting only pins the shard parameters used for clients
-# that speak FEC. Written to server.env; the wrapper passes it as -fec so it
+# that speak FEC. Written to server.env; the wrapper passes it as --fec so it
 # survives the daily key-refresh restarts.
 FEC="${FEC:-}"
 if [ -z "$FEC" ] && [ -f "$ENV_FILE" ]; then
@@ -108,7 +108,7 @@ fi
 # Fail-closed validation, mirroring parse_fec_config in config.hpp: only 0:0,
 # empty, or DATA:PARITY with 1 <= PARITY <= DATA and DATA+PARITY <= 256.
 # An invalid value must abort the install loudly rather than reach the server
-# and turn the next restart into a crash loop (the server refuses a bad -fec).
+# and turn the next restart into a crash loop (the server refuses a bad --fec).
 # Leading zeros are stripped with the same dash-safe loop as the timer
 # fallback below (10#.. is bash-only and this file must stay dash-clean).
 validate_fec() {
@@ -228,7 +228,7 @@ SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
 
 # Same fail-closed shape as the installer's validate_fec: a corrupted FEC line
 # must abort here (visible in journald) instead of crash-looping the server on
-# a -fec it refuses.
+# a --fec it refuses.
 case "$FEC" in
     ""|0:0) ;;
     *[!0-9:]*) echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2; exit 1 ;;
@@ -244,7 +244,7 @@ case "$FEC" in
 esac
 SERVER_ARGS=(-p "$PORT" -H "$HOST" -L "$LOG_LEVEL")
 if [ -n "$FEC" ] && [ "$FEC" != "0:0" ]; then
-    SERVER_ARGS+=(-fec "$FEC")
+    SERVER_ARGS+=(--fec "$FEC")
 fi
 
 DATE_BEIJING=$(TZ=Asia/Shanghai date +%Y%m%d)

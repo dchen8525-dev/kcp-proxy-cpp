@@ -96,7 +96,7 @@ function validateLaunchConfig(cfg) {
 // visible to every local user, while its environment is not.
 // allowLan binds the SOCKS listener to 0.0.0.0 instead of loopback only —
 // the default stays 127.0.0.1 so a fresh install never exposes the proxy.
-// FEC rides as "-fec DATA:PARITY" ONLY when enabled: an absent flag is the
+// FEC rides as "--fec DATA:PARITY" ONLY when enabled: an absent flag is the
 // disabled form, keeping the argv (and the wire) byte-identical to pre-FEC
 // launches. Both peers must run identical values — there is no negotiation.
 function buildClientArgs({ serverHost, serverPort, localPort, allowLan,
@@ -117,7 +117,7 @@ function buildClientArgs({ serverHost, serverPort, localPort, allowLan,
     // keeping a half-filled form usable.
     const pair = parseFecPair(fecPair);
     const valid = pair && pair[0] > 0 && pair[1] > 0;
-    args.push('-fec', valid ? `${pair[0]}:${pair[1]}` : '10:3');
+    args.push('--fec', valid ? `${pair[0]}:${pair[1]}` : '10:3');
   }
   return args;
 }

@@ -234,7 +234,7 @@ case "$FEC" in
             echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2
             exit 1
         fi
-        FEC_ARGS="-fec $FEC"
+        FEC_ARGS="--fec $FEC"
         ;;
 esac
 SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
@@ -265,7 +265,7 @@ if [ -n "$LOG_FILE" ] && ( : >> "$LOG_FILE" ) 2>/dev/null; then
     fi
     {
         echo "=== $(TZ=Asia/Shanghai date '+%F %T') starting  key_date=${DATE_BEIJING}  port=${PORT}  fec=${FEC:-adaptive-default} ==="
-        # $FEC_ARGS is validated above to be empty or exactly "-fec N:M", so
+        # $FEC_ARGS is validated above to be empty or exactly "--fec N:M", so
         # the unquoted word split is safe and keeps this /bin/sh (dash) clean.
         exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL" $FEC_ARGS
     } >> "$LOG_FILE" 2>&1
@@ -279,7 +279,7 @@ exec "$SERVER_BIN" -p "$PORT" -H "$HOST" -L "$LOG_LEVEL" $FEC_ARGS
 
 # FEC shard pair auto-written to server.env when the line is missing (the
 # GUI/CLI default; the server's per-session auto-adaptation uses the same
-# values when -fec is absent entirely).
+# values when --fec is absent entirely).
 DEFAULT_SERVER_FEC = "10:3"
 
 SERVER_ENV = f"""\

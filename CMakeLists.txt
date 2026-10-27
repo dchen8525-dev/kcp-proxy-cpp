@@ -40,6 +40,10 @@ find_package(spdlog CONFIG REQUIRED)
 # main, so the test target keeps its one-source shape.
 find_package(doctest CONFIG REQUIRED)
 
+# Command-line parsing (src/main_server.cpp, src/main_client.cpp). CLI11 ships
+# as a compiled static library, so the link is not just headers.
+find_package(CLI11 CONFIG REQUIRED)
+
 # KCP: the `kcp::kcp` target is the C++17 port of kcp-go (dchen8525-dev/kcp-cpp)
 # that replaced the C ikcp vcpkg port. It is consumed two ways, both pinned to
 # the same upstream revision:
@@ -181,10 +185,10 @@ endif()
 
 # --- Executables ---
 add_executable(kcp-proxy-server ${PROJECT_ROOT}/src/main_server.cpp)
-target_link_libraries(kcp-proxy-server PRIVATE kcp_proxy_lib)
+target_link_libraries(kcp-proxy-server PRIVATE kcp_proxy_lib CLI11::CLI11)
 
 add_executable(kcp-proxy-client ${PROJECT_ROOT}/src/main_client.cpp)
-target_link_libraries(kcp-proxy-client PRIVATE kcp_proxy_lib)
+target_link_libraries(kcp-proxy-client PRIVATE kcp_proxy_lib CLI11::CLI11)
 
 enable_testing()
 

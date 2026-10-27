@@ -451,7 +451,7 @@ async function startProxy(opts = {}) {
 
   // FEC: the form sends fecEnabled as a real boolean, but a value that round
   // tripped through the config file is a string, so normalize both. Without
-  // this the checkbox alone would not be enough to make `-fec` appear.
+  // this the checkbox alone would not be enough to make `--fec` appear.
   const fecEnabled = override && override.fecEnabled != null
     ? (override.fecEnabled === true || override.fecEnabled === 'true')
     : store.get('fecEnabled') === true;

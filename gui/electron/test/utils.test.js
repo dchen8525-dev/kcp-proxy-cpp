@@ -69,23 +69,23 @@ test('formatBytesPerSec humanizes rates and never goes negative', () => {
   assert.strictEqual(formatBytesPerSec(3.5 * 1024 * 1024), '3.50 MB/s');
 });
 
-test('buildClientArgs omits -fec entirely when FEC is disabled', () => {
+test('buildClientArgs omits --fec entirely when FEC is disabled', () => {
   // The absent flag IS the disabled form: argv (and wire) stay byte-identical
   // to pre-FEC launches, which is what keeps old pairs compatible.
   const args = buildClientArgs({
     serverHost: 'example.com', serverPort: '8388', localPort: '1080',
     allowLan: false
   });
-  assert.strictEqual(args.includes('-fec'), false);
+  assert.strictEqual(args.includes('--fec'), false);
 });
 
-test('buildClientArgs appends -fec DATA:PARITY when FEC is enabled', () => {
+test('buildClientArgs appends --fec DATA:PARITY when FEC is enabled', () => {
   const args = buildClientArgs({
     serverHost: 'example.com', serverPort: '8388', localPort: '1080',
     allowLan: false, fecEnabled: true, fecPair: '10:3'
   });
-  const i = args.indexOf('-fec');
-  assert.notStrictEqual(i, -1, '-fec flag must be present');
+  const i = args.indexOf('--fec');
+  assert.notStrictEqual(i, -1, '--fec flag must be present');
   assert.strictEqual(args[i + 1], '10:3');
   // The flag must come after the fixed connect parameters, at the tail.
   assert.ok(i > args.indexOf('-L'));
@@ -98,7 +98,7 @@ test('buildClientArgs canonicalizes the pair it emits', () => {
     serverHost: 'h', serverPort: 8388, localPort: 1080,
     allowLan: true, fecEnabled: true, fecPair: '010:003'
   });
-  assert.deepStrictEqual(args.slice(-2), ['-fec', '10:3']);
+  assert.deepStrictEqual(args.slice(-2), ['--fec', '10:3']);
 });
 
 test('validateLaunchConfig rejects bad FEC pairs only while FEC is enabled', () => {
@@ -128,7 +128,7 @@ test('validateLaunchConfig rejects bad FEC pairs only while FEC is enabled', () 
 
 test('buildClientArgs never emits a malformed pair for a bad FEC form', () => {
   // Regression: a malformed pair used to reach the argv verbatim (formerly as
-  // "-fec NaN:NaN"). The client's parser is fail-closed, so that is not a
+  // "--fec NaN:NaN"). The client's parser is fail-closed, so that is not a
   // degraded tunnel -- it is a client that refuses to start at all. Every
   // unusable value must fall back to the default pair instead.
   const cases = [
@@ -145,7 +145,7 @@ test('buildClientArgs never emits a malformed pair for a bad FEC form', () => {
       serverHost: 'h', serverPort: '8388', localPort: '1080',
       allowLan: false, fecEnabled: true, fecPair
     });
-    assert.strictEqual(args[args.indexOf('-fec') + 1], want,
+    assert.strictEqual(args[args.indexOf('--fec') + 1], want,
       `FEC form ${JSON.stringify(fecPair)} must fall back to ${want}`);
     assert.ok(!args.some((a) => a.includes('NaN')), 'no argv token may contain NaN');
   }

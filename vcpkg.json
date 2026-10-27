@@ -11,6 +11,7 @@
     },
     "spdlog",
     "doctest",
+    "cli11",
     "kcp-cpp"
   ]
 }
