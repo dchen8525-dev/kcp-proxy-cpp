@@ -802,11 +802,14 @@ void KCPProxyClient::read_socks5_reply(
             auto reply_write_deadline = std::make_shared<asio::steady_timer>(io_);
             reply_write_deadline->expires_after(std::chrono::seconds(SOCKS5_HANDSHAKE_TIMEOUT_SEC));
             reply_write_deadline->async_wait(
-                [client_socket, session](const std::error_code& wait_ec) {
+                [client_socket, session, self](const std::error_code& wait_ec) {
                     if (wait_ec == asio::error::operation_aborted) return;
                     LOG_WARNING("client", "SOCKS5 reply write stalled - reclaiming tunnel");
-                    std::error_code ignored_wait;
-                    client_socket->close(ignored_wait);
+                    // close_local_socket, not a bare close(): the app not
+                    // reading is exactly when unread bytes sit in the receive
+                    // queue, so a bare close() would RST and discard the reply
+                    // bytes we just wrote (see close_local_socket).
+                    self->close_local_socket(client_socket);
                     session->close();
                 });
 

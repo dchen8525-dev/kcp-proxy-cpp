@@ -238,6 +238,16 @@ Crypto::~Crypto() {
     // needs no wiping.
     OPENSSL_cleanse(encrypt_key_.data(), encrypt_key_.size());
     OPENSSL_cleanse(decrypt_key_.data(), decrypt_key_.size());
+    // The PSK too: derive_session_keys() only cleanses key_ once the key
+    // schedule is baked in, but a server-side Crypto whose FIRST decrypt fails
+    // before that point (datagram shorter than the header, EVP init throwing)
+    // returns from decrypt_impl with key_ still holding the raw PSK, and the
+    // object is then destroyed. Without this it stayed readable in freed heap.
+    // cleanse on an empty string is a no-op, so the already-cleared case is free.
+    if (!key_.empty()) {
+        OPENSSL_cleanse(key_.data(), key_.size());
+        key_.clear();
+    }
 }
 
 std::array<uint8_t, NONCE_SIZE> Crypto::generate_nonce(uint64_t counter, uint8_t direction) {
