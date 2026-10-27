@@ -115,8 +115,14 @@ inline CLI::Validator log_level_validator() {
         "LEVEL");
 }
 
-// Apply a log level by name, case-insensitively. An unknown name is a warning,
-// not a failure: the operator keeps the default level and still gets a server.
+// Apply a log level by name, case-insensitively.
+//
+// Both mains attach log_level_validator() to -L, so by the time control
+// reaches here the name is guaranteed to be one of the four -- an unknown
+// spelling is rejected at parse time (fail-closed, like --fec), not silently
+// mapped to a default. The warning branch below therefore only fires for a
+// direct caller that bypasses the validator; it is defense-in-depth, not the
+// CLI contract.
 inline void parse_log_level(const std::string& log_level) {
     std::string lower = log_level;
     for (auto& c : lower)

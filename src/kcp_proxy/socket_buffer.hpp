@@ -117,12 +117,16 @@ inline EffectiveBufferSizes apply_udp_buffer_sizes(asio::ip::udp::socket& socket
     };
 
     if (report_once) {
+        // The first call's result is cached, not merely logged: a later caller
+        // must get the real sizes back, never the {"?", "?"} defaults of a
+        // fresh EffectiveBufferSizes. std::call_once synchronizes every call
+        // with the one that filled `cached`, so reading it afterwards is safe.
         static std::once_flag once;
-        EffectiveBufferSizes out;
+        static EffectiveBufferSizes cached;
         std::call_once(once, [&] {
-            out = read_and_report();
+            cached = read_and_report();
         });
-        return out;
+        return cached;
     }
     return read_and_report();
 }

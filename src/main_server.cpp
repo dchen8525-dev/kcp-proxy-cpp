@@ -86,8 +86,9 @@ std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {
         // app.exit() prints the diagnostic (to stderr for errors, stdout for
-        // --help/--version) and yields CLI11's own exit code, which the caller
-        // returns verbatim.
+        // --help) and yields CLI11's own exit code, which the caller returns
+        // verbatim. CallForHelp derives from Success, so --help is exit 0 --
+        // main() must pass it through, not coerce it to 1.
         exit_code = app.exit(e);
         return std::nullopt;
     }
@@ -99,7 +100,7 @@ std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code
 int main(int argc, char* argv[]) {
     int cli_exit = 0;
     auto parsed_cli = parse_cli(argc, argv, cli_exit);
-    if (!parsed_cli) return cli_exit == 0 ? 1 : cli_exit;
+    if (!parsed_cli) return cli_exit;
     ServerCliOptions opts = std::move(*parsed_cli);
 
     // parse_fec_config already accepted this text in the validator; parsing it

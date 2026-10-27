@@ -677,6 +677,29 @@ TEST_CASE("test_socket_buffer_clamp_detection") {
                   "any shortfall, however small, must be reported");
 }
 
+TEST_CASE("test_apply_udp_buffer_sizes_report_once_returns_cached_sizes") {
+    // report_once exists so a client with one socket per local TCP connection
+    // logs the (process-invariant) clamp report a single time. Its CONTRACT is
+    // that every call still returns real sizes: the pre-fix version left the
+    // result inside the call_once lambda, so calls after the first returned
+    // the {"?", "?"} defaults of a fresh EffectiveBufferSizes -- a trap for any
+    // future caller that uses the return value for a per-session banner.
+    asio::io_context io;
+    asio::ip::udp::socket sock(io);
+    sock.open(asio::ip::udp::v4());
+
+    const auto first = apply_udp_buffer_sizes(sock, "test", /*report_once=*/true);
+    const auto second = apply_udp_buffer_sizes(sock, "test", /*report_once=*/true);
+
+    CHECK_MESSAGE(first.rcv != "?", "first report_once call must read back so_rcvbuf");
+    CHECK_MESSAGE(first.snd != "?", "first report_once call must read back so_sndbuf");
+    // Two checks, not one && chain: doctest cannot decompose operator&&.
+    CHECK_MESSAGE(first.rcv == second.rcv,
+                  "report_once must return the cached so_rcvbuf, not a placeholder");
+    CHECK_MESSAGE(first.snd == second.snd,
+                  "report_once must return the cached so_sndbuf, not a placeholder");
+}
+
 TEST_CASE("test_kcp_wrapper_applies_constants") {
     // configure() must apply the KCP_* constants to the live KCP state. The
     // whole point of promoting the literals to named constants (b52a8bb) was

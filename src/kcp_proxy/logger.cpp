@@ -187,6 +187,12 @@ std::shared_ptr<spdlog::logger> module_logger(std::string_view module) {
     std::lock_guard<std::mutex> lock(g_logger_mutex);
     auto it = g_module_loggers.find(std::string(module));
     if (it != g_module_loggers.end()) return it->second;
+    // Re-read the level under the registration lock. A set_log_level() that
+    // ran between the unlocked build above and this lock walked a map that did
+    // not yet contain lg, so without this re-read a logger registered in that
+    // window would keep the stale level for the rest of the process (its own
+    // filtering, independent of the header atomic the macros check).
+    lg->set_level(to_spdlog(current_log_level()));
     g_module_loggers.emplace(std::string(module), lg);
     return lg;
 }
