@@ -28,6 +28,14 @@ find_package(OpenSSL REQUIRED)
 find_package(asio REQUIRED)
 find_package(fmt REQUIRED)
 
+# Logging backend (kcp_proxy/logger.cpp). spdlog is built against the SAME fmt
+# the project already pins -- on Windows that is not the default: vcpkg builds
+# spdlog's bundled fmt unless SPDLOG_FMT_EXTERNAL is defined, and then
+# logger.cpp would see two incompatible fmt::vN ABIs (link errors on
+# fmt::format / spdlog::...). The vcpkg port defines it for its own compile,
+# so the consumer side must define it too.
+find_package(spdlog CONFIG REQUIRED)
+
 # KCP: the `kcp::kcp` target is the C++17 port of kcp-go (dchen8525-dev/kcp-cpp)
 # that replaced the C ikcp vcpkg port. It is consumed two ways, both pinned to
 # the same upstream revision:
@@ -78,8 +86,17 @@ add_library(kcp_proxy_lib STATIC
     ${PROJECT_ROOT}/src/kcp_proxy/client.cpp
 )
 target_include_directories(kcp_proxy_lib PUBLIC ${PROJECT_ROOT}/src)
-target_link_libraries(kcp_proxy_lib PUBLIC ${kcp_proxy_lib_LINK_DEPS} kcp::kcp fmt::fmt)
-target_compile_definitions(kcp_proxy_lib PUBLIC ASIO_STANDALONE FMT_HEADER_ONLY)
+# spdlog_header_only, not spdlog: the vcpkg port ships spdlog as a DLL on
+# Windows, which would add spdlog.dll to the runtime set that package.py
+# assembles for every release. Header-only keeps the shipped binary set
+# unchanged (fmt is header-only here too), at the cost of one TU compiling it.
+target_link_libraries(kcp_proxy_lib PUBLIC ${kcp_proxy_lib_LINK_DEPS} kcp::kcp fmt::fmt
+    spdlog::spdlog_header_only)
+# SPDLOG_FMT_EXTERNAL must be PUBLIC: every TU that includes <spdlog/...> has
+# to agree on fmt::vN, and kcp_proxy_lib's headers do not, but its consumers
+# include asio and fmt alongside it.
+target_compile_definitions(kcp_proxy_lib PUBLIC ASIO_STANDALONE FMT_HEADER_ONLY
+    SPDLOG_FMT_EXTERNAL)
 
 # Performance optimization flags
 option(KCP_PROXY_ENABLE_NATIVE_TUNE

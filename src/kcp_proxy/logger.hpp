@@ -1,13 +1,15 @@
 #pragma once
 
 #include <fmt/format.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <chrono>
 
 namespace kcp_proxy {
 
@@ -110,6 +112,45 @@ private:
 void set_log_level(LogLevel level);
 LogLevel current_log_level() noexcept;
 void set_log_file_path(const char* path);
+
+// The one uppercase spelling of a level name ("DEBUG"/"INFO"/"WARNING"/
+// "ERROR"). It is a format contract, not a convenience: the [LEVEL] field is
+// part of every emitted line (see the formatter in logger.cpp), the GUI strips
+// it (gui/electron/main.js), and the startup banner prints the active level in
+// the same words. Three copies had grown up -- the formatter, the banner's
+// local helper, and the level->en-US switch -- so a change to one silently
+// desynced the other two.
+inline std::string_view log_level_name(LogLevel level) noexcept {
+    switch (level) {
+        case LogLevel::Debug:
+            return "DEBUG";
+        case LogLevel::Info:
+            return "INFO";
+        case LogLevel::Warning:
+            return "WARNING";
+        case LogLevel::Error:
+            return "ERROR";
+    }
+    return "INFO";
+}
+
+// The active level lives in an atomic so the LOG_* macros' hot-path check
+// stays lock-free; spdlog mirrors it for the logging path itself. Exposed in
+// the header (rather than hidden in the .cpp) so the macros below can inline
+// the load instead of paying a cross-TU call on every filtered line.
+namespace detail {
+inline std::atomic<LogLevel>& log_level_storage() {
+    static std::atomic<LogLevel> level{LogLevel::Info};
+    return level;
+}
+inline void store_log_level(LogLevel level) {
+    log_level_storage().store(level, std::memory_order_relaxed);
+}
+inline LogLevel load_log_level() noexcept {
+    return log_level_storage().load(std::memory_order_relaxed);
+}
+} // namespace detail
+
 void log(LogLevel level, std::string_view module, std::string_view message);
 
 // Test-only: receive every line the logger actually emits, in addition to the
@@ -125,7 +166,8 @@ void set_log_sink_for_test(LogSink sink);
 
 // Performance-optimized logging with fmt library
 template <typename... Args>
-void log_fmt(LogLevel level, std::string_view module, fmt::format_string<Args...> fmt, Args&&... args) {
+void log_fmt(LogLevel level, std::string_view module, fmt::format_string<Args...> fmt,
+             Args&&... args) {
     if (static_cast<int>(level) >= static_cast<int>(current_log_level())) {
         try {
             log(level, module, fmt::format(fmt, std::forward<Args>(args)...));
@@ -138,28 +180,28 @@ void log_fmt(LogLevel level, std::string_view module, fmt::format_string<Args...
 
 // Convenience macros with fmt support. The level check is hoisted to the call site
 // so we don't pay for std::string concatenation in the hot path when the level is filtered.
-#define LOG_DEBUG(mod, msg)                                                     \
-    do {                                                                        \
-        if (::kcp_proxy::LogLevel::Debug >= ::kcp_proxy::current_log_level())  \
-            ::kcp_proxy::log(::kcp_proxy::LogLevel::Debug, (mod), (msg));      \
+#define LOG_DEBUG(mod, msg)                                                   \
+    do {                                                                      \
+        if (::kcp_proxy::LogLevel::Debug >= ::kcp_proxy::current_log_level()) \
+            ::kcp_proxy::log(::kcp_proxy::LogLevel::Debug, (mod), (msg));     \
     } while (0)
 
-#define LOG_INFO(mod, msg)                                                      \
-    do {                                                                        \
-        if (::kcp_proxy::LogLevel::Info >= ::kcp_proxy::current_log_level())   \
-            ::kcp_proxy::log(::kcp_proxy::LogLevel::Info, (mod), (msg));       \
+#define LOG_INFO(mod, msg)                                                   \
+    do {                                                                     \
+        if (::kcp_proxy::LogLevel::Info >= ::kcp_proxy::current_log_level()) \
+            ::kcp_proxy::log(::kcp_proxy::LogLevel::Info, (mod), (msg));     \
     } while (0)
 
 #define LOG_WARNING(mod, msg)                                                   \
     do {                                                                        \
         if (::kcp_proxy::LogLevel::Warning >= ::kcp_proxy::current_log_level()) \
-            ::kcp_proxy::log(::kcp_proxy::LogLevel::Warning, (mod), (msg));    \
+            ::kcp_proxy::log(::kcp_proxy::LogLevel::Warning, (mod), (msg));     \
     } while (0)
 
-#define LOG_ERROR(mod, msg)                                                     \
-    do {                                                                        \
-        if (::kcp_proxy::LogLevel::Error >= ::kcp_proxy::current_log_level())  \
-            ::kcp_proxy::log(::kcp_proxy::LogLevel::Error, (mod), (msg));      \
+#define LOG_ERROR(mod, msg)                                                   \
+    do {                                                                      \
+        if (::kcp_proxy::LogLevel::Error >= ::kcp_proxy::current_log_level()) \
+            ::kcp_proxy::log(::kcp_proxy::LogLevel::Error, (mod), (msg));     \
     } while (0)
 
 // Fmt-based logging macros (more efficient than string concatenation)
