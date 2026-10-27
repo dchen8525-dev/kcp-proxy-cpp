@@ -241,6 +241,11 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // The packaged version, handed to the preload through process.argv. A
+      // sandboxed preload cannot reach app.getVersion() (its polyfilled
+      // require only serves electron/events/timers/url), and an IPC round-trip
+      // would resolve after first paint, flashing the HTML fallback first.
+      additionalArguments: [`--app-version=${app.getVersion()}`],
       // The sandbox stays ON (the Electron default). It used to be disabled
       // because the preload required './utils' for validateLaunchConfig and
       // formatBytes, and a sandboxed preload's polyfilled require only serves
@@ -896,10 +901,6 @@ ipcMain.handle('stop-proxy', async () => {
 });
 
 ipcMain.handle('get-status', () => isRunning);
-
-// Packaged version for the sidebar footer. The HTML ships a hardcoded fallback
-// that would drift on every release; this keeps the label truthful.
-ipcMain.handle('get-app-version', () => app.getVersion());
 
 // Today's key date (Beijing) for the overview panel. Computed here, from
 // utils.js — the same function the key generator uses — so the displayed date

@@ -4,6 +4,14 @@
 // ipcRenderer wrapper or self-contained.
 const { contextBridge, ipcRenderer } = require('electron');
 
+// The packaged version, passed down by the main process through
+// webPreferences.additionalArguments. A sandboxed preload cannot call
+// app.getVersion() itself, and resolving it over IPC would land after the
+// window's first paint — long enough for the footer to show its fallback.
+const APP_VERSION_PREFIX = '--app-version=';
+const versionArg = process.argv.find((arg) => arg.startsWith(APP_VERSION_PREFIX));
+const appVersion = versionArg ? versionArg.slice(APP_VERSION_PREFIX.length) : '';
+
 // Track registered listeners for cleanup
 const channelListeners = new Map();
 
@@ -26,8 +34,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Validated in the main process so utils.js stays the single source of truth
   // for rules that must agree with the server (see the handler in main.js).
   validateConfig: (config) => ipcRenderer.invoke('validate-config', config),
-  // Packaged app version (drives the sidebar footer label).
-  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  // Packaged app version (drives the sidebar footer label). A plain string, not
+  // an async getter: it is already resolved by the time the page runs.
+  appVersion,
   // Today's key date (Beijing, YYYYMMDD) for the overview panel.
   getKeyDate: () => ipcRenderer.invoke('get-key-date'),
 

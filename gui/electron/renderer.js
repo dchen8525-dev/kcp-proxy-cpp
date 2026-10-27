@@ -54,6 +54,14 @@ async function init() {
     return;
   }
 
+  // The footer version arrives from the preload, which read app.getVersion()
+  // out of process.argv before this page loaded. Set it before the first await
+  // so the label is correct on the very first paint; the HTML fallback carries
+  // no version number, so nothing stale can ever show.
+  if (window.electronAPI.appVersion) {
+    elements.sideFoot.textContent = `v${window.electronAPI.appVersion} · 纸感墨白`;
+  }
+
   // Attach listeners BEFORE loading config so window controls and buttons stay
   // responsive even if the config read below throws.
   setupEventListeners();
@@ -70,13 +78,6 @@ async function init() {
   } catch (err) {
     appendLog(`读取配置失败: ${err.message}`, 'error');
   }
-
-  // Cosmetic: replace the hardcoded fallback in the sidebar footer with the
-  // real packaged version so it never drifts on a release.
-  try {
-    const version = await window.electronAPI.getAppVersion();
-    if (version) elements.sideFoot.textContent = `v${version} · 纸感墨白`;
-  } catch { /* version label is cosmetic — keep the HTML fallback */ }
 
   // Today's key date for the overview row. Computed in the main process from
   // utils.js (the same function minting the key), fetched once per launch —
