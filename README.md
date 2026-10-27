@@ -143,7 +143,7 @@ vcpkg 查找顺序为 `VCPKG_ROOT` → 仓库内 `vcpkg/` → 自动克隆。不
 ### deb 安装（推荐）
 
 ```bash
-VERSION=0.2.2                       # 换成要安装的版本，见 Releases
+VERSION=0.2.3                       # 换成要安装的版本，见 Releases
 wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v$VERSION/kcp-proxy-server_${VERSION}_amd64.deb
 sudo dpkg -i kcp-proxy-server_${VERSION}_amd64.deb
 
@@ -446,6 +446,9 @@ AppImage / NSIS / Portable 并合并 `SHA256SUMS` 发布。
 
 ## 版本与兼容性
 
+- **0.2.3**：仅 GUI 与文档。侧栏版本号改由 preload 从 `app.getVersion()` 注入（不再有一次 IPC
+  往返，也不在首个 await 之前显示假版本）；概览与连接设置的说明文字从常驻段落收进字段后的 `?`
+  悬停提示；README 按代码重写。协议、线格式、KCP 参数均无变化，0.2.2 与 0.2.3 可互连。
 - **0.2.2**：仅重构。181 处手写 `std::to_string` 拼接统一到 `fmt`，`secure_wipe` 改用
   `OPENSSL_cleanse`，删除死代码 `get_env`。协议、线格式、KCP 参数均无变化，0.2.1 与 0.2.2 可互连。
 - **0.2.1**：修 0.2.0 发布后才被发现的缺陷——`--help` 退出码、日志级别注册竞态、格式门禁从未真正执行。
