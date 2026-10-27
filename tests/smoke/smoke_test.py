@@ -1064,29 +1064,58 @@ def _changed_cxx_files() -> list[str]:
     return [p for p in out.splitlines() if CXX_SOURCES.match(p)]
 
 def _clang_format() -> str | None:
-    """Path to a usable clang-format, or None when this host has none."""
-    for name in ("clang-format", "clang-format.exe"):
+    """Path to a usable clang-format, or None when this host has none.
+
+    Candidate order is deliberate. $CLANG_FORMAT is what CI's install step and
+    anyone pinning a version set, so it is consulted FIRST; a PATH lookup only
+    fills in when it is unset or unusable.
+
+    The previous order was the reverse -- PATH first, environment as a
+    last-resort fallback -- and that made the check dead in CI: the
+    ubuntu-22.04 image ships clang-format 14 on PATH, so the search found v14,
+    refused it as a version mismatch, and returned None without ever looking at
+    the /usr/bin/clang-format-22 the job had just installed two steps earlier.
+    The job stayed green with a ::warning annotation ("the formatting check did
+    NOT run"), which is precisely the failure mode this test's own comment says
+    is worse than having no check. Every candidate is now tried, and the
+    version-specific name is also probed directly, so neither a stale PATH entry
+    nor a distro that only ships clang-format-NN can hide the pinned tool.
+    """
+    candidates: list[str] = []
+    env = os.environ.get("CLANG_FORMAT")
+    if env:
+        # Accept a bare name as well as a path: CI exports an absolute path, a
+        # developer may well export CLANG_FORMAT=clang-format-22.
+        candidates.append(shutil.which(env) or env)
+    # The pinned major first: distro packages install clang-format-NN and often
+    # leave a different major on the unversioned name.
+    for name in (f"clang-format-{CLANG_FORMAT_MAJOR}", "clang-format", "clang-format.exe"):
         found = shutil.which(name)
         if found:
-            break
-    else:
-        env = os.environ.get("CLANG_FORMAT")
-        if not env or not Path(env).exists():
-            return None
-        found = env
-    try:
-        version = subprocess.run([found, "--version"], capture_output=True,
-                                 text=True, check=False).stdout
-    except OSError:
-        return None
-    match = re.search(r"clang-format version (\d+)", version)
-    if not match:
-        return None
-    if int(match.group(1)) != CLANG_FORMAT_MAJOR:
-        print(f"SKIP clang-format: found v{match.group(1)}, "
-              f"this check pins v{CLANG_FORMAT_MAJOR}")
-        return None
-    return found
+            candidates.append(found)
+
+    mismatched: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen or not Path(candidate).exists():
+            continue
+        seen.add(candidate)
+        try:
+            version = subprocess.run([candidate, "--version"], capture_output=True,
+                                     text=True, check=False).stdout
+        except OSError:
+            continue
+        match = re.search(r"clang-format version (\d+)", version)
+        if not match:
+            continue
+        if int(match.group(1)) == CLANG_FORMAT_MAJOR:
+            return candidate
+        mismatched.append(f"{candidate} (v{match.group(1)})")
+
+    if mismatched:
+        print(f"SKIP clang-format: no v{CLANG_FORMAT_MAJOR} among "
+              + ", ".join(mismatched))
+    return None
 
 def _added_line_numbers(relative: str) -> set[int]:
     """Line numbers (in the working-tree file) that this change added."""
@@ -1106,6 +1135,24 @@ def _violations_on_lines(tool: str, relative: str, lines: set[int]) -> list[int]
     even under --lines, and its boundary entries (blank-line normalisation
     between hunks) point at lines that are themselves fine. Diffing the text
     answers the actual question -- "would this line read differently".
+
+    The comparison includes LEADING WHITESPACE. An earlier version compared
+    stripped text, which made the check structurally blind to indentation: a
+    line indented 12 spaces where clang-format wants 8 still matched some other
+    line with the same body text and passed. That is not hypothetical -- three
+    such lines were sitting in tests/unit/test_core.cpp (misaligned
+    continuation strings in the doctest migration) while the gate reported
+    clean, and indentation is the single most common thing clang-format
+    changes. Measured over the whole 0.1.5..0.2.0 diff (1203 added non-blank
+    lines), the strict comparison flags those three and nothing else, and over
+    the fix commit's 49 added lines it flags nothing.
+
+    Known gap, deliberately not papered over: a line clang-format would MOVE but
+    not rewrite (an out-of-order #include) still matches, because the text does
+    survive. Include sorting is off in .clang-format for that reason (see the
+    comment there) -- 13 of 16 sources would be rewritten just in their include
+    block, and in server.cpp / kcp_client_session.cpp that rewrite puts
+    <mswsock.h> before <winsock2.h>, which does not compile.
     """
     path = ROOT / relative
     original = path.read_text(encoding="utf-8").replace("\r\n", "\n").splitlines()
@@ -1116,46 +1163,49 @@ def _violations_on_lines(tool: str, relative: str, lines: set[int]) -> list[int]
     # re-wrapping around a single line shifts every later line, so the output
     # cannot be compared index-by-index.
     #
-    # The check is therefore "does this exact line survive formatting", i.e. it
-    # must still appear in the formatted text at the same indentation. A line
-    # clang-format re-wraps or re-indents disappears, which is what we want to
-    # report. Only ADDED lines are judged, so the untouched neighbours -- which
-    # carry plenty of hand-chosen wrapping -- are never blamed.
+    # The check is therefore "does this exact line survive formatting". A line
+    # clang-format re-wraps, re-indents or joins into its neighbour disappears,
+    # which is what we want to report. Only ADDED lines are judged, so the
+    # untouched neighbours -- which carry plenty of hand-chosen wrapping -- are
+    # never blamed.
     result = subprocess.run([tool, "--style=file", relative], cwd=ROOT,
                             capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"clang-format failed on {relative}: "
                            f"{result.stderr.strip()}")
-    formatted_lines = {l.strip() for l in result.stdout.replace("\r\n", "\n").splitlines()
+    # rstrip only: trailing whitespace is git diff --check's business, but the
+    # indentation has to survive.
+    formatted_lines = {l.rstrip() for l in result.stdout.replace("\r\n", "\n").splitlines()
                        if l.strip()}
 
     offenders = []
     for n in sorted(lines):
         if not (1 <= n <= len(original)):
             continue
-        text = original[n - 1].strip()
-        if text and text not in formatted_lines:
+        text = original[n - 1].rstrip()
+        if text.strip() and text not in formatted_lines:
             offenders.append(n)
     return offenders
 
 def test_clang_format_agrees_with_changed_lines():
     """New lines must be formatted; untouched lines are left alone.
 
-    Skips (loudly) when clang-format is absent or is a different major version:
-    a missing dev tool must not fail CI, and a mismatched version would report
-    formatting that is correct for the version the tree was formatted with.
+    Skips when clang-format is absent on a developer's machine: a missing dev
+    tool must not fail a local run. In CI it FAILS instead, because the hygiene
+    job installs the pinned version one step earlier -- if the suite still
+    cannot find it, the gate is broken and a green check would be a lie. That
+    is not hypothetical either: the first version of this check reported
+    "the formatting check did NOT run" as a warning annotation while the job
+    passed, so nothing was ever enforced.
     """
     tool = _clang_format()
     if tool is None:
-        # A developer without clang-format must not fail the suite, but a CI
-        # run that silently skipped the check would be worse than no check at
-        # all -- so CI is required to have it. The job installs the pinned
-        # version; if that ever regresses, this annotation is what shows it.
-        print("SKIP clang-format: not installed (or wrong version)")
+        detail = (f"clang-format v{CLANG_FORMAT_MAJOR} not found (set CLANG_FORMAT, "
+                  f"or install clang-format-{CLANG_FORMAT_MAJOR})")
         if os.environ.get("CI"):
-            print("::warning title=clang-format skipped::"
-                  f"CI is set but clang-format v{CLANG_FORMAT_MAJOR} was not found; "
-                  "the formatting check did NOT run")
+            require(False, f"{detail}; CI installs it before running this suite, "
+                           "so the formatting gate would silently not run")
+        print(f"SKIP clang-format: {detail}")
         return
 
     try:
@@ -1202,6 +1252,58 @@ def test_clang_format_config_matches_the_tree():
             "PointerAlignment must be Left to mean `int* x`; Right means `int *x`")
     require(re.search(r"^SpacesBeforeTrailingComments:\s*1\s*$", config, re.M),
             "the tree writes `} // namespace` with one space before the comment")
+    # Include sorting is the other setting that disagreed with the tree: with
+    # SortIncludes on, clang-format rewrites the include block of 13 of the 16
+    # sources (blank-line regrouping plus alphabetical order), and in the two
+    # files that include <mswsock.h> it puts that header before <winsock2.h> --
+    # mswsock.h uses SOCKET without including winsock2.h, so the Windows build
+    # would break if anyone followed the gate's own "run clang-format -i"
+    # advice. The tree's include order is intentional; keep it unsorted.
+    require(re.search(r"^SortIncludes:\s*false\s*$", config, re.M),
+            "SortIncludes must be false: the tree's include order is intentional "
+            "(winsock2.h before mswsock.h) and clang-format would reorder 13 files")
+
+
+def test_legacy_fec_flag_is_explained():
+    """Both binaries must explain the pre-0.2.0 `-fec` spelling.
+
+    The rename is the one breaking CLI change in 0.2.0, and CLI11's own
+    message for the old spelling ("The following arguments were not expected:
+    -fec 10:3") reads like a typo. The first thing an operator hits after
+    upgrading a launcher is exactly that, so both entry points have to print
+    the migration line -- and a future edit must not drop one of them.
+    """
+    for entry in ("src/main_server.cpp", "src/main_client.cpp"):
+        require("cli::explain_legacy_fec(argc, argv)" in read(entry),
+                f"{entry} must explain that -fec became --fec before reporting "
+                "the parse error")
+    helper = read("src/cli_helpers.hpp")
+    require("was renamed to --fec" in helper,
+            "cli_helpers.hpp must carry the rename message")
+
+
+def test_log_line_format_is_pinned():
+    """The emitted log line format must have exactly one definition.
+
+    ``YYYY-MM-DD HH:MM:SS.mmm [LEVEL] module: message`` is a contract three
+    other things depend on: gui/electron/main.js strips the prefix with an
+    anchored regex, tests/e2e/robustness_e2e.py parses line[:23] as a
+    timestamp, and docs/ANDROID_INTEROP.md quotes the shape. The spdlog
+    migration left the constant *and* a second, subtly different literal (the
+    one the formatter actually used, with a placeholder instead of %l), so
+    editing the documented pattern changed nothing -- the classic way a format
+    contract rots. The formatter now derives its pattern from the constant, and
+    this check keeps it that way.
+    """
+    source = read("src/kcp_proxy/logger.cpp")
+    require("%Y-%m-%d %H:%M:%S.%e [%l] %n: %v" in source,
+            "logger.cpp must pin the documented log line format")
+    # One occurrence is the constant; more than one means a literal was
+    # restated somewhere the constant cannot reach.
+    stamp = source.count("%Y-%m-%d %H:%M:%S.%e")
+    require(stamp == 1,
+            f"the timestamp pattern appears {stamp} times in logger.cpp; the "
+            "formatter must derive from the pinned constant, not restate it")
 
 
 # --------------------------------------------------------------------------- #
@@ -1283,6 +1385,8 @@ TESTS = [
     test_ci_runs_this_suite_and_the_whitespace_check,
     test_clang_format_config_matches_the_tree,
     test_clang_format_agrees_with_changed_lines,
+    test_log_line_format_is_pinned,
+    test_legacy_fec_flag_is_explained,
     test_archive_members,
 ]
 

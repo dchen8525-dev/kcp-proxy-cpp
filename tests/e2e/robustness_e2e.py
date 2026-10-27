@@ -55,6 +55,7 @@ Exit code 0 on success, non-zero with a diagnostic on failure.
 import argparse
 import os
 import random
+import re
 import socket
 import struct
 import subprocess
@@ -99,6 +100,14 @@ MAX_AUTH_FAILURES_PER_ADDR_PER_SEC = 20
 # a leak.
 KCP_TIMEOUT_SEC = 60
 SWEEP_INTERVAL_SEC = 30
+
+# The emitted log line format, which is a contract rather than a preference:
+# logger.cpp pins it, gui/electron/main.js strips this exact prefix with an
+# anchored regex (and derives the level chip from it), docs/ANDROID_INTEROP.md
+# quotes the shape, and this file slices line[:23] as a timestamp.
+LOG_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} "
+    r"\[(?:DEBUG|INFO|WARNING|ERROR)\] [a-z_]+: ")
 
 
 # --------------------------------------------------------------------------- #
@@ -397,6 +406,23 @@ def phase_wrong_key(server_exe, client_exe, log_dir):
                 "exit=%s, client exit=%s)" % (server.alive(), server.exit_code(),
                                               client.exit_code()))
         print("  [ok] server created no session; packet rejected (DECRYPT_FAILED)")
+
+        # `[[INFO]]` instead of `[INFO]` is exactly the kind of regression this
+        # suite has to catch: every other assertion here still passed when the
+        # formatter emitted double brackets (the timestamps were right, the
+        # messages were right), while the GUI's prefix regex stopped matching
+        # and every line fell back to the raw text with the wrong level chip.
+        stamped = [line for line in srv_log.splitlines() if line[:4].isdigit()]
+        if not stamped:
+            dump_logs([server.log_path, client.log_path])
+            raise AssertionError("server emitted no timestamped log lines at all")
+        for line in stamped:
+            if not LOG_LINE_RE.match(line):
+                dump_logs([server.log_path, client.log_path])
+                raise AssertionError(
+                    "log line does not match 'YYYY-MM-DD HH:MM:SS.mmm [LEVEL] "
+                    "module: message': %r" % line)
+        print("  [ok] %d log lines match the documented format" % len(stamped))
 
         if not server.alive() or not client.alive():
             raise AssertionError("a process died during the wrong-key phase")

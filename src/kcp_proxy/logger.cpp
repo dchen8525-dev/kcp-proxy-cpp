@@ -38,6 +38,31 @@ namespace {
 // spdlog's default ("[2026-01-01 00:00:00.000] [info] [name] msg").
 constexpr const char* kPattern = "%Y-%m-%d %H:%M:%S.%e [%l] %n: %v";
 
+// What the formatter substitutes for spdlog's lowercase %l.
+constexpr char kLevelPlaceholder = '\x01';
+
+// kPattern with the whole `[%l]` field swapped for the bracketed placeholder.
+// The formatter must derive its pattern from kPattern rather than restate it:
+// the previous version carried a second, subtly different literal (the same
+// string with [\x01] in place of [%l]) right here in the constructor, so
+// editing the constant above -- the documented contract -- silently changed
+// nothing. tests/smoke asserts the pattern appears exactly once in this file,
+// and tests/e2e asserts the emitted line shape, which is what keeps the two
+// from drifting apart again.
+//
+// The replacement is on "[%l]", not on "%l": kPattern already brackets the
+// level, and substituting only the %l doubles them ("[[INFO]]"), which no
+// longer matches the GUI's prefix regex or the documented shape.
+std::string formatter_pattern() {
+    std::string pattern(kPattern);
+    const std::string level_field = "[%l]";
+    const size_t at = pattern.find(level_field);
+    if (at != std::string::npos) {
+        pattern.replace(at, level_field.size(), std::string("[") + kLevelPlaceholder + "]");
+    }
+    return pattern;
+}
+
 // spdlog's %l always renders the level in lowercase ("info"), and the pattern
 // language has no uppercase variant, so the [LEVEL] field is the one part of
 // the line spdlog cannot reproduce on its own. Everything else in kPattern is
@@ -47,8 +72,7 @@ constexpr const char* kPattern = "%Y-%m-%d %H:%M:%S.%e [%l] %n: %v";
 // timestamp, %e milliseconds and the logger name still come from spdlog.
 class UppercaseLevelFormatter final : public spdlog::formatter {
 public:
-    UppercaseLevelFormatter()
-        : inner_("%Y-%m-%d %H:%M:%S.%e [\x01] %n: %v", spdlog::pattern_time_type::local) {}
+    UppercaseLevelFormatter() : inner_(formatter_pattern(), spdlog::pattern_time_type::local) {}
 
     void format(const spdlog::details::log_msg& msg, spdlog::memory_buf_t& dest) override {
         // memory_buf_t (fmt's memory_buffer) is append-only, so the pattern is
@@ -61,7 +85,7 @@ public:
         // std::string_view for the search (spdlog's fmt::string_view has no
         // find/substr); converted to spdlog's type only for append.
         const std::string_view line(scratch_.data(), scratch_.size());
-        const size_t marker = line.find('\x01');
+        const size_t marker = line.find(kLevelPlaceholder);
         auto append = [&dest](std::string_view piece) {
             spdlog::details::fmt_helper::append_string_view(
                 spdlog::string_view_t(piece.data(), piece.size()), dest);

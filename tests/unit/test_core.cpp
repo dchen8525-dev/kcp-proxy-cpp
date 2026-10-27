@@ -573,17 +573,15 @@ TEST_CASE("test_async_read_some_rejects_stacked_reads") {
     bool second_called = false;
     std::error_code second_ec;
 
-    session->async_read_some(asio::buffer(first_buf),
-        [&](std::error_code ec, size_t) {
-            first_called = true;
-            CHECK_MESSAGE(ec == asio::error::operation_aborted,
-                        "first pending read should remain pending until stop");
-        });
-    session->async_read_some(asio::buffer(second_buf),
-        [&](std::error_code ec, size_t) {
-            second_called = true;
-            second_ec = ec;
-        });
+    session->async_read_some(asio::buffer(first_buf), [&](std::error_code ec, size_t) {
+        first_called = true;
+        CHECK_MESSAGE(ec == asio::error::operation_aborted,
+                      "first pending read should remain pending until stop");
+    });
+    session->async_read_some(asio::buffer(second_buf), [&](std::error_code ec, size_t) {
+        second_called = true;
+        second_ec = ec;
+    });
 
     io.poll();
     CHECK_MESSAGE(!first_called, "first read handler should not be overwritten or completed");
@@ -2779,11 +2777,11 @@ TEST_CASE("test_allowlist_matching") {
     };
     for (const char* entry : malformed) {
         CHECK_MESSAGE(!parse_allow_target_entry(entry, host, has_port, port),
-                    "malformed entry must be rejected");
+                      "malformed entry must be rejected");
         CHECK_MESSAGE(!target_matches_allowlist({entry}, "host", 9000),
-                    "malformed entry must not match host:9000");
+                      "malformed entry must not match host:9000");
         CHECK_MESSAGE(!target_matches_allowlist({entry}, "::1", 9000),
-                    "malformed entry must not match [::1]:9000");
+                      "malformed entry must not match [::1]:9000");
     }
     // The wrapping regressions: these ports must not have been silently
     // allowlisted by the typo'd entries above.

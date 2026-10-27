@@ -53,35 +53,26 @@ AllowShortLoopsOnASingleLine: false
 BinPackArguments: true
 BinPackParameters: true
 
-SortIncludes: true
-IncludeBlocks: Regroup
-IncludeCategories:
-  - Regex: '^"kcp_proxy/'
-    Priority: 1
-  - Regex: '^"(address|logger|crypto|config|socks5|server|client|byte_view|time_util|cli_helpers)'
-    Priority: 1
-  # Vendored kcp headers sit with the project's own: they are quoted includes
-  # from this repo, not a third-party package.
-  - Regex: '^"kcp/'
-    Priority: 1
-  - Regex: '^<fmt/'
-    Priority: 2
-  - Regex: '^<asio'
-    Priority: 2
-  - Regex: '^<openssl/'
-    Priority: 2
-  # doctest sorts last so the unit-test TU can end with
-  #   #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-  #   #include <doctest/doctest.h>
-  # (the macro must precede doctest's first inclusion). --lines formatting of
-  # that block is what silently reordered it once before, which dropped the
-  # single-TU implementation and the main() with it.
-  - Regex: '^<doctest/'
-    Priority: 4
-  - Regex: '^<'
-    Priority: 3
-  - Regex: '^"(ikcp.h)'
-    Priority: 4
+# Include order is the tree's, not clang-format's.
+#
+# With SortIncludes on, clang-format rewrites the include block of 13 of the 16
+# sources: it regroups the blocks with blank lines (IncludeBlocks: Regroup) and
+# sorts alphabetically inside them. Two problems, both fatal to the "the config
+# describes the tree" goal:
+#
+#   * The regrouping alone is a large diff in files nobody meant to touch, and
+#     the gate's own failure message tells people to run `clang-format -i`.
+#   * More seriously, sorting inside `#if defined(_WIN32)` puts <mswsock.h>
+#     BEFORE <winsock2.h> (server.cpp, kcp_client_session.cpp). mswsock.h uses
+#     SOCKET and WSAIoctl without including winsock2.h -- verified against the
+#     SDK header, which only pulls in winapifamily.h and mswsockdef.h -- so
+#     following that advice breaks the Windows build.
+#
+# The order here is deliberate: project headers, then third-party, then the
+# platform block that must come first for Winsock. Left unsorted, the setting
+# that expressed the old intent (IncludeBlocks/IncludeCategories) is inert and
+# has been removed rather than left to mislead.
+SortIncludes: false
 
 Standard: c++17
 DeriveLineEnding: true

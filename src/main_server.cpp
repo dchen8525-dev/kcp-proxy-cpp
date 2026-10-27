@@ -85,6 +85,12 @@ std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {
+        // A stale launcher still passing the pre-0.2.0 `-fec` gets a message
+        // that names the rename instead of "arguments were not expected".
+        if (cli::explain_legacy_fec(argc, argv)) {
+            exit_code = 1;
+            return std::nullopt;
+        }
         // app.exit() prints the diagnostic (to stderr for errors, stdout for
         // --help) and yields CLI11's own exit code, which the caller returns
         // verbatim. CallForHelp derives from Success, so --help is exit 0 --

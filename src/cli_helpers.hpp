@@ -139,6 +139,25 @@ inline void parse_log_level(const std::string& log_level) {
         std::cerr << "Warning: unknown log level '" << log_level << "'\n";
 }
 
+// 0.2.0 renamed `-fec` to `--fec`; the old single-dash spelling is now an
+// unknown argument. CLI11 reports that as "The following arguments were not
+// expected: -fec 10:3", which reads like a typo and says nothing about a
+// rename -- but a launcher, systemd unit or shell history carrying the old
+// spelling is the expected failure right after an upgrade, so the message has
+// to name the fix. Returns true when it explained the failure, in which case
+// the caller exits without CLI11's own diagnostic.
+inline bool explain_legacy_fec(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i]);
+        if (arg == "-fec" || arg.substr(0, 5) == "-fec=") {
+            std::cerr << "Error: -fec was renamed to --fec in KCP-Proxy 0.2.0; "
+                         "update the launcher to pass --fec DATA:PARITY\n";
+            return true;
+        }
+    }
+    return false;
+}
+
 template <typename StopFn>
 inline void setup_signal_handler(asio::io_context& io, StopFn stop_fn) {
     auto signals = std::make_shared<asio::signal_set>(io, SIGINT
