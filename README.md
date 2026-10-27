@@ -1,574 +1,473 @@
 # KCP Proxy (C++)
 
-基于 KCP 协议的 SOCKS5 代理，将 TCP 流量通过加密的 KCP (UDP) 隧道进行转发。
+把本地 TCP 流量装进加密的 KCP/UDP 隧道，用 SOCKS5 接出来。
 
 ```
-本地应用 --TCP--> 客户端 SOCKS5 --[加密/KCP/UDP]--> 服务端 --TCP--> 目标服务器
+浏览器/应用 ──SOCKS5(TCP)──▶ kcp-proxy-client ══KCP/UDP·AES-128-GCM══▶ kcp-proxy-server ──TCP──▶ 目标
 ```
 
-## 目录与发布产物
+客户端监听 `127.0.0.1:1080`，服务端监听 UDP `8388`。
 
-脚本的规范实现按职责位于 `scripts/runtime/`、`scripts/deploy/`、`scripts/package/` 和 `scripts/templates/`，
-根目录只保留 4 个入口：`build.sh`、`build_vs.bat`、`deploy.sh`、`deploy.bat`（后两者转发到 `scripts/deploy/deploy.py`）。
-`build/` 是 CMake 临时目录，`bin/` 是本地构建二进制，`dist/staging/` 是临时打包目录，`dist/releases/` 保存正式发布包。
+跨境线路、移动网络、晚高峰家宽这类链路上，TCP 一旦丢包就会缩窗并因队头阻塞整体卡住；
+KCP 是跑在 UDP 上的 ARQ 协议，用更多带宽换更稳的延迟。本项目把 KCP 包进 AEAD，
+客户端只暴露一个标准 SOCKS5 端口，浏览器和命令行工具无需改动。
 
-Electron (`gui/electron`) 是主 GUI，提供跨平台的图形界面。
+代价要说在前面：它比裸 TCP 费流量，并且依赖 UDP 不被运营商或防火墙降级。所以需要 UDP 转发的
+场景（HTTP/3、UDP DNS、SOCKS5 `UDP ASSOCIATE`）不适用，见[协议与加密](#协议与加密)末尾。
+
+服务端与客户端为 C++17，GUI 为 Electron；发布包与版本历史见
+[Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases)。
+
+## 目录
+
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [服务端部署](#服务端部署)
+- [客户端](#客户端)
+- [命令行参考](#命令行参考)
+- [前向纠错（FEC）](#前向纠错fec)
+- [协议与加密](#协议与加密)
+- [架构](#架构)
+- [目录结构](#目录结构)
+- [测试与 CI](#测试与-ci)
+- [版本与兼容性](#版本与兼容性)
+- [排障](#排障)
 
 ## 特性
 
-- SOCKS5 CONNECT TCP 代理支持（不支持 UDP ASSOCIATE）
-- KCP 可靠 UDP 传输（极速模式，10ms 刷新间隔）
-- AES-128-GCM 加密，方向标识防跨方向重放，滑动窗口检测重放包
-- 可选 Reed-Solomon 前向纠错（FEC，如 `10:3`），抗高丢包链路
-- 每日密钥自动轮换（北京日期 + 密钥后缀）
-- 基于 Asio 的全异步架构，无阻塞调用
-- 服务端单 UDP Socket 多路复用所有会话
-- SSRF 防护与未认证来源限速
+**传输**
 
-## 构建
+- SOCKS5 `CONNECT`（TCP），支持 `IPv4` / `IPv6` / `DOMAIN` 三种地址类型
+- KCP 极速模式：`conv=1`、`mtu=1400`、`interval=10ms`、`nodelay=1`、`fast resend=5`、`nc=1`、收发窗口各 1024 段、会话超时 60s
+- 服务端单 UDP Socket 多路复用全部会话；客户端每个本地 TCP 连接一个独立 UDP Socket
+- 半关闭语义：一侧停止发送时用 `KCP_PROXY_FIN_V1` 通知对端，对端 `shutdown(SHUT_WR)` 而不是 `close()`，不丢在途响应
+- 应用层心跳（30s）防止空闲隧道被误回收
 
-项目使用 **vcpkg** 管理依赖，**CMake** 构建。依赖项：
+**加密**
 
-| 依赖 | 来源 | 说明 |
+- AES-128-GCM + HKDF-SHA256，密钥由「密钥串 + 每会话随机盐」派生，会话之间不共享 nonce 序列
+- nonce 内嵌方向标识（c2s `0x01` / s2c `0x02`），2048-bit 滑动窗口检测重放
+- 密钥不落命令行：客户端与 GUI 通过 `KCP_PROXY_KEY` 环境变量传递
+
+**抗丢包**
+
+- 可选 Reed-Solomon FEC（如 `10:3`）：发送侧每 10 个数据报额外产生 3 个校验报，接收侧丢失 ≤3 个可本地重建，不必等重传
+- 服务端逐会话自适应：客户端说 FEC 就按 FEC 回，不说就发明文裸 KCP 段，同一服务端可同时服务两类客户端
+
+**运维**
+
+- 每日密钥：`北京日期(YYYYMMDD)` + 后缀，服务端由 systemd timer 每 6 小时重启切换，客户端启动时本地推导
+- SSRF 防护：默认拦截回环/私网/链路本地/组播等受限目标
+- 未认证来源按秒限速；服务端最多 4096 会话，客户端最多 512 并发连接
+- 日志行格式固定（`YYYY-MM-DD HH:MM:SS.mmm [LEVEL] module: message`），GUI 靠它解析状态与流量
+
+**GUI（Electron）**
+
+- 概览页实时上下行速率、峰值、累计流量与迷你曲线
+- 托盘常驻（关窗不退出）、托盘启停、断线重连、开机自动连接、允许局域网
+- 连接测试结果内联显示，不必翻日志
+- 内置自动更新（GitHub Releases）
+
+## 快速开始
+
+### 直接下载
+
+发布包在 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases)：
+
+| 产物 | 平台 | 用途 |
 |------|------|------|
-| OpenSSL | vcpkg | TLS / AES-128-GCM |
-| Asio | vcpkg | 异步网络库（standalone，无 Boost） |
-| KCP | vcpkg overlay port | C++17 移植（dchen8525-dev/kcp-cpp），含 FEC 编解码 |
-| fmt | vcpkg | 日志/字符串格式化（{fmt}） |
+| `kcp-proxy-server_<ver>_amd64.deb` | Linux amd64 | 服务端，装完即 systemd 服务 |
+| `kcp-proxy-<ver>-linux-x64.tar.gz` | Linux x64 | 服务端/客户端命令行，解压即用 |
+| `kcp-proxy-<ver>-windows-x64.zip` | Windows x64 | 服务端/客户端命令行 |
+| `KCP-Proxy-<ver>-Setup.exe` | Windows | GUI 安装包（NSIS，推荐） |
+| `KCP-Proxy-<ver>-Portable.exe` | Windows | GUI 免安装单文件 |
+| `KCP-Proxy-<ver>.AppImage` | Linux | GUI |
+| `SHA256SUMS` | — | 以上全部产物的校验和 |
 
-### 通用前置条件
+```bash
+# 校验（下载到同一目录后）
+sha256sum -c SHA256SUMS --ignore-missing
+```
 
-- **CMake 3.22+**
-- **vcpkg**（脚本会自动检测或引导安装，见下方说明）
+GUI 的 `latest.yml` / `latest-linux.yml` / `.blockmap` 是自动更新用的元数据，不需要手动下载。
 
-克隆仓库后即可构建：
+### 从源码构建
+
+依赖由 **vcpkg** 管理，构建由 **CMake 3.22+** 驱动：
+
+| 依赖 | 用途 |
+|------|------|
+| asio | 全异步网络、定时器、信号（standalone，无 Boost） |
+| openssl | AES-128-GCM、HKDF、`OPENSSL_cleanse` |
+| fmt | 字符串与日志格式化 |
+| spdlog | 日志后端 |
+| kcp-cpp | KCP 协议栈 C++17 移植（`ports/kcp-cpp` overlay，含 Reed-Solomon 编解码） |
+| doctest | 单元测试框架 |
+| CLI11 | 命令行解析 |
+
+**Linux / macOS**
 
 ```bash
 git clone https://github.com/dchen8525-dev/kcp-proxy-cpp.git
 cd kcp-proxy-cpp
+./build.sh                      # 自动处理 vcpkg，产物进 bin/linux/
 ```
 
-### Linux / macOS
+**Windows（MSVC）**
 
-**前置依赖：**
-- GCC 7+（或 Clang 6+）
-- make / ninja（任选构建工具）
-
-**一键构建：**
-
-```bash
-./build.sh
-```
-
-**手动构建：**
-
-```bash
-# 设置 VCPKG_ROOT（如果尚未设置）
-export VCPKG_ROOT=/path/to/vcpkg
-
-cmake --preset default
-cmake --build --preset release
-```
-
-**本地 CPU 优化（可选）：**
-
-默认构建使用通用指令集，便于分发。如需针对本机 CPU 优化（`-march=native`），configure 时开启：
-
-```bash
-cmake -B build -DKCP_PROXY_ENABLE_NATIVE_TUNE=ON
-```
-
-> **不要**用该选项构建发布包：`-march=native` 产物可能含目标用户 CPU 不支持的指令（如 AVX-512），在旧机器上会非法指令崩溃。CI 打包流程保持默认关闭。
-
-### Windows (MSVC)
-
-**前置依赖：**
-- Visual Studio 2019 或更高版本（Community / Professional / Enterprise / BuildTools），需安装 **"使用 C++ 的桌面开发"** 工作负载
-- CMake 3.22+（VS 安装器中勾选 "C++ CMake 工具 for Windows" 可一并安装）
-- Git for Windows
-
-**一键构建：**
+需要 Visual Studio 2019+ 的「使用 C++ 的桌面开发」工作负载、CMake、Git for Windows。
 
 ```powershell
-.\build_vs.bat
+.\build_vs.bat                  # 产物进 bin\windows\，附带所需 DLL
 ```
 
-脚本会自动：
-1. 检测并设置 MSVC 编译环境
-2. 按优先级选择 vcpkg：用户 `VCPKG_ROOT` 环境变量 > 项目本地 `vcpkg/` > 自动克隆并引导安装
-3. 通过 vcpkg 安装依赖（asio、openssl、fmt、kcp-cpp）
-4. CMake 配置、编译并输出到 `bin\windows\`
+**手动构建**（两端同法）
 
-**手动构建：**
-
-```powershell
-# 设置 VCPKG_ROOT（如果尚未设置）
-$env:VCPKG_ROOT = "C:\path\to\vcpkg"
-
+```bash
+export VCPKG_ROOT=/path/to/vcpkg      # Windows: $env:VCPKG_ROOT = "C:\path\to\vcpkg"
 cmake --preset default
 cmake --build --preset release --parallel
 ```
 
-### vcpkg 说明
+产物：`kcp-proxy-server`、`kcp-proxy-client`，位于 `build/Release/`（多配置生成器）或 `build/`。
+Presets 另有 `debug`。
 
-构建时会自动使用 vcpkg 安装依赖。vcpkg 的查找优先级：
+vcpkg 查找顺序为 `VCPKG_ROOT` → 仓库内 `vcpkg/` → 自动克隆。不建议用 VS 自带的
+`BuildTools\VC\vcpkg`，它常缺 `builtin-baseline` 支持；脚本会跳过它。
 
-1. 环境变量 `VCPKG_ROOT` 指向的 vcpkg 实例
-2. 项目目录下的 `vcpkg/` 文件夹
-3. 如果都不存在，脚本会自动从 GitHub 克隆并引导安装
+> **`-DKCP_PROXY_ENABLE_NATIVE_TUNE=ON` 只用于本机提速**（`-march=native`）。发布包一律保持
+> 关闭：带 AVX-512 的产物在旧 CPU 上会非法指令崩溃。
 
-> **注意：** 不建议使用 VS 内置的 vcpkg 实例（位于 `BuildTools\VC\vcpkg`），它可能缺少 `builtin-baseline` 支持。脚本会自动跳过它，使用项目本地 vcpkg。
+## 服务端部署
 
-### CMake Presets
-
-| Preset | 说明 |
-|--------|------|
-| `default` | 默认配置（使用 vcpkg 工具链） |
-| `release` | Release 构建 |
-| `debug` | Debug 构建 |
-
-构建产物：
-- `kcp-proxy-server` — 服务端
-- `kcp-proxy-client` — 客户端
-- 输出目录：`build/`（多配置：`build/Release/`、`build/Debug/`）
-- 一键构建会自动复制到 `bin/linux/` 或 `bin/windows/`
-
-## 部署与使用
-
-### 服务端部署（Ubuntu/Debian）
-
-#### 方法1：使用deb包（推荐）
-
-从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载最新的deb包：
+### deb 安装（推荐）
 
 ```bash
-# 下载deb包（以v0.2.2为例）
-wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v0.2.2/kcp-proxy-server_0.2.2_amd64.deb
+VERSION=0.2.2                       # 换成要安装的版本，见 Releases
+wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v$VERSION/kcp-proxy-server_${VERSION}_amd64.deb
+sudo dpkg -i kcp-proxy-server_${VERSION}_amd64.deb
 
-# 安装
-sudo dpkg -i kcp-proxy-server_0.2.2_amd64.deb
-
-# 启动服务
-sudo systemctl start kcp-proxy-server
-
-# 设置开机自启
-sudo systemctl enable kcp-proxy-server
-
-# 查看状态
 sudo systemctl status kcp-proxy-server
 ```
 
-**配置说明**：
-- 服务自动监听 UDP 8388 端口
-- 密钥配置：`/etc/kcp-proxy/server.env`
-- 日志文件：`/var/log/kcp-proxy/server.log`（stdout+stderr 追加写入；超过 10 MiB 时在下次重启时轮转为 `.1`，仅保留一代。可在 `server.env` 中修改 `LOG_FILE` 路径，置空则只输出到 journald）
-- 日志查看：`journalctl -u kcp-proxy-server -f`（启动横幅等 systemd 输出），或 `tail -f /var/log/kcp-proxy/server.log`
-- 默认密钥：Beijing Date (YYYYMMDD) + suffix
-- 密钥轮换：systemd timer `kcp-proxy-server-key-refresh.timer` 在**北京时区** 00:00/06:00/12:00/18:00
-  重启服务端。调度表达式固定为 UTC（`OnCalendar=*-*-* 04,10,16,22:00:00 UTC`，即北京
-  00:00/06:00/12:00/18:00），因此**与服务器本地时区无关**：裸 `OnCalendar=` 会按主机时区解析，
-  在非 UTC+8 的机器上午夜触发点可能偏离北京日期切换近 14 小时。北京固定 UTC+8 且无夏令时，故
-  UTC 形式是精确的。若主机的 systemd 低于 228（不支持 `UTC` 后缀），安装脚本会自动换算成本地
-  墙钟时间并给出提示。日期变更后客户端也需重启，否则仍持有前一天的密钥。
-- FEC 前向纠错：`/etc/kcp-proxy/server.env` 中 `FEC=数据:校验`，新装默认 `10:3`，修改后需
-  `systemctl restart kcp-proxy-server`。固定值要求客户端使用相同数值（GUI 勾选"启用 FEC"
-  并填同样的 `数据:校验`），两端不一致时隧道能握手但 FEC 静默失效；置空或 `0:0` 为自适应
-  模式，服务端按客户端逐会话适配
-- 内核 UDP 缓冲上限：`/etc/sysctl.d/99-kcp-proxy.conf`（见下）
+安装后：
 
-#### 内核 UDP 缓冲上限（重要）
+| 项 | 位置 |
+|----|------|
+| 二进制 | `/usr/local/bin/kcp-proxy/kcp-proxy-server` |
+| 配置 | `/etc/kcp-proxy/server.env`（`chmod 600`） |
+| 日志 | `/var/log/kcp-proxy/server.log`，或 journald |
+| 服务 / 定时器 | `kcp-proxy-server.service`、`kcp-proxy-server-key-refresh.timer` |
+| 运行用户 | 系统用户 `kcpproxy`（无 home、nologin） |
+| 内核参数 | `/etc/sysctl.d/99-kcp-proxy.conf` |
 
-服务端启动时会向内核申请 4 MiB 的 UDP 收发缓冲，但内核会把它**静默**钳制到
-`net.core.rmem_max` / `net.core.wmem_max`（Debian 默认仅 208 KiB），且 `setsockopt`
-照样返回成功。缓冲变小后，突发流量会溢出并被内核丢包，而 KCP 会把丢包误判为网络
-拥塞、进而整窗重传——表现为连接卡住、最终 `ERR_CONNECTION_CLOSED`。
+### `server.env`
 
-因此安装脚本（deb 的 postinst 与 `install-service.sh`）会在**启动服务之前**写入
-`/etc/sysctl.d/99-kcp-proxy.conf`，把上限提高到 4 MiB：
+```ini
+SUFFIX=你的密钥后缀        # 8-128 位 [A-Za-z0-9._-]
+PORT=8388
+HOST=0.0.0.0
+LOG_LEVEL=INFO
+LOG_FILE=/var/log/kcp-proxy/server.log   # 置空则只输出到 journald
+FEC=10:3                                 # 置空或 0:0 表示用内建自适应默认值
+```
 
-- **只升不降**：若主机当前值已经 ≥ 4 MiB，则完全不动（连文件都不写），
-  已经调高的 `rmem_max` 绝不会被安装脚本改小。
-- 缺少 `sysctl` 的最小化 Debian 主机上会跳过并打印警告，安装不会失败。
-- **卸载不会回滚**：`uninstall-service.sh` 会删除该 drop-in，但删除配置文件
-  **不会**把已经生效的值降回来，重启前 `rmem_max` 仍保持调高状态。
+改完 `sudo systemctl restart kcp-proxy-server` 生效。`LOG_FILE` 必须留在
+`/var/log/kcp-proxy` 下：unit 开了 `ProtectSystem=strict`，写别处会被拒绝。
+日志超过 10 MiB 时在下次重启时轮转为 `.1`，只保留一代。
 
-启动日志会打印实际生效值，被钳制时会额外输出一条 WARNING：
+### 密钥轮换
+
+完整密钥 = `北京日期(YYYYMMDD)` + `SUFFIX`。`kcp-proxy-server-key-refresh.timer` 在北京时间
+00:00 / 06:00 / 12:00 / 18:00 重启服务，让服务端拿到当天日期。
+
+定时器故意写成 UTC 形式（`OnCalendar=*-*-* 04,10,16,22:00:00 UTC`）：裸 `OnCalendar=` 按**主机时区**
+解析，在非 UTC+8 机器上午夜触发点可能偏离北京日期切换近 14 小时；北京固定 UTC+8 且无夏令时，UTC 才是精确的。
+systemd < 228 不支持 `UTC` 后缀，安装脚本会探测并回退为换算后的本地时间。
+
+**客户端也要重启**才能拿到新日期的密钥，否则会持续 `DECRYPT_FAILED`。
+
+### 内核 UDP 缓冲（重要）
+
+服务端启动时申请 4 MiB 收发缓冲，但内核会**静默**钳制到 `net.core.rmem_max` / `wmem_max`
+（Debian 默认仅 208 KiB），而 `setsockopt` 照样返回成功。缓冲变小后突发流量溢出被丢，
+KCP 把丢包当拥塞、整窗重传，现象是连接卡住直至 `ERR_CONNECTION_CLOSED`。
+
+因此 deb 的 postinst 与 `install-service.sh` 会在**启动服务之前**写入
+`/etc/sysctl.d/99-kcp-proxy.conf`，把上限提到 4 MiB：
+
+- **只升不降**：当前值已 ≥ 4 MiB 时完全不写文件。
+- 缺 `sysctl` 的最小化主机跳过并告警，安装不失败。
+- 卸载会删 drop-in，但**不会**把已生效的值降回来。
+
+启动日志会打出生效值，被钳制时额外一条 WARNING：
 
 ```
 UDP socket buffers so_rcvbuf=4194304 so_sndbuf=4194304
 UDP socket buffer clamped by the kernel: so_rcvbuf requested=4194304 effective=212992 ...
 ```
 
-排查突发丢包见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
-
-#### 方法2：从源码部署
-
-如果需要自定义构建，可以使用一键部署脚本：
+### 防火墙
 
 ```bash
-# 先构建Linux二进制
-./build.sh
-
-# 部署到远程服务器
-./deploy.sh root@your-server-ip
-
-# 可选参数
-./deploy.sh root@1.2.3.4 -P 2222              # 自定义SSH端口
-./deploy.sh root@1.2.3.4 --prompt-suffix      # 交互式隐藏输入密钥后缀（推荐，不进 shell 历史与 ps）
-KCP_PROXY_DEPLOY_SUFFIX='MyStrongSuffix' ./deploy.sh root@1.2.3.4   # 或用环境变量传后缀
-./deploy.sh root@1.2.3.4 --suffix MyStrongSuffix   # 直接传参：⚠️ 会出现在 shell 历史与 ps 输出中
-./deploy.sh root@1.2.3.4 --uninstall           # 卸载
+sudo ufw allow 8388/udp && sudo ufw reload
 ```
 
-密钥后缀为 8-128 位字母、数字、`.`、`_` 或 `-`。省略后缀时沿用服务端现有值
-（首次安装为内建默认值）。
+只需要 UDP。客户端到服务端不建立 TCP 连接。
 
----
-
-### 客户端使用（Windows GUI）
-
-#### 下载与安装
-
-从 [GitHub Releases](https://github.com/dchen8525-dev/kcp-proxy-cpp/releases) 下载Windows GUI客户端：
-
-```
-KCP-Proxy-0.2.2-Setup.exe     # NSIS 安装包（推荐）
-KCP-Proxy-0.2.2-Portable.exe  # 免安装单文件版
-```
-
-运行安装包，或直接运行免安装版。
-
-#### GUI使用步骤
-
-1. **配置服务器**：
-   - 地址：填写服务器IP或域名（例如：`example.com` 或 `192.168.1.100`）
-   - 端口：默认 `8388`
-   - 本地SOCKS端口：默认 `1080`
-
-2. **配置密钥**：
-   - 填写密钥后缀（8-128 位字母、数字、`.`、`_` 或 `-`）
-   - 完整密钥 = 北京日期 (YYYYMMDD) + 后缀，服务端每天自动轮换
-   - 可选：勾选「启用 FEC」并填写分片 `数据:校验`（默认 `10:3`，需与服务端一致）
-
-3. **启动连接**：
-   - 点击「启动连接」按钮
-   - 查看日志确认连接成功
-
-4. **使用代理**：
-   - 浏览器或其他应用配置SOCKS5代理：`127.0.0.1:1080`
-   - 测试连接：`curl -x socks5h://127.0.0.1:1080 https://example.com`
-
-#### GUI特性
-
-- ✅ 系统托盘支持（关闭窗口不退出）
-- ✅ 实时日志显示
-- ✅ 连接测试结果内联显示（概览页即时反馈，不必翻日志）
-- ✅ 实时上下行速率、峰值与累计流量（迷你曲线图）
-- ✅ FEC 开关与分片配置（单字段 `数据:校验`，如 `10:3`）
-- ✅ 断线自动重连、打开应用自动连接、允许局域网使用
-- ✅ 托盘快速启动/停止
-- ✅ 配置手动保存：点击「保存设置」才写入，启动连接按当前表单执行
-
-#### 密钥模式说明
-
-**每日密钥（GUI 与默认部署方式）**：
-- 格式：`YYYYMMDD` + suffix
-- 例如：日期`20260818`，后缀`abc` → 密钥`20260818abc`
-- 服务端每天自动轮换；GUI 只使用这种模式
-
-**固定密钥（仅命令行客户端）**：
-- 通过 `-k <密钥>` 手动指定（至少16字符，例如 `<SECRET_KEY>`）
-- 仅在与 `kcp-proxy-server -k` 搭配、且不依赖每日轮换时使用
-- ⚠️ 安全提示：本仓库文档与测试中出现的 `remote_test_key_123456` 是**公开的演示/测试密钥**，任何人都能看到。生产环境必须替换为**你自己生成的随机强密钥（≥16 字符）**，切勿使用示例值或弱密钥。
-
----
-
-### 防火墙配置
-
-**服务端（Ubuntu）**：
+### 从源码远程部署
 
 ```bash
-# 开放UDP 8388端口
-sudo ufw allow 8388/udp
-sudo ufw reload
-
-# 或使用iptables
-sudo iptables -A INPUT -p udp --dport 8388 -j ACCEPT
+./build.sh                                  # 先产出 Linux 二进制
+./deploy.sh root@your-server-ip             # 上传并安装为 systemd 服务
+./deploy.sh root@1.2.3.4 -P 2222            # 自定义 SSH 端口
+./deploy.sh root@1.2.3.4 --prompt-suffix    # 隐藏交互输入后缀（推荐）
+./deploy.sh root@1.2.3.4 --dry-run          # 只验证打包，不连接
+./deploy.sh root@1.2.3.4 --uninstall
 ```
 
----
+`deploy.sh` / `deploy.bat` 只是 `scripts/deploy/deploy.py` 的入口（Python 3 标准库 + 系统
+`ssh`/`scp`，Windows 自带 OpenSSH 即可）。后缀也可用环境变量
+`KCP_PROXY_DEPLOY_SUFFIX` 传入；`--suffix VALUE` 会出现在 shell 历史与 `ps` 输出里，不建议。
+省略后缀时沿用服务端现有值。
 
-### 测试连接
+## 客户端
 
-**通过GUI客户端**：
-1. 启动GUI，填写服务器地址和密钥
-2. 点击「启动连接」
-3. 浏览器配置代理：`127.0.0.1:1080`
-4. 访问网站测试
+### Windows GUI
 
-**验证代理**：
+下载 `KCP-Proxy-<ver>-Setup.exe` 安装，或直接用 `KCP-Proxy-<ver>-Portable.exe`。
+
+1. **连接设置**：服务器地址（IP/域名）、服务器端口（默认 8388）、密钥后缀、本地 SOCKS 端口（默认 1080）
+2. **按需勾选**：启用 FEC（填与服务端一致的 `数据:校验`，默认 `10:3`）、允许局域网使用、打开应用时自动连接、断线重连
+3. **保存设置** → **启动连接**（「保存设置」才写盘；「启动连接」按当前表单执行）
+4. 应用侧代理指向 `socks5://127.0.0.1:1080`
+
 ```bash
-# Windows (PowerShell)
+# 验证：返回的应该是服务器 IP
 curl -x socks5h://127.0.0.1:1080 https://httpbin.org/ip
-
-# 应该返回服务器的IP地址
 ```
 
-## 运行参数（可选）
+GUI 关闭窗口默认收进托盘；托盘菜单可启停、安装更新。
 
-如果需要使用命令行版本（高级用户）：
+### 命令行客户端
 
-### 服务端命令行
+适合无 GUI 的机器或需要脚本化：
 
 ```bash
-kcp-proxy-server -k <密钥> [-H 0.0.0.0] [-p 8388] [-L info]
+kcp-proxy-client -s example.com -l 1080 -k "$(TZ=Asia/Shanghai date +%Y%m%d)YOURSUFFIX"
+
+# 或让密钥走环境变量，避免出现在 ps 里
+KCP_PROXY_KEY="$(TZ=Asia/Shanghai date +%Y%m%d)YOURSUFFIX" \
+  kcp-proxy-client -s example.com -l 1080
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-k, --key` | （必填） | 加密密钥，最少 16 字符 |
+不传 `--fec` 即关闭 FEC。密钥模式上命令行更灵活：可以传固定的长密钥（≥16 字符），
+只要两端一致且不依赖每日轮换。
+
+## 命令行参考
+
+### `kcp-proxy-server`
+
+```bash
+kcp-proxy-server -k <密钥> [-H 0.0.0.0] [-p 8388] [-T 1] [-L INFO] [--fec 10:3] [--allow-target HOST[:PORT]]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `-k, --key` | 必填 | 加密密钥，≥16 字符；也可用环境变量 `KCP_PROXY_KEY` |
 | `-H, --host` | `0.0.0.0` | UDP 绑定地址 |
-| `-p, --port` | `8388` | UDP 监听端口 |
-| `-L, --log-level` | `INFO` | 日志级别 |
-| `-T, --threads` | `1` | io_context 工作线程数，范围 1–64；KCP 更新始终跑在单个共享的 10ms tick 上，多线程只用于分摊 UDP/TCP I/O |
-| `--allow-target` | （空） | 允许指定目标绕过 SSRF 防护（可重复，`主机[:端口]`）。**仅限实验室/测试**，默认空即全防护，切勿在不可信网络暴露 |
-| `--fec` | `off` | Reed-Solomon 前向纠错，格式 `DATA:PARITY`（如 `10:3`；`0:0` 表示关闭）。**必须与客户端完全一致**，否则隧道能握手但一个字节也传不过去 |
-| `KCP_PROXY_KEY`（环境变量） | （空） | 与 `-k` 等价的密钥来源；未提供 `-k` 时读取。供 GUI 调用，避免密钥出现在命令行里 |
+| `-p, --port` | `8388` | UDP 监听端口（严格十进制，1–65535） |
+| `-T, --threads` | `1` | io_context 工作线程数，1–64。KCP 更新始终跑在单个共享 10ms tick 上，多线程只分摊 UDP/TCP I/O |
+| `-L, --log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `--fec` | 未设 | FEC 分片参数 `DATA:PARITY`（如 `10:3`，`0:0` 关闭）。**服务端本身逐会话自适应**，此值只决定适配时用哪组分片，未设时用内建 `10:3` |
+| `--allow-target` | 空 | 放行指定目标绕过 SSRF 防护，可重复，`主机[:端口]`。**仅限实验室**，默认空即全防护 |
 
-### 客户端命令行
+解析是失败关闭式的：端口写 `abc`、FEC 写成 `3:10`（校验位多于数据位）都会直接拒绝启动，
+不会退回默认值。
+
+### `kcp-proxy-client`
 
 ```bash
-kcp-proxy-client -s <服务端地址> -k <密钥> [-p 8388] [-H 127.0.0.1] [-l 1080] [--half-close-grace 120]
+kcp-proxy-client -s <服务端地址> -k <密钥> [-p 8388] [-H 127.0.0.1] [-l 1080] [-L INFO] [--fec 10:3] [--half-close-grace 120]
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-s, --server` | （必填） | 远端 KCP 服务端地址 |
-| `-k, --key` | （必填） | 加密密钥，最少 16 字符 |
-| `-p, --server-port` | `8388` | 远端 KCP 服务端端口 |
-| `-H, --listen-host` | `127.0.0.1` | 本地 SOCKS5 监听地址 |
-| `-l, --listen-port` | `1080` | 本地 SOCKS5 监听端口 |
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `-s, --server` | 必填 | 远端 KCP 服务端地址 |
+| `-p, --server-port` | `8388` | 远端 UDP 端口 |
+| `-k, --key` | 必填 | 加密密钥，≥16 字符；也可用 `KCP_PROXY_KEY` |
+| `-H, --listen-host` | `127.0.0.1` | 本地 SOCKS5 绑定地址（`0.0.0.0` 即允许局域网） |
+| `-l, --listen-port` | `1080` | 本地 SOCKS5 端口 |
 | `-L, --log-level` | `INFO` | 日志级别 |
-| `--half-close-grace` | `120`（=2×超时） | 本地应用停止发送后，目标仍无数据可投递多少秒即回收隧道；只要目标还在持续投递数据就不会被回收（回收计时仅由真实数据推进，心跳不算） |
-| `--fec` | `off` | Reed-Solomon 前向纠错，格式 `DATA:PARITY`（如 `10:3`；`0:0` 表示关闭）。**必须与服务端完全一致** |
-| `KCP_PROXY_KEY`（环境变量） | （空） | 与 `-k` 等价的密钥来源；未提供 `-k` 时读取。供 GUI 调用，避免密钥出现在命令行里 |
+| `--fec` | 未设 | `DATA:PARITY`，如 `10:3`；`0:0` 或省略即关闭。**客户端决定本端是否用 FEC 成帧** |
+| `--half-close-grace` | `120`（2×超时） | 本地应用停止发送后，目标多久没有新数据就回收隧道。计时只由真实数据推进，心跳不算 |
 
-#### 前向纠错（FEC）
+> 0.2.0 起 FEC 参数是 `--fec`（双横线）。旧写法 `-fec 10:3` 会得到一个明确的迁移提示，
+> 而不是 CLI11 的「arguments were not expected」。
 
-KCP 自带的快速重传只能在**丢包被检测到之后**才开始补救，一次 RTT 内丢失的包仍会让应用卡顿。
-`--fec 10:3` 在发送侧每 10 个 KCP 数据报额外生成 3 个校验报，接收侧任意丢失 ≤3 个即可本地重建，
-无需等待重传。代价是 30% 额外上行带宽，因此只在跨境/无线等丢包明显的链路上开启。
+## 前向纠错（FEC）
 
-配置约束：`DATA` 与 `PARITY` 都 ≥ 1 且 `DATA + PARITY ≤ 256`，`PARITY ≤ DATA`（冗余度不超过
-100%）。参数解析是失败的**关闭式**的：写错任何一处都直接拒绝启动，而不是退回无 FEC 模式——
-两端参数不一致时隧道能完成 UDP 握手却传不了任何数据，那种"能连上但不通"的故障远比启动报错难查。
+KCP 的快速重传只能在**丢包被检测到之后**才开始补救，一个 RTT 内丢的包仍会让应用卡顿。
+`--fec 10:3` 让发送侧每 10 个数据报额外产生 3 个校验报，接收侧任意丢 ≤3 个即可本地重建。
+代价是 30% 额外上行带宽，只在跨境、无线等丢包明显的链路上开。
 
-GUI 中勾选"启用 FEC"后，在「FEC 分片 (数据:校验)」填入与服务端一致的值（如 `10:3`）；
-点击「保存设置」后修改才会保存。
+**两端语义不同，这是最容易踩错的地方：**
 
-**推荐**：普通用户使用Electron GUI，更直观易用。
+| 端 | `--fec` 的含义 |
+|----|----------------|
+| 客户端 | **显式**：本端是否用 FEC 成帧，同时决定它期望收到什么 |
+| 服务端 | **自适应**：会话首个解密后的数据报带 FEC 头就按 FEC 成帧，是裸 KCP 段就保持裸帧。`--fec` 只提供适配时的分片参数，未设则用内建 `10:3` |
+
+因此两端参数不一致**不会**导致完全不通：数据分片各自独立有效，仍能传输，只是校验修复能力下降
+（跨丢包链路会表现为速度变慢而不是断流）。要拿到完整修复能力，两端写同一个 `DATA:PARITY`。
+
+配置约束：`DATA ≥ 1`、`PARITY ≥ 1`、`DATA + PARITY ≤ 256`、`PARITY ≤ DATA`（冗余不超过 100%）。
+解析失败即拒绝启动，不静默降级成「无 FEC」——一条「能连上但不通」的隧道比启动报错难查得多。
+
+线路上限由编译期 `static_assert` 兜住：FEC 成帧后的最坏尺寸连同 salt/nonce 与 IP/UDP 头仍在
+1500 MTU 之内，不会触发 IP 分片（分片丢一个片就等于整包丢失，对 KCP 是最坏情况）。
 
 ## 协议与加密
 
-每个本地 TCP 连接会创建一个独立 KCP/UDP 会话。C++ 客户端会先在 KCP 内发送认证加密的
-`KCP_PROXY_HELLO_V2`，服务端返回 `KCP_PROXY_HELLO_ACK_V2` 后客户端才把该会话标记为 connected
-（V2 相比 V1 只多了半关闭支持，见下）。作为兼容模式，服务端也接受首个有效加密 KCP payload 直接是
-SOCKS5 CONNECT 请求（不要求 HELLO），并继续接受 `KCP_PROXY_HELLO_V1` 的旧客户端。
-超时、错密钥、服务端未运行或 UDP 被阻断都会导致连接失败。
+每个本地 TCP 连接对应一个独立 KCP/UDP 会话。客户端先在 KCP 内发送认证加密的
+`KCP_PROXY_HELLO_V2`，收到服务端 `KCP_PROXY_HELLO_ACK_V2` 后才把会话标记为 connected。
+兼容性上，服务端也接受首个有效加密 payload 直接是 SOCKS5 CONNECT 请求（不要求 HELLO），
+并继续接受 `KCP_PROXY_HELLO_V1` 的旧客户端；V2 相比 V1 只多出半关闭支持。
 
-隧道两端各自用 `KCP_PROXY_FIN_V1`（payload 为 `magic || session_salt`，与心跳同样的会话盐作用域）
-通知对端"我这个方向不再发送数据"：服务端在目标连接 EOF 时发送，客户端在本地应用停止发送时发送。
-接收方随即停止在该方向读取 KCP，并对相应 TCP socket 执行 `shutdown(SHUT_WR)`（而非 `close()`，
-以免丢弃应用尚未读走的数据）。没有它时，隧道只能靠 60s 空闲扫描收尾——目标已挂断的本地应用会白等
-最长一分钟。该消息只在 V2 握手协商成功后发送，V1 对端永远不会收到。
+半关闭由 `KCP_PROXY_FIN_V1`（payload 为 `magic || session_salt`）表达：服务端在目标 EOF 时发送，
+客户端在本地应用停止发送时发送。接收方停止在该方向读 KCP，并对相应 socket 执行
+`shutdown(SHUT_WR)`，避免丢掉应用尚未读走的数据。没有它，隧道只能靠 60s 空闲扫描收尾。
 
-密钥字符串不会直接 SHA-256 截断。实现使用 HKDF-SHA256 派生 AES-128-GCM 密钥：
-
-- cipher: `AES-128-GCM`
-- HKDF salt: 固定字符串 `kcp-proxy-hkdf-salt-v1` 拼接 16 字节随机 per-session salt
-- client -> server info: `kcp-proxy/c2s/v1`
-- server -> client info: `kcp-proxy/s2c/v1`
-- tag length: 16 bytes
-- CLI 最小密钥长度: 16 字符
-- wire format: `[session_salt(16)][nonce(12)][ciphertext][tag(16)]`
-
-每个会话由客户端生成 16 字节随机 salt（明文随每包携带），双方用 `PSK + salt` 通过 HKDF 派生
-独立的会话密钥，保证各会话计数器/nonce 永不跨会话复用（AES-GCM nonce 复用的后果是灾难性的）。
-服务端拒绝任何与在线会话共享同一 salt 的新会话。
-
-Nonce（12 字节）结构为：
+密钥串不会直接 SHA-256 截断，而是用 HKDF-SHA256 派生 AES-128-GCM 密钥：
 
 ```
-[8 字节单调递增计数器][1 字节方向标识][3 字节零填充]
+cipher:   AES-128-GCM
+HKDF:     SHA-256，salt = "kcp-proxy-hkdf-salt-v1" || session_salt(16B)
+info:     "kcp-proxy/c2s/v1"（客户端→服务端） / "kcp-proxy/s2c/v1"（服务端→客户端）
+nonce:    12B = [8B 单调计数器][1B 方向][3B 零]
+wire:     [session_salt(16)][nonce(12)][ciphertext][tag(16)]
 ```
 
-计数器起始值由 salt 前 6 字节派生（大端），使 nonce 序列即使在被强制共享密钥的会话间也唯一。
-
-方向标识：客户端 `0x01`，服务端 `0x02`，防止跨方向重放攻击。普通接收端维护 2048-bit 滑动窗口
-检测重放包；服务端首次包预认证（首个数据包即建立会话并播种重放窗口），不使用全局重放窗口。
-单个会话达到 2^48 次加密后拒绝继续加密，需重新建立连接。
-
-服务端会拦截指向回环/私网/链路本地/组播等受限地址的 CONNECT（SSRF 防护），并对未认证来源的
-会话建立尝试做每秒限速，避免垃圾 UDP 洪泛耗尽 CPU。
+每次会话由客户端生成 16 字节随机 salt 并明文随包携带，双方用 `PSK + salt` 派生独立的会话密钥，
+保证 nonce 永不跨会话复用（AES-GCM 的 nonce 复用后果是灾难性的）。服务端拒绝与在线会话共享
+同一 salt 的新会话。计数器起值由 salt 前 6 字节派生，单会话加密 2^48 次后拒绝继续，需重建连接。
 
 SOCKS5 支持范围：
 
-- 支持 `CONNECT`
-- 支持地址类型 `IPv4`、`IPv6`、`DOMAIN`
-- 不支持 `UDP ASSOCIATE` 和 `BIND`，会返回 SOCKS5 command not supported
-- 不转发 QUIC/HTTP3、UDP DNS 等 UDP 流量；浏览器如需稳定通过本代理访问，请禁用 QUIC/HTTP3
+- 支持 `CONNECT`，地址类型 `IPv4` / `IPv6` / `DOMAIN`
+- 不支持 `UDP ASSOCIATE` 与 `BIND`，返回 command not supported
+- 不转发 QUIC/HTTP3、UDP DNS 等 UDP 流量；浏览器如需稳定通过本代理，请关闭 QUIC/HTTP3
 
 ## 架构
 
 ```
-KCPProxyClient (客户端)
-  ├── TCP Acceptor (本地 SOCKS5 监听)
-  └── 每个 TCP 连接创建:
-      ├── Crypto (加密实例)
-      └── KCPClientSession (独立 UDP Socket + KcpWrapper)
+KCPProxyClient
+  ├── TCP acceptor（本地 SOCKS5）
+  └── 每个本地 TCP 连接:
+      ├── KCPClientSession（独立 UDP socket）
+      │   ├── KcpWrapper（KCP 状态机）
+      │   └── Crypto（AES-128-GCM 实例）
+      └── SOCKS5 握手内联处理
 
-KCPServer (服务端)
-  ├── 单个 UDP Socket (所有会话共享)
+KCPServer
+  ├── 单个 UDP socket（所有会话共用）
   └── unordered_map<ip:port, KCPSession>
-      └── 每个 KCPSession:
-          ├── KcpWrapper (KCP 状态机)
-          └── Crypto (加密实例)
+      └── KCPSession
+          ├── KcpWrapper
+          └── Crypto
 ```
 
-- **KcpWrapper** — 对 vendored `ikcp` 的 C++ RAII 封装，通过输出回调将 KCP 产生的数据交给加密层和 UDP 发送
-- **Crypto** — AES-128-GCM 加解密，单调递增 Nonce 计数器
-- **KCPSession** — 服务端会话，每个客户端端点一个，共享服务端 UDP Socket
-- **KCPClientSession** — 客户端会话，每个 TCP 连接一个，独立 UDP Socket
-- **KCPServer** — 服务端主类，管理会话映射，定期清理超时会话（60 秒）
-- **KCPProxyClient** — 客户端主类，接受本地 SOCKS5 连接，内联处理 SOCKS5 握手
+| 组件 | 职责 |
+|------|------|
+| `KcpWrapper` | 对 kcp-cpp 的 RAII 封装，输出回调把 KCP 产生的数据交给加密层与 UDP |
+| `Crypto` | AES-128-GCM 加解密、单调 nonce 计数器、重放窗口 |
+| `KCPSession` | 服务端会话：一个客户端端点一个，共享服务端 UDP socket |
+| `KCPClientSession` | 客户端会话：一个本地 TCP 连接一个，独立 UDP socket |
+| `KCPServer` | 会话映射、SSRF 防护、未认证来源限速、超时清理（60s 扫描） |
+| `KCPProxyClient` | 接受本地 SOCKS5 连接、反压（`wait_send` 超阈值暂停读）、半关闭收尾 |
 
 ## 目录结构
 
 ```text
 kcp-proxy-cpp/
-├── README.md              # 项目主文档
-├── AGENTS.md              # AI开发指南
-├── CLAUDE.md              # Claude AI指南
-├── CMakeLists.txt         # CMake配置
-├── CMakePresets.json      # CMake预设
-├── vcpkg.json             # vcpkg依赖管理
-├── vcpkg-configuration.json # vcpkg overlay 配置（指向 ports/）
-├── ports/                 # vcpkg overlay port
-│   └── kcp-cpp/           # C++17 KCP 移植（dchen8525-dev/kcp-cpp）的打包配置
-├── build.sh               # Linux/macOS构建脚本
-├── build_vs.bat           # Windows构建脚本
-├── deploy.sh / deploy.bat # 部署快捷入口（转发到 scripts/deploy/deploy.py）
-│
-├── src/                   # 源代码
-│   └── kcp_proxy/         # 核心库实现
-│       ├── *.hpp          # 头文件
-│       ├── *.cpp          # 实现文件
-│       ├── main_server.cpp # 服务端入口
-│       └── main_client.cpp # 客户端入口
-│
-├── tests/                 # 测试代码
-│   ├── smoke/             # 烟雾测试
-│   ├── unit/              # 单元测试
-│   └── e2e/               # 端到端隧道测试（黄金路径 + 负面/健壮性）
-│
-├── docs/                  # 文档
-│   ├── TESTING.md         # 测试指南
-│   ├── ANDROID_INTEROP.md # Android互操作说明
-│   ├── PROTOCOL.md        # 协议与握手细节
-│   ├── TROUBLESHOOTING.md # 排障指南
-│   └── FINAL_REPORT.md    # Android 互操作专项报告
-│
-├── scripts/               # 脚本（按职责分类）
-│   ├── deploy/            # 部署脚本
-│   │   ├── deploy.py      # 一键远程部署（Python3，仅标准库 + 系统 ssh/scp）
-│   │   ├── install-service.sh   # systemd安装
-│   │   └── uninstall-service.sh # 卸载服务
-│   ├── package/           # 打包脚本
-│   │   └── package.py     # 统一打包（Python3.12，纯标准库，跨平台）
-│   ├── runtime/           # 运行时脚本
-│   │   ├── common.sh      # 共享配置（suffix、端口等）
-│   │   ├── start.sh       # 本地启动服务端/客户端（Linux/macOS）
-│   │   └── start.bat      # 本地启动服务端/客户端（Windows）
-│   └── templates/         # 配置模板
-│       ├── kcp-proxy-server-key-refresh.service # 密钥轮换 service
-│       └── kcp-proxy-server-key-refresh.timer   # 密钥轮换 timer
-│
-├── gui/                   # GUI客户端
-│   └── electron/          # Electron GUI（跨平台）
-│       ├── main.js        # 主进程
-│       ├── renderer.js    # 渲染进程
-│       ├── package.json   # Node.js依赖
-│       └── dist/          # 构建产物（.gitignore）
-│
-├── build/                 # CMake构建目录（.gitignore）
-├── bin/                   # 编译产物（.gitignore）
-│   ├── linux/             # Linux二进制
-│   │   ├── kcp-proxy-server
-│   │   └── kcp-proxy-client
-│   └── windows/           # Windows二进制
-│       ├── kcp-proxy-server.exe
-│       ├── kcp-proxy-client.exe
-│       └── *.dll          # 依赖DLL
-│
-└── dist/                  # 发布包（.gitignore）
-    ├── *.deb              # Debian包
-    └── *.zip              # Windows GUI包
+├── CMakeLists.txt / CMakePresets.json / vcpkg.json / vcpkg-configuration.json
+├── build.sh / build_vs.bat            # 一键构建（Linux/macOS、Windows）
+├── deploy.sh / deploy.bat             # 部署入口 → scripts/deploy/deploy.py
+├── ports/kcp-cpp/                     # vcpkg overlay port（KCP + FEC）
+├── src/
+│   ├── main_server.cpp / main_client.cpp
+│   ├── cli_helpers.hpp                # CLI11 校验器、密钥清零
+│   └── kcp_proxy/                     # 核心：server / client / kcp_* / crypto / socks5 / logger / config
+├── tests/
+│   ├── unit/test_core.cpp             # doctest
+│   ├── smoke/smoke_test.py            # 打包/部署不变量 + 变更行 clang-format 门禁
+│   └── e2e/                           # tunnel / robustness / adversarial / fec_loss
+├── gui/electron/                      # Electron GUI（main.js / renderer.js / utils.js / styles.css）
+├── scripts/
+│   ├── deploy/                        # deploy.py、install-service.sh、uninstall-service.sh
+│   ├── package/package.py             # 统一打包（纯标准库）
+│   ├── runtime/                       # 本地起服务端/客户端
+│   └── templates/                     # systemd 密钥轮换 service/timer
+├── docs/                              # PROTOCOL / TESTING / TROUBLESHOOTING / ANDROID_INTEROP / FINAL_REPORT
+├── build/ bin/ dist/                  # 构建、二进制、发布包（均 .gitignore）
 ```
 
-### 主要目录说明
+## 测试与 CI
 
-**源代码与测试**：
-- `src/kcp_proxy/` - 核心实现，包括服务端、客户端、加密、KCP封装
-- `tests/unit/` - 单元测试，覆盖加密、SOCKS5解析等核心功能
-- `tests/smoke/` - 烟雾测试，验证基本功能
-- `tests/e2e/` - 端到端测试：`tunnel_e2e.py`（隧道字节级黄金路径）、`robustness_e2e.py`（错误密钥、垃圾包洪泛、并发与会话回收）
+```bash
+ctest --test-dir build -C Release --output-on-failure   # 6 个用例
+```
 
-**脚本与部署**：
-- `scripts/deploy/` - 远程部署脚本，支持一键部署到服务器
-- `scripts/package/package.py` - 统一打包入口（Python3.12，纯标准库，Linux/macOS/Windows 通用）：
-  - `python3 scripts/package/package.py standalone` - CLI 发布包（linux/macos 打 tar.gz，windows 打 zip）
-  - `python3 scripts/package/package.py deb` - Debian 服务包（有 dpkg-deb 时优先用，否则用标准库构造）
-- `scripts/runtime/` - 运行时脚本，本地启动服务端/客户端
-- `scripts/templates/` - 配置模板，服务端环境变量等
+| ctest 用例 | 覆盖 |
+|------------|------|
+| `kcp_proxy_test` | doctest 单元测试：加解密与失败路径、SOCKS5 解析/应答、受限目标（SSRF）判定、FEC 编解码与服务端逐会话自适应、会话路由与半关闭、日志节流、配置行格式 |
+| `kcp_proxy_smoke` | 打包与部署不变量（deb/zip 布局、systemd 模板、北京时区调度换算），以及**变更行的 clang-format 门禁** |
+| `kcp_proxy_e2e_tunnel` | 离线端到端：SOCKS5 → KCP → 目标，字节级校验 |
+| `kcp_proxy_e2e_robustness` | 错密钥、垃圾包洪泛、并发、会话回收、日志行格式 |
+| `kcp_proxy_e2e_adversarial` | SOCKS5 协议滥用、多源洪泛（全局认证预算）、客户端会话上限、上游连接卡死、服务端重启与换密钥 |
+| `kcp_proxy_e2e_fec_loss` | 8% 双向丢包下 FEC 修复生效（并有 `off` 对照组） |
 
-**GUI客户端**：
-- `gui/electron/` - **主GUI**，基于Electron，跨平台可运行；官方打包产物覆盖 Windows（Setup/Portable）与 Linux（AppImage）
-  - 纸感墨白界面，系统托盘支持
-  - 实时日志显示，连接测试内联反馈
+格式门禁只在缺失 clang-format 时不硬失败；`KCP_REQUIRE_CLANG_FORMAT=1` 时缺失即失败（CI 的
+hygiene job 就是这种模式），`KCP_SMOKE_DIFF_BASE` 指定比对基线。版本固定在 22，避免格式化结果
+随**开发者本机**的 clang-format 漂移。
 
-**构建与发布**：
-- `build/` - CMake构建目录，包含中间产物
-- `bin/` - 编译后的二进制文件，按平台分目录
-- `dist/` - 最终发布包（deb、zip等）
+GUI：
 
-**文档**：
-- `docs/TESTING.md` - 测试指南和流程
-- `docs/ANDROID_INTEROP.md` - Android客户端互操作说明
-- `AGENTS.md` - AI开发助手指南
-- `CLAUDE.md` - Claude AI特定指南
+```bash
+cd gui/electron
+npm run check     # JS 语法 + electron-builder 配置 JSON 校验
+npm test          # node --test：密钥派生、参数拼装、启动契约
+```
 
-**配置文件**：
-- `CMakeLists.txt` - CMake构建配置（必须在根目录）
-- `CMakePresets.json` - CMake预设，简化构建命令
-- `vcpkg.json` - vcpkg依赖清单（OpenSSL、Asio、fmt、kcp-cpp）；kcp-cpp 来自本仓库的 `ports/kcp-cpp` overlay port
+CI（`.github/workflows/ci.yml`）分五块：hygiene（空白检查、格式门禁、打包冒烟）、
+gui-checks、build-linux、build-windows、build-macos。打 tag 触发 `release.yml`，
+先校验 `CMakeLists.txt` 的 `project(... VERSION)` 与 tag 一致，再打包 deb / tar.gz / zip /
+AppImage / NSIS / Portable 并合并 `SHA256SUMS` 发布。
 
-**快捷脚本**：
-- `build.sh` / `build_vs.bat` - 一键构建
-- `deploy.sh` / `deploy.bat` - 部署快捷入口（转发到 `scripts/deploy/deploy.py`）
+## 版本与兼容性
 
-**文档**：
-- `README.md` - 项目主文档（本文件）
-- `AGENTS.md` / `CLAUDE.md` - AI开发指南
+- **0.2.2**：仅重构。181 处手写 `std::to_string` 拼接统一到 `fmt`，`secure_wipe` 改用
+  `OPENSSL_cleanse`，删除死代码 `get_env`。协议、线格式、KCP 参数均无变化，0.2.1 与 0.2.2 可互连。
+- **0.2.1**：修 0.2.0 发布后才被发现的缺陷——`--help` 退出码、日志级别注册竞态、格式门禁从未真正执行。
+- **0.2.0**：基础设施迁移（spdlog / doctest / CLI11 / clang-format 门禁）。**破坏性变更：`-fec` → `--fec`**。
+- 升级时**两端二进制一起换**。启用 FEC 时 GUI 两端也需要同版本。
 
-## 依赖
+日志行格式属于协议：`YYYY-MM-DD HH:MM:SS.mmm [LEVEL] module: message`。GUI 与 e2e 都会解析
+`TRAFFIC tx=… rx=…`、`FAIL_STAGE=…`、`KCP config …` 这些行，改动措辞等同于改动协议。
 
-| 依赖 | 来源 |
-|------|------|
-| OpenSSL | vcpkg |
-| Asio | vcpkg（standalone，无 Boost） |
-| KCP | vcpkg overlay port（`ports/kcp-cpp`） |
-| fmt | vcpkg |
+## 排障
 
-KCP 基于 UDP 的可靠 ARQ 协议，以极速模式运行：`conv=1`，`mtu=1400`，`nodelay=1`，`interval=10ms`，`fast resend=5`，`nc=1`，发送/接收窗口 `1024`，会话超时 `60s`。窗口曾为 256/512，实测在 190ms RTT 链路上会把单隧道限速在约 14 Mbps，提升后消除该瓶颈。
+先看日志级别 `DEBUG` 下的启动横幅：`KCP config …` 与 `FEC config shards=…` 会打印两端实际参数，
+参数不一致通常在这里就能看出来。
 
-更多协议、测试和排障细节见 `docs/PROTOCOL.md`、`docs/TESTING.md`、`docs/TROUBLESHOOTING.md`。
+| 现象 | 常见原因 |
+|------|----------|
+| 客户端一直连不上 | UDP 8388 未放行；服务端未运行；地址写成域名但本地 DNS 不通 |
+| 握手成功但立即断开 | 两端密钥不同（日期已变而客户端未重启，或后缀不一致） |
+| 能连但极慢、周期性卡住 | 内核 UDP 缓冲被钳制（见[内核 UDP 缓冲](#内核-udp-缓冲重要)）；或链路上 UDP 被限速 |
+| `DECRYPT_FAILED` 持续刷 | 密钥不匹配；服务端刚轮换而客户端仍持旧日期 |
+| 浏览器部分站点异常 | 浏览器走了 QUIC/HTTP3，本代理不转发 UDP |
+| 局域网其他设备连不上 | GUI 未勾选「允许局域网使用」（默认只绑 127.0.0.1） |
+
+更多见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)；协议细节见
+[docs/PROTOCOL.md](docs/PROTOCOL.md)，测试细节见 [docs/TESTING.md](docs/TESTING.md)。
