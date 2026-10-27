@@ -17,6 +17,7 @@ from pathlib import Path
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -173,8 +174,13 @@ def test_gui_never_puts_the_key_on_the_command_line():
             "buildClientEnv must assign the key to KCP_PROXY_KEY")
 
     # ...and the client must actually read that variable, or the GUI is broken.
-    require('get_env("KCP_PROXY_KEY")' in read("src/main_client.cpp"),
-            "the client must read KCP_PROXY_KEY from the environment")
+    # The handoff moved from a manual get_env() call to CLI11's ->envname(),
+    # which reads the variable only when -k/--key is absent -- the same
+    # precedence the old code had (argv first, environment as the fallback).
+    # Assert on that binding rather than on the old spelling.
+    main_client = read("src/main_client.cpp")
+    require('envname("KCP_PROXY_KEY")' in main_client,
+            "the client must bind --key to KCP_PROXY_KEY for the GUI handoff")
 
 
 def test_server_wrappers_never_put_the_key_on_the_command_line():
@@ -1010,6 +1016,195 @@ def test_ci_runs_this_suite_and_the_whitespace_check():
 
 
 # --------------------------------------------------------------------------- #
+# clang-format
+# --------------------------------------------------------------------------- #
+# .clang-format used to describe a style this repository never wrote (Allman
+# braces against a K&R tree, and PointerAlignment spelled backwards), so no one
+# could apply it without rewriting everything. That is fixed; the point of this
+# check is to stop the config drifting away from the code again.
+#
+# Deliberately INCREMENTAL: only the lines a change adds are checked, never the
+# whole file. The tracked sources carry a lot of hand-chosen line wrapping that
+# no formatter reproduces (server.cpp alone has ~400 such spots), so requiring
+# a touched file to be byte-identical to clang-format's output would force a
+# reformat of every file anyone edits -- the exact churn this check exists to
+# prevent. New lines must be formatted; historical lines are left alone until
+# someone decides to reformat them on purpose.
+CXX_SOURCES = re.compile(r"^(src/.*\.(?:cpp|hpp)|tests/unit/.*\.cpp)$")
+
+# clang-format's output changes between major versions, so an unpinned checker
+# would fail on formatting that is correct for the version that produced it.
+# 22 is what the files were formatted with.
+CLANG_FORMAT_MAJOR = 22
+
+def _git(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True,
+        # git converts to CRLF on checkout under the Windows default; the
+        # tracker stores LF. Normalising here keeps the comparison about
+        # formatting rather than about line endings, which .gitattributes
+        # already owns.
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout
+
+def _diff_base() -> str:
+    """The commit to diff against, defaulting to HEAD.
+
+    An EMPTY value must fall back too: CI passes the PR base sha, which is
+    absent on a push event, and `git diff "" --` is a usage error rather than
+    "no changes".
+    """
+    return os.environ.get("KCP_SMOKE_DIFF_BASE") or "HEAD"
+
+def _changed_cxx_files() -> list[str]:
+    out = _git("diff", "--name-only", "--diff-filter=ACMR", _diff_base(), "--")
+    return [p for p in out.splitlines() if CXX_SOURCES.match(p)]
+
+def _clang_format() -> str | None:
+    """Path to a usable clang-format, or None when this host has none."""
+    for name in ("clang-format", "clang-format.exe"):
+        found = shutil.which(name)
+        if found:
+            break
+    else:
+        env = os.environ.get("CLANG_FORMAT")
+        if not env or not Path(env).exists():
+            return None
+        found = env
+    try:
+        version = subprocess.run([found, "--version"], capture_output=True,
+                                 text=True, check=False).stdout
+    except OSError:
+        return None
+    match = re.search(r"clang-format version (\d+)", version)
+    if not match:
+        return None
+    if int(match.group(1)) != CLANG_FORMAT_MAJOR:
+        print(f"SKIP clang-format: found v{match.group(1)}, "
+              f"this check pins v{CLANG_FORMAT_MAJOR}")
+        return None
+    return found
+
+def _added_line_numbers(relative: str) -> set[int]:
+    """Line numbers (in the working-tree file) that this change added."""
+    diff = _git("diff", "-U0", _diff_base(), "--", relative)
+    added: set[int] = set()
+    for match in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff, re.M):
+        start = int(match.group(1))
+        count = int(match.group(2)) if match.group(2) is not None else 1
+        added.update(range(start, start + count))
+    return added
+
+def _violations_on_lines(tool: str, relative: str, lines: set[int]) -> list[int]:
+    """Which of `lines` clang-format would rewrite.
+
+    Compares the formatted text against the original line by line instead of
+    reading --output-replacements-xml: that XML is computed for the whole file
+    even under --lines, and its boundary entries (blank-line normalisation
+    between hunks) point at lines that are themselves fine. Diffing the text
+    answers the actual question -- "would this line read differently".
+    """
+    path = ROOT / relative
+    original = path.read_text(encoding="utf-8").replace("\r\n", "\n").splitlines()
+
+    # One invocation for the whole file, then compare the ADDED lines against
+    # what clang-format produced. Formatting --lines one line at a time would
+    # need one process per line (this file has ~3000) and is unreliable anyway:
+    # re-wrapping around a single line shifts every later line, so the output
+    # cannot be compared index-by-index.
+    #
+    # The check is therefore "does this exact line survive formatting", i.e. it
+    # must still appear in the formatted text at the same indentation. A line
+    # clang-format re-wraps or re-indents disappears, which is what we want to
+    # report. Only ADDED lines are judged, so the untouched neighbours -- which
+    # carry plenty of hand-chosen wrapping -- are never blamed.
+    result = subprocess.run([tool, "--style=file", relative], cwd=ROOT,
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"clang-format failed on {relative}: "
+                           f"{result.stderr.strip()}")
+    formatted_lines = {l.strip() for l in result.stdout.replace("\r\n", "\n").splitlines()
+                       if l.strip()}
+
+    offenders = []
+    for n in sorted(lines):
+        if not (1 <= n <= len(original)):
+            continue
+        text = original[n - 1].strip()
+        if text and text not in formatted_lines:
+            offenders.append(n)
+    return offenders
+
+def test_clang_format_agrees_with_changed_lines():
+    """New lines must be formatted; untouched lines are left alone.
+
+    Skips (loudly) when clang-format is absent or is a different major version:
+    a missing dev tool must not fail CI, and a mismatched version would report
+    formatting that is correct for the version the tree was formatted with.
+    """
+    tool = _clang_format()
+    if tool is None:
+        # A developer without clang-format must not fail the suite, but a CI
+        # run that silently skipped the check would be worse than no check at
+        # all -- so CI is required to have it. The job installs the pinned
+        # version; if that ever regresses, this annotation is what shows it.
+        print("SKIP clang-format: not installed (or wrong version)")
+        if os.environ.get("CI"):
+            print("::warning title=clang-format skipped::"
+                  f"CI is set but clang-format v{CLANG_FORMAT_MAJOR} was not found; "
+                  "the formatting check did NOT run")
+        return
+
+    try:
+        files = _changed_cxx_files()
+    except RuntimeError as exc:
+        print(f"SKIP clang-format: {exc}")
+        return
+    if not files:
+        print("SKIP clang-format: no C++ files changed")
+        return
+
+    dirty = []
+    for relative in files:
+        try:
+            added = _added_line_numbers(relative)
+            if not added:
+                continue
+            bad = _violations_on_lines(tool, relative, added)
+        except RuntimeError as exc:
+            dirty.append(str(exc))
+            continue
+        if bad:
+            shown = ", ".join(str(n) for n in bad[:8])
+            more = "" if len(bad) <= 8 else f" (+{len(bad) - 8} more)"
+            dirty.append(f"{relative}: line {shown}{more}")
+
+    require(not dirty,
+            "lines added by this change do not match .clang-format "
+            f"(run `clang-format -i <file>`): {'; '.join(dirty)}")
+
+
+def test_clang_format_config_matches_the_tree():
+    """The config must describe the style the sources are written in.
+
+    This is the regression that made the old file unusable: it asked for
+    braces on their own line while the whole tree writes `if (x) {`. Checked
+    structurally rather than by formatting output, so it does not depend on a
+    clang-format installation.
+    """
+    config = read(".clang-format")
+    require(re.search(r"^BreakBeforeBraces:\s*Attach\s*$", config, re.M),
+            ".clang-format must use Attach (K&R) -- the tree does not use Allman")
+    require(re.search(r"^PointerAlignment:\s*Left\s*$", config, re.M),
+            "PointerAlignment must be Left to mean `int* x`; Right means `int *x`")
+    require(re.search(r"^SpacesBeforeTrailingComments:\s*1\s*$", config, re.M),
+            "the tree writes `} // namespace` with one space before the comment")
+
+
+# --------------------------------------------------------------------------- #
 # built archives
 # --------------------------------------------------------------------------- #
 def test_archive_members():
@@ -1086,6 +1281,8 @@ TESTS = [
     test_suffix_validation_agrees,
     test_deb_postinst_generates_suffix_and_resets_failed,
     test_ci_runs_this_suite_and_the_whitespace_check,
+    test_clang_format_config_matches_the_tree,
+    test_clang_format_agrees_with_changed_lines,
     test_archive_members,
 ]
 

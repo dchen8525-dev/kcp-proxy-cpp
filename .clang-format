@@ -1,4 +1,21 @@
 ---
+# Describes the style this repository actually uses, so `clang-format` can
+# check it instead of rewriting it.
+#
+# The previous file was BasedOnStyle: Google with AfterFunction/AfterClass/
+# AfterControlStatement = true, i.e. Allman braces:
+#
+#     void f()
+#     {
+#         if (x)
+#         {
+#
+# while every source file here writes K&R (`void f() {`). The two had never
+# agreed, so the file had never been applied -- formatting the tree with it
+# would have moved thousands of lines. Verified against the tree before
+# changing: 379 control/function/class open braces on the same line, 6 on the
+# next line, and all 6 of those are single-statement ifs whose brace is simply
+# absent.
 Language: Cpp
 BasedOnStyle: Google
 IndentWidth: 4
@@ -7,9 +24,35 @@ ContinuationIndentWidth: 4
 ColumnLimit: 100
 AccessModifierOffset: -4
 AlignAfterOpenBracket: Align
-PointerAlignment: Right
-ReferenceAlignment: Right
+# `int* x` / `const T& x`, which is what the tree writes (199 occurrences
+# against 0 of `int *x` outside comments). NOTE: clang-format's Left/Right name
+# the side the *symbol* attaches to, so Left is the "type-attached" spelling --
+# the old `Right` here meant `int *x`, the opposite of this codebase.
+PointerAlignment: Left
+ReferenceAlignment: Left
 DerivePointerAlignment: false
+# The tree writes `} // namespace kcp_proxy` with one space, not Google's two.
+SpacesBeforeTrailingComments: 1
+
+# K&R: braces attach. This is the one setting that matters most -- it is what
+# the old AfterFunction/AfterControlStatement: true values got wrong.
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortLambdasOnASingleLine: Empty
+# Short bodies stay on one line only when the brace is omitted entirely
+# (`if (!running_) return;`), which is the form the tree uses 137 times.
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+
+# Arguments and parameters are packed. The tree is mostly one-per-line when a
+# signature wraps (that is what the author typed by hand), but packing scores
+# noticeably closer to it in total -- measured over every source file, the
+# one-per-line setting was ~500 lines further away. Neither reproduces hand
+# wrapping exactly, which is expected: clang-format's job here is a single
+# consistent rule, not a pixel-perfect replay of the current layout.
+BinPackArguments: true
+BinPackParameters: true
+
 SortIncludes: true
 IncludeBlocks: Regroup
 IncludeCategories:
@@ -17,30 +60,30 @@ IncludeCategories:
     Priority: 1
   - Regex: '^"(address|logger|crypto|config|socks5|server|client|byte_view|time_util|cli_helpers)'
     Priority: 1
+  # Vendored kcp headers sit with the project's own: they are quoted includes
+  # from this repo, not a third-party package.
+  - Regex: '^"kcp/'
+    Priority: 1
   - Regex: '^<fmt/'
     Priority: 2
   - Regex: '^<asio'
     Priority: 2
   - Regex: '^<openssl/'
     Priority: 2
+  # doctest sorts last so the unit-test TU can end with
+  #   #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+  #   #include <doctest/doctest.h>
+  # (the macro must precede doctest's first inclusion). --lines formatting of
+  # that block is what silently reordered it once before, which dropped the
+  # single-TU implementation and the main() with it.
+  - Regex: '^<doctest/'
+    Priority: 4
   - Regex: '^<'
     Priority: 3
   - Regex: '^"(ikcp.h)'
     Priority: 4
+
 Standard: c++17
-AllowShortFunctionsOnASingleLine: Empty
-AllowShortLambdasOnASingleLine: Empty
-AllowShortIfStatementsOnASingleLine: Never
-BreakBeforeBraces: Custom
-BraceWrapping:
-  AfterControlStatement: Always
-  AfterFunction: true
-  AfterClass: true
-  AfterStruct: true
-  AfterEnum: true
-  BeforeElse: true
-BinPackArguments: false
-BinPackParameters: false
 DeriveLineEnding: true
 UseTab: Never
 ---

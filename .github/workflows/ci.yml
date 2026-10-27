@@ -55,8 +55,41 @@ jobs:
         echo "git diff --check over $range"
         git diff --check "$range"
 
+    - name: Install clang-format (formatting check for changed C++ lines)
+      # The smoke suite's format check is skipped when clang-format is missing,
+      # so without this step CI would silently never enforce it. The version is
+      # pinned to the major that formatted the tree: clang-format's output
+      # changes between majors, and the check refuses a mismatched version
+      # rather than reporting formatting that is correct for another one.
+      run: |
+        set -euo pipefail
+        if command -v clang-format-22 >/dev/null; then
+          echo "clang-format-22 already present on this image"
+        else
+          # Try the distro package first; fall back to apt.llvm.org, which is
+          # where LLVM publishes versions the distro does not ship.
+          sudo apt-get update -qq
+          if ! sudo apt-get install -y -qq clang-format-22; then
+            echo "distro has no clang-format-22; trying apt.llvm.org"
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+            . /etc/os-release
+            echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-22 main" \
+              | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq clang-format-22
+          fi
+        fi
+        echo "CLANG_FORMAT=$(command -v clang-format-22)" >> "$GITHUB_ENV"
+        clang-format-22 --version
+
     - name: Packaging / deployment smoke tests
       run: python3 tests/smoke/smoke_test.py
+      env:
+        # Compare against the change's base commit, so "added lines" means the
+        # same set the whitespace step above inspects. Empty on a first push;
+        # the suite falls back to HEAD in that case.
+        KCP_SMOKE_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
 
   # The GUI had tests (`npm test`) and a syntax/JSON check (`npm run check`)
   # that CI never ran, so a broken main.js or a malformed electron-builder
