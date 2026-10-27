@@ -1,4 +1,6 @@
 #include "cli_helpers.hpp"
+
+#include <fmt/format.h>
 #include "kcp_proxy/client.hpp"
 
 #include <asio.hpp>
@@ -125,8 +127,8 @@ int main(int argc, char* argv[]) {
         cli::secure_wipe(key);
         client->start();
 
-        LOG_INFO("main", "KCP proxy client started, SOCKS5 on " + opts.listen_host + ":" +
-                             std::to_string(opts.listen_port) + " fec=" + fec.to_string());
+        LOG_INFO("main", fmt::format("KCP proxy client started, SOCKS5 on {}:{} fec={}",
+                                     opts.listen_host, opts.listen_port, fec.to_string()));
 
         cli::setup_signal_handler(io, [client]() {
             client->stop();

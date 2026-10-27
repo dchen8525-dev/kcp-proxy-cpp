@@ -1,4 +1,6 @@
 #include "cli_helpers.hpp"
+
+#include <fmt/format.h>
 #include "kcp_proxy/server.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
 
@@ -128,8 +130,8 @@ int main(int argc, char* argv[]) {
         server->set_allowed_targets(opts.allowed_targets);
         server->start();
 
-        LOG_INFO("main", "KCP proxy server started on " + opts.host + ":" +
-                             std::to_string(server->bound_port()) + " fec=" + fec.to_string());
+        LOG_INFO("main", fmt::format("KCP proxy server started on {}:{} fec={}", opts.host,
+                                     server->bound_port(), fec.to_string()));
 
         cli::setup_signal_handler(io, [server]() {
             server->stop();

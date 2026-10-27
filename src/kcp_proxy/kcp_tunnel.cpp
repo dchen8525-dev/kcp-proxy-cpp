@@ -56,8 +56,7 @@ KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
         // datagram (FEC_DATAGRAM_MAX); Encode/resize keep it exact below.
         fec_send_buf_.reserve(FEC_DATAGRAM_MAX);
     }
-    LOG_DEBUG(log_module_, log_msg("created conv=" + std::to_string(conv) +
-              " fec=" + fec.to_string()));
+    LOG_DEBUG(log_module_, log_msg(fmt::format("created conv={} fec={}", conv, fec.to_string())));
     kcp_.set_output_callback([this](byte_view data) {
         // Always invoked from strand_ (KCP only runs there).
         on_kcp_datagram(data);
@@ -116,13 +115,11 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         if (looks_like_fec_frame(data, size)) {
             uint32_t suppressed = 0;
             if (fec_peer_only_log().should_log(suppressed)) {
-                LOG_WARNING(log_module_,
-                            log_msg("peer is sending FEC-framed datagrams but local --fec is off "
-                                    "(enable --fec with the SAME DATA:PARITY, or clear it on the "
-                                    "peer)" +
-                                    (suppressed ? " (" + std::to_string(suppressed) +
-                                                      " more suppressed this interval)"
-                                                : "")));
+                std::string line =
+                    "peer is sending FEC-framed datagrams but local --fec is off "
+                    "(enable --fec with the SAME DATA:PARITY, or clear it on the peer)";
+                line += throttle_suffix(suppressed);
+                LOG_WARNING(log_module_, log_msg(line));
             }
         }
         return kcp_.input(byte_view(data, size));
@@ -152,9 +149,9 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
             // bridge mangled the stream). Refuse like a truncated KCP segment:
             // the caller's throttled KCP_INPUT_FAILED line makes the condition
             // visible without per-packet spam.
-            LOG_DEBUG(log_module_, log_msg("fec data framing mismatch: " +
-                      std::to_string(size) + " bytes, declared=" +
-                      std::to_string(declared)));
+            LOG_DEBUG(log_module_,
+                      log_msg(fmt::format("fec data framing mismatch: {} bytes, declared={}", size,
+                                          declared)));
             return -2;
         }
         ret = kcp_.input(byte_view(data + 8, size - 8));
@@ -166,9 +163,9 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         // mismatch completely silent -- the tunnel would connect at the UDP
         // level and carry nothing, with no FAIL_STAGE line anywhere. Refuse
         // instead so the mismatch is as loud as the docs promise.
-        LOG_DEBUG(log_module_, log_msg("fec packet type mismatch: flag=" +
-                  std::to_string(flag) + " size=" + std::to_string(size) +
-                  " (peers disagree about -fec)"));
+        LOG_DEBUG(log_module_, log_msg(fmt::format("fec packet type mismatch: flag={} size={} "
+                                                   "(peers disagree about -fec)",
+                                                   flag, size)));
         return -2;
     }
     // Every packet that reached this point (data and parity) must also feed the
@@ -185,9 +182,9 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         const uint16_t declared = static_cast<uint16_t>(rebuilt[0]) |
                                   static_cast<uint16_t>(rebuilt[1] << 8);
         if (declared <= 2 || declared > rebuilt.size()) {
-            LOG_DEBUG(log_module_, log_msg("fec rebuilt framing mismatch: " +
-                      std::to_string(rebuilt.size()) + " bytes, declared=" +
-                      std::to_string(declared)));
+            LOG_DEBUG(log_module_,
+                      log_msg(fmt::format("fec rebuilt framing mismatch: {} bytes, declared={}",
+                                          rebuilt.size(), declared)));
             continue;
         }
         const int r = kcp_.input(byte_view(rebuilt.data() + 2,
@@ -195,8 +192,8 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         if (r >= 0) {
             metrics_.fec_repaired.fetch_add(1, std::memory_order_relaxed);
         } else {
-            LOG_DEBUG(log_module_, log_msg("fec rebuilt shard refused by kcp input: ret=" +
-                      std::to_string(r)));
+            LOG_DEBUG(log_module_,
+                      log_msg(fmt::format("fec rebuilt shard refused by kcp input: ret={}", r)));
         }
     }
     return ret;
@@ -273,8 +270,8 @@ void KcpTunnel::park_write(std::function<void()> resume) {
     // KCP per tunnel, so a second park can only be a re-park of the same loop
     // after a resume that found the queue full again.
     write_resume_cb_ = std::move(resume);
-    LOG_DEBUG(log_module_, log_msg("write loop parked, wait_send=" +
-                                   std::to_string(kcp_.wait_send())));
+    LOG_DEBUG(log_module_,
+              log_msg(fmt::format("write loop parked, wait_send={}", kcp_.wait_send())));
 }
 
 void KcpTunnel::unpark_write() {
@@ -295,8 +292,8 @@ void KcpTunnel::maybe_resume_write() {
     // install a fresh hook rather than have this call clobber it afterwards.
     auto resume = std::move(write_resume_cb_);
     write_resume_cb_ = nullptr;
-    LOG_DEBUG(log_module_, log_msg("write loop resumed, wait_send=" +
-                                   std::to_string(kcp_.wait_send())));
+    LOG_DEBUG(log_module_,
+              log_msg(fmt::format("write loop resumed, wait_send={}", kcp_.wait_send())));
     resume();
 }
 
@@ -334,14 +331,14 @@ void KcpTunnel::send_data(byte_view data) {
 
 void KcpTunnel::on_send(byte_view data) {
     if (!is_active()) return;
-    LOG_DEBUG(log_module_, log_msg("on_send " + std::to_string(data.size()) + " bytes"));
+    LOG_DEBUG(log_module_, log_msg(fmt::format("on_send {} bytes", data.size())));
     int send_ret = kcp_.send(data);
     if (send_ret < 0) {
         // A KCP-layer refusal (send window full), not a crypto failure -- it
         // gets its own counter so encrypt_errors stays a pure AEAD signal.
         metrics_.send_errors.fetch_add(1, std::memory_order_relaxed);
-        LOG_ERROR(log_module_, log_msg("ikcp_send failed, ret=" + std::to_string(send_ret) +
-                  ", closing session"));
+        LOG_ERROR(log_module_,
+                  log_msg(fmt::format("ikcp_send failed, ret={}, closing session", send_ret)));
         shut_down();
         return;
     }

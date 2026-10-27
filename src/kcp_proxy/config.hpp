@@ -1,5 +1,7 @@
 #pragma once
 
+#include <fmt/format.h>
+
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -269,9 +271,7 @@ struct FecConfig {
     bool enabled() const { return data_shards > 0 && parity_shards > 0; }
     // "10:3" when enabled, "off" otherwise — for logs and usage text.
     std::string to_string() const {
-        return enabled() ? std::to_string(data_shards) + ":" +
-                               std::to_string(parity_shards)
-                         : "off";
+        return enabled() ? fmt::format("{}:{}", data_shards, parity_shards) : "off";
     }
 };
 
@@ -389,15 +389,11 @@ inline constexpr char KCP_CONTROL_KEEPALIVE[] = "KCP_PROXY_KEEPALIVE_V1";
 // is visible in the logs instead of showing up as a mysterious handshake
 // failure. Keep the field order stable — it is greppable output.
 inline std::string kcp_config_line() {
-    return "KCP config conv=" + std::to_string(KCP_CONV) +
-           " mtu=" + std::to_string(KCP_MTU) +
-           " nodelay=" + std::to_string(KCP_NODELAY) +
-           " interval=" + std::to_string(KCP_INTERVAL_MS) +
-           " resend=" + std::to_string(KCP_RESEND) +
-           " nc=" + std::to_string(KCP_NC) +
-           " sndWnd=" + std::to_string(KCP_SNDWND) +
-           " rcvWnd=" + std::to_string(KCP_RCVWND) +
-           " timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s";
+    return fmt::format(
+        "KCP config conv={} mtu={} nodelay={} interval={} resend={} nc={} "
+        "sndWnd={} rcvWnd={} timeout={}s",
+        KCP_CONV, KCP_MTU, KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC, KCP_SNDWND, KCP_RCVWND,
+        KCP_TIMEOUT_SEC);
 }
 
 } // namespace kcp_proxy

@@ -4,6 +4,7 @@
 #include "kcp_proxy/logger.hpp"
 
 #include <asio.hpp>
+#include <fmt/format.h>
 
 #include <mutex>
 #include <string>
@@ -40,11 +41,12 @@ inline std::string describe_buffer_clamp(std::string_view option_name, std::stri
                                          int requested, int effective) {
     if (effective >= requested) return std::string();
 
-    return "UDP socket buffer clamped by the kernel: " + std::string(option_name) +
-           " requested=" + std::to_string(requested) + " effective=" + std::to_string(effective) +
-           " -- the kernel caps it at " + std::string(sysctl_name) +
-           " (raise it, e.g. via /etc/sysctl.d/99-kcp-proxy.conf; otherwise a burst "
-           "overflows the buffer and the resulting drops look like network loss)";
+    return fmt::format(
+        "UDP socket buffer clamped by the kernel: {} requested={} effective={}"
+        " -- the kernel caps it at {}"
+        " (raise it, e.g. via /etc/sysctl.d/99-kcp-proxy.conf; otherwise a burst "
+        "overflows the buffer and the resulting drops look like network loss)",
+        option_name, requested, effective, sysctl_name);
 }
 
 // Raise SO_RCVBUF/SO_SNDBUF and report what the kernel actually granted.
@@ -95,12 +97,12 @@ inline EffectiveBufferSizes apply_udp_buffer_sizes(asio::ip::udp::socket& socket
         asio::socket_base::receive_buffer_size eff_rcv;
         socket.get_option(eff_rcv, read_ec);
         const bool rcv_ok = !read_ec;
-        if (rcv_ok) out.rcv = std::to_string(eff_rcv.value());
+        if (rcv_ok) out.rcv = fmt::to_string(eff_rcv.value());
 
         asio::socket_base::send_buffer_size eff_snd;
         socket.get_option(eff_snd, read_ec);
         const bool snd_ok = !read_ec;
-        if (snd_ok) out.snd = std::to_string(eff_snd.value());
+        if (snd_ok) out.snd = fmt::to_string(eff_snd.value());
 
         LOG_INFO(log_module, "UDP socket buffers so_rcvbuf=" + out.rcv + " so_sndbuf=" + out.snd);
         if (rcv_ok) {

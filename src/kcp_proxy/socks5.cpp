@@ -1,6 +1,8 @@
 #include "kcp_proxy/socks5.hpp"
 #include "kcp_proxy/address.hpp"
 
+#include <fmt/format.h>
+
 namespace kcp_proxy {
 
 std::vector<uint8_t> SOCKS5Response::build() const {
@@ -32,7 +34,7 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
 
     if (data[0] != SOCKS5_VERSION) {
         result.status = SOCKS5ParseStatus::Invalid;
-        result.error = "invalid SOCKS5 version: " + std::to_string(data[0]);
+        result.error = fmt::format("invalid SOCKS5 version: {}", data[0]);
         return result;
     }
 
@@ -41,7 +43,7 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
     // silently accepted.
     if (data[2] != 0x00) {
         result.status = SOCKS5ParseStatus::Invalid;
-        result.error = "invalid SOCKS5 reserved byte: " + std::to_string(data[2]);
+        result.error = fmt::format("invalid SOCKS5 reserved byte: {}", data[2]);
         return result;
     }
 
@@ -66,7 +68,7 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
         need = 4 + 1 + domain_len + 2;
     } else {
         result.status = SOCKS5ParseStatus::Invalid;
-        result.error = "unsupported address type: " + std::to_string(atyp);
+        result.error = fmt::format("unsupported address type: {}", atyp);
         result.bad_atyp = true;
         return result;
     }
@@ -107,14 +109,14 @@ SOCKS5ReplyResult parse_socks5_reply(const std::vector<uint8_t>& data) {
 
     if (data[0] != SOCKS5_VERSION) {
         result.status = SOCKS5ReplyStatus::Invalid;
-        result.error = "invalid SOCKS5 reply version: " + std::to_string(data[0]);
+        result.error = fmt::format("invalid SOCKS5 reply version: {}", data[0]);
         return result;
     }
 
     // Same RSV rule as the request parser: reserved, and must be 0x00.
     if (data[2] != 0x00) {
         result.status = SOCKS5ReplyStatus::Invalid;
-        result.error = "invalid SOCKS5 reply reserved byte: " + std::to_string(data[2]);
+        result.error = fmt::format("invalid SOCKS5 reply reserved byte: {}", data[2]);
         return result;
     }
 
@@ -137,7 +139,7 @@ SOCKS5ReplyResult parse_socks5_reply(const std::vector<uint8_t>& data) {
         need = 4 + 1 + domain_len + 2;
     } else {
         result.status = SOCKS5ReplyStatus::Invalid;
-        result.error = "unsupported reply address type: " + std::to_string(atyp);
+        result.error = fmt::format("unsupported reply address type: {}", atyp);
         return result;
     }
 

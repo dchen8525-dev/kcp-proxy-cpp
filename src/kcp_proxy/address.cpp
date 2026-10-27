@@ -2,7 +2,9 @@
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/config.hpp"
 #include <asio/ip/address.hpp>
+#include <asio/ip/address_v4.hpp>
 #include <asio/ip/address_v6.hpp>
+#include <fmt/format.h>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -21,10 +23,12 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         if (data_size < offset + 7) {
             throw std::invalid_argument("Insufficient data for IPv4 address");
         }
-        std::string host = std::to_string(data[offset + 1]) + "." +
-                           std::to_string(data[offset + 2]) + "." +
-                           std::to_string(data[offset + 3]) + "." +
-                           std::to_string(data[offset + 4]);
+        // Same shape as the IPv6 branch below: hand the four wire bytes to
+        // asio and let it render the text form, instead of concatenating four
+        // decimal conversions around three dots.
+        std::array<unsigned char, 4> bytes{};
+        std::copy_n(data + offset + 1, bytes.size(), bytes.begin());
+        std::string host = asio::ip::address_v4(bytes).to_string();
         uint16_t port = (static_cast<uint16_t>(data[offset + 5]) << 8) |
                         data[offset + 6];
         return {host, port};
@@ -58,7 +62,7 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         return {host, port};
     }
 
-    throw std::invalid_argument("Unsupported address type: " + std::to_string(atyp));
+    throw std::invalid_argument(fmt::format("Unsupported address type: {}", atyp));
 }
 
 ParsedAddress parse_address(byte_view data, size_t offset) {

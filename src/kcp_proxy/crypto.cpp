@@ -97,10 +97,7 @@ void log_reject_throttled(LogThrottle& throttle, MakeMessage make_message) {
     uint32_t suppressed = 0;
     if (!throttle.should_log(suppressed)) return;
     std::string message = make_message();
-    if (suppressed > 0) {
-        message += " (" + std::to_string(suppressed) +
-                   " more suppressed this interval)";
-    }
+    message += throttle_suffix(suppressed);
     LOG_WARNING("crypto", message);
 }
 

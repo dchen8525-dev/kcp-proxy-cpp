@@ -113,6 +113,20 @@ void set_log_level(LogLevel level);
 LogLevel current_log_level() noexcept;
 void set_log_file_path(const char* path);
 
+// The suffix every throttled diagnostic appends after its own message:
+// " (N more suppressed this interval)" when the preceding LogThrottle folded
+// N occurrences into this line, and nothing otherwise.
+//
+// It exists because that phrasing appeared at eleven sites, each built by hand
+// from a ternary over a string concatenation. Any one of them could drift in
+// wording or spacing and the line would stop matching the "more suppressed
+// this interval" contract the tests and operators grep for; with one
+// definition there is nothing to drift.
+inline std::string throttle_suffix(uint32_t suppressed) {
+    return suppressed ? fmt::format(" ({} more suppressed this interval)", suppressed)
+                      : std::string();
+}
+
 // The one uppercase spelling of a level name ("DEBUG"/"INFO"/"WARNING"/
 // "ERROR"). It is a format contract, not a convenience: the [LEVEL] field is
 // part of every emitted line (see the formatter in logger.cpp), the GUI strips

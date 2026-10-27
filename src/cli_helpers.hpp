@@ -6,9 +6,8 @@
 #include <asio.hpp>
 
 #include <CLI/CLI.hpp>
+#include <openssl/crypto.h>
 #include <cctype>
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -18,33 +17,17 @@
 namespace kcp_proxy {
 namespace cli {
 
-// Read an environment variable ("" when unset). Kept for the callers that need
-// a raw lookup; the option tables below reach it through CLI11's envname().
-inline std::string get_env(const char* name) {
-#ifdef _WIN32
-    // MSVC deprecates getenv (C4996); _dupenv_s is the sanctioned form and is
-    // also provided by MinGW-w64.
-    char* buf = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) != 0 || buf == nullptr) {
-        return {};
-    }
-    std::string value(buf);
-    std::free(buf);
-    return value;
-#else
-    const char* value = std::getenv(name);
-    return value ? std::string(value) : std::string();
-#endif
-}
-
 // Overwrite a secret before it leaves scope. The key reaches the process via
 // argv or the environment and both outlive the string that holds it here, so
 // zeroing only shortens the window -- but it is the window under our control.
+//
+// OPENSSL_cleanse, not a hand-written volatile loop: it is the same primitive
+// Crypto uses for its key material, and it is definitionally resistant to the
+// dead-store elimination a plain loop is subject to. Having one cleanse in the
+// codebase instead of two also means the "is this wipe real?" question has one
+// answer.
 inline void secure_wipe(std::string& s) {
-    volatile unsigned char* p = reinterpret_cast<volatile unsigned char*>(s.data());
-    for (size_t i = 0; i < s.size(); ++i)
-        p[i] = 0;
+    if (!s.empty()) OPENSSL_cleanse(s.data(), s.size());
 }
 
 // Strict decimal validator for numeric options.

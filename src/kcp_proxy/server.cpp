@@ -95,8 +95,8 @@ void KCPServer::start() {
     }
     udp_socket_.bind(listen_ep, ec);
     if (ec) {
-        throw std::runtime_error("failed to bind UDP socket on " + host_ + ":" +
-                                 std::to_string(port_) + ": " + ec.message());
+        throw std::runtime_error(
+            fmt::format("failed to bind UDP socket on {}:{}: {}", host_, port_, ec.message()));
     }
 
     // Raise the kernel UDP send/receive buffers and report any silent clamp.
@@ -109,8 +109,7 @@ void KCPServer::start() {
     // disable_udp_connreset). The tolerant handler below stays as the
     // cross-platform safety net.
     const int wsa_rc = disable_udp_connreset(udp_socket_);
-    LOG_INFO("server",
-             std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") + std::to_string(wsa_rc) + ")");
+    LOG_INFO("server", fmt::format("SIO_UDP_CONNRESET disabled (wsa_rc={})", wsa_rc));
 #endif
 
     running_ = true;
@@ -129,19 +128,20 @@ void KCPServer::start() {
     std::error_code bind_ec;
     const auto bound_ep = udp_socket_.local_endpoint(bind_ec);
     const uint16_t bound_port = bind_ec ? port_ : bound_ep.port();
-    LOG_INFO("server", "listening on " + host_ + ":" + std::to_string(bound_port));
-    LOG_INFO("server", "diagnostics udp_bind=" + host_ + " udp_port=" + std::to_string(bound_port) +
-                           " udp_recv_slots=" + std::to_string(UDP_RECV_SLOTS) +
-                           " crypto=AES-128-GCM/HKDF-SHA256" +
-                           " socks5_mode=CONNECT_ONLY udp_associate=unsupported" +
-                           " log_level=" + std::string(log_level_name(current_log_level())));
+    LOG_INFO("server", fmt::format("listening on {}:{}", host_, bound_port));
+    LOG_INFO("server",
+             fmt::format("diagnostics udp_bind={} udp_port={} udp_recv_slots={}"
+                         " crypto=AES-128-GCM/HKDF-SHA256"
+                         " socks5_mode=CONNECT_ONLY udp_associate=unsupported"
+                         " log_level={}",
+                         host_, bound_port, UDP_RECV_SLOTS, log_level_name(current_log_level())));
     LOG_INFO("server", kcp_config_line());
     LOG_INFO("server", fec_config_line(fec_));
-    LOG_INFO("server", std::string("server FEC mode: auto-adapt per client framing") +
-             (fec_.enabled() ? " (shards=" + fec_.to_string() + ")"
-                             : " (default shards=" +
-                                   std::to_string(FEC_ADAPTIVE_DATA_SHARDS) + ":" +
-                                   std::to_string(FEC_ADAPTIVE_PARITY_SHARDS) + ")"));
+    const std::string fec_mode =
+        fec_.enabled() ? fmt::format(" (shards={})", fec_.to_string())
+                       : fmt::format(" (default shards={}:{})", FEC_ADAPTIVE_DATA_SHARDS,
+                                     FEC_ADAPTIVE_PARITY_SHARDS);
+    LOG_INFO("server", fmt::format("server FEC mode: auto-adapt per client framing{}", fec_mode));
 
     do_receive();
 }
@@ -294,9 +294,8 @@ void KCPServer::handle_receive(size_t index, const std::error_code& ec,
                 // visible the moment it starts.
                 uint32_t suppressed = 0;
                 if (recv_error_log_.should_log(suppressed)) {
-                    LOG_ERROR("server", "UDP receive error: " + ec.message() +
-                              (suppressed ? " (" + std::to_string(suppressed) +
-                                            " more suppressed this interval)" : ""));
+                    LOG_ERROR("server", fmt::format("UDP receive error: {}{}", ec.message(),
+                                                    throttle_suffix(suppressed)));
                 }
                 park_receive_slot(index);
             }
@@ -317,9 +316,8 @@ void KCPServer::handle_receive(size_t index, const std::error_code& ec,
     const auto endpoint = recv_slots_[index].endpoint;
     byte_view data(recv_slots_[index].buf.data(), bytes_transferred);
 
-    LOG_DEBUG("server", "UDP recv " + std::to_string(bytes_transferred) +
-              " bytes from " + endpoint.address().to_string() + ":" +
-              std::to_string(endpoint.port()));
+    LOG_DEBUG("server", fmt::format("UDP recv {} bytes from {}:{}", bytes_transferred,
+                                    endpoint.address().to_string(), endpoint.port()));
 
     route_datagram(endpoint, data);
     arm_receive_slot(index);
@@ -340,9 +338,8 @@ std::shared_ptr<KCPSession> KCPServer::route_datagram(
     } catch (const std::exception& e) {
         uint32_t suppressed = 0;
         if (route_exception_log_.should_log(suppressed)) {
-            LOG_ERROR("server", "datagram routing failed: " + std::string(e.what()) +
-                        (suppressed ? " (" + std::to_string(suppressed) +
-                                      " more suppressed this interval)" : ""));
+            LOG_ERROR("server", fmt::format("datagram routing failed: {}{}", e.what(),
+                                            throttle_suffix(suppressed)));
         }
         return nullptr;
     } catch (...) {
@@ -363,11 +360,9 @@ std::shared_ptr<KCPSession> KCPServer::route_datagram_impl(
         // get_or_create_session: one hostile datagram, one line, no upper bound.
         uint32_t suppressed = 0;
         if (drop_log_.should_log(suppressed)) {
-            LOG_WARNING("server", "packet dropped from " +
-                        endpoint.address().to_string() + ":" +
-                        std::to_string(endpoint.port()) + " (no session created)" +
-                        (suppressed ? " (" + std::to_string(suppressed) +
-                                      " more suppressed this interval)" : ""));
+            LOG_WARNING("server", fmt::format("packet dropped from {}:{} (no session created){}",
+                                              endpoint.address().to_string(), endpoint.port(),
+                                              throttle_suffix(suppressed)));
         }
         return nullptr;
     }
@@ -479,8 +474,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,
     bool& already_consumed) {
     already_consumed = false;
-    std::string sid = addr.address().to_string() + ":" +
-                      std::to_string(addr.port());
+    std::string sid = fmt::format("{}:{}", addr.address().to_string(), addr.port());
 
     // Fast path: an existing live session. Read-only lookup, so concurrent
     // readers (one per incoming UDP datagram) proceed in parallel.
@@ -551,11 +545,9 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         // (see session_cap_log_ in server.hpp).
         uint32_t suppressed = 0;
         if (session_cap_log_.should_log(suppressed)) {
-            LOG_WARNING("server", fmt::format(
-                        "session cap reached ({}) dropping packet from {}{}",
-                        MAX_CONCURRENT_SESSIONS, sid,
-                        suppressed ? fmt::format(" ({} more suppressed this interval)",
-                                   suppressed) : std::string()));
+            LOG_WARNING("server",
+                        fmt::format("session cap reached ({}) dropping packet from {}{}",
+                                    MAX_CONCURRENT_SESSIONS, sid, throttle_suffix(suppressed)));
         }
         return nullptr;
     }
@@ -591,26 +583,28 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             // log line class -- one hostile datagram, one line, no upper bound.
             uint32_t suppressed = 0;
             if (auth_ratelimit_log_.should_log(suppressed)) {
-                LOG_WARNING("server", "auth failure per-address rate limit reached, dropping packet from " + sid +
-                            (suppressed ? " (" + std::to_string(suppressed) +
-                                          " more suppressed this interval)" : ""));
+                LOG_WARNING("server",
+                            fmt::format("auth failure per-address rate limit reached, dropping "
+                                        "packet from {}{}",
+                                        sid, throttle_suffix(suppressed)));
             }
             return nullptr;
         }
         if (auth_attempts_window_ >= MAX_AUTH_ATTEMPTS_PER_SEC) {
             uint32_t suppressed = 0;
             if (auth_global_budget_log_.should_log(suppressed)) {
-                LOG_WARNING("server", "auth attempt rate limit reached, dropping packet from " + sid +
-                            (suppressed ? " (" + std::to_string(suppressed) +
-                                          " more suppressed this interval)" : ""));
+                LOG_WARNING(
+                    "server",
+                    fmt::format("auth attempt rate limit reached, dropping packet from {}{}", sid,
+                                throttle_suffix(suppressed)));
             }
             return nullptr;
         }
         ++auth_attempts_window_;
     }
 
-    LOG_DEBUG("server", sid + ": attempting auth decrypt on " +
-             std::to_string(encrypted_packet.size()) + " bytes");
+    LOG_DEBUG("server",
+              fmt::format("{}: attempting auth decrypt on {} bytes", sid, encrypted_packet.size()));
     std::vector<uint8_t> decrypted;
     // server_mode=true: the first decrypted packet of a brand-new session seeds
     // the replay window (handled inside Crypto::decrypt) and is never rejected
@@ -618,7 +612,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     auto session_crypto = std::make_shared<Crypto>(key_, NONCE_DIR_SERVER, byte_view{}, true);
     try {
         decrypted = session_crypto->decrypt(encrypted_packet);
-        LOG_DEBUG("server", sid + ": auth OK, decrypted " + std::to_string(decrypted.size()) + " bytes");
+        LOG_DEBUG("server", fmt::format("{}: auth OK, decrypted {} bytes", sid, decrypted.size()));
     } catch (const std::exception& e) {
         // Count this failure against the source address so a repeat offender is
         // dropped pre-decrypt next time (see the per-address gate above). Bounded
@@ -637,10 +631,10 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         // robustness suite still finds FAIL_STAGE=DECRYPT_FAILED in the log.
         uint32_t suppressed = 0;
         if (decrypt_fail_log_.should_log(suppressed)) {
-            LOG_WARNING("server", "FAIL_STAGE=DECRYPT_FAILED ERROR=" + std::string(e.what()) +
-                        " CLIENT_ENDPOINT=" + sid + " TARGET=-" +
-                        (suppressed ? " (" + std::to_string(suppressed) +
-                                      " more suppressed this interval)" : ""));
+            LOG_WARNING("server",
+                        fmt::format("FAIL_STAGE=DECRYPT_FAILED ERROR={} CLIENT_ENDPOINT={} "
+                                    "TARGET=-{}",
+                                    e.what(), sid, throttle_suffix(suppressed)));
         }
         return nullptr;
     }
@@ -813,9 +807,9 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             std::string rejection_line;
             switch (rejection) {
                 case RejectReason::SessionCap:
-                    rejection_line = "session cap reached (" +
-                                     std::to_string(MAX_CONCURRENT_SESSIONS) +
-                                     "), dropping packet from " + sid;
+                    rejection_line =
+                        fmt::format("session cap reached ({}), dropping packet from {}",
+                                    MAX_CONCURRENT_SESSIONS, sid);
                     break;
                 case RejectReason::DuplicateSalt:
                     rejection_line = fmt::format(
@@ -828,10 +822,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 case RejectReason::None:
                     break;
             }
-            if (suppressed) {
-                rejection_line += " (" + std::to_string(suppressed) +
-                                  " more suppressed this interval)";
-            }
+            rejection_line += throttle_suffix(suppressed);
             LOG_WARNING("server", rejection_line);
         }
         return nullptr;
@@ -842,8 +833,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     session->inject_decrypted(std::move(decrypted));
     already_consumed = true;
 
-    LOG_INFO("server", "new session: " + sid + " (total: " +
-             std::to_string(total_sessions) + ")");
+    LOG_INFO("server", fmt::format("new session: {} (total: {})", sid, total_sessions));
     return session;
 }
 
@@ -861,14 +851,15 @@ void KCPServer::handle_kcp_data(std::shared_ptr<KCPSession> session,
         return;
     }
 
-    LOG_DEBUG("server", session->session_id() + ": handle_kcp_data, protocol_handshake_done=" +
-              std::to_string(session->is_protocol_handshake_done()) +
-              " socks5_handshake_done=" +
-              std::to_string(session->is_handshake_done()) +
-              " forward_pending=" + std::to_string(session->is_forward_read_pending()) +
-              " socks5_pending=" + std::to_string(session->is_socks5_read_pending()) +
-              " peek=" + std::to_string(session->peek_size()) +
-              " wait_send=" + std::to_string(session->wait_send()));
+    LOG_DEBUG(
+        "server",
+        fmt::format("{}: handle_kcp_data, protocol_handshake_done={} socks5_handshake_done={}"
+                    " forward_pending={} socks5_pending={} peek={} wait_send={}",
+                    session->session_id(), static_cast<int>(session->is_protocol_handshake_done()),
+                    static_cast<int>(session->is_handshake_done()),
+                    static_cast<int>(session->is_forward_read_pending()),
+                    static_cast<int>(session->is_socks5_read_pending()), session->peek_size(),
+                    session->wait_send()));
     if (session->peek_size() <= 0) {
         LOG_DEBUG("server", session->session_id() + ": no complete KCP payload to read, skipping");
         return;
@@ -984,14 +975,13 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
 
     // Success: parsed.request contains valid SOCKS5 request
     const auto& request = *parsed.request;
-    LOG_INFO("server", session->session_id() +
-             (log_details ? ": SOCKS5 connect target cmd=" +
-              std::to_string(request.cmd) + " atyp=" +
-              std::to_string(request.atyp) + " host=" + request.host +
-              " port=" + std::to_string(request.port)
-              : ": SOCKS5 CONNECT dst=" + request.host +
-              ":" + std::to_string(request.port) +
-              " cmd=" + std::to_string(request.cmd)));
+    LOG_INFO(
+        "server",
+        session->session_id() +
+            (log_details ? fmt::format(": SOCKS5 connect target cmd={} atyp={} host={} port={}",
+                                       request.cmd, request.atyp, request.host, request.port)
+                         : fmt::format(": SOCKS5 CONNECT dst={}:{} cmd={}", request.host,
+                                       request.port, request.cmd)));
 
     if (request.cmd == SOCKS5_CMD_CONNECT) {
         // Suppress further SOCKS5 dispatches until the upstream connect
@@ -1004,10 +994,10 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
     } else if (request.cmd == SOCKS5_CMD_UDP_ASSOCIATE) {
         handle_udp_associate(session, request);
     } else {
-        LOG_WARNING("server", "FAIL_STAGE=SOCKS5_UNSUPPORTED_COMMAND ERROR=cmd_" +
-                    std::to_string(request.cmd) + " CLIENT_ENDPOINT=" +
-                    session->session_id() + " TARGET=" + request.host +
-                    ":" + std::to_string(request.port));
+        LOG_WARNING("server",
+                    fmt::format("FAIL_STAGE=SOCKS5_UNSUPPORTED_COMMAND ERROR=cmd_{}"
+                                " CLIENT_ENDPOINT={} TARGET={}:{}",
+                                request.cmd, session->session_id(), request.host, request.port));
         send_socks5_reply(session, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
         // Same as the other failure paths: the client sees the reply and tears
         // the KCP session down; close_connection evicts it from the table at once.
@@ -1079,8 +1069,8 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
 void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                         const SOCKS5Request& request,
                                         std::vector<uint8_t> initial_payload) {
-    LOG_INFO("server", session->session_id() +
-             ": connecting to " + request.host + ":" + std::to_string(request.port));
+    LOG_INFO("server", fmt::format("{}: connecting to {}:{}", session->session_id(), request.host,
+                                   request.port));
 
     // Built on the SESSION strand, not the raw io_context: with -T > 1 the
     // deadline handler's resolver->cancel()/tcp_socket->close() would
@@ -1104,10 +1094,10 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
         std::error_code ignored;
         resolver->cancel();
         if (tcp_socket->is_open()) tcp_socket->close(ignored);
-        LOG_WARNING("server", "FAIL_STAGE=TCP_CONNECT_FAILED ERROR=connect_timeout_" +
-                    std::to_string(CONNECT_TIMEOUT_SEC) + "s CLIENT_ENDPOINT=" +
-                    session->session_id() + " TARGET=" + request.host +
-                    ":" +                     std::to_string(request.port));
+        LOG_WARNING("server", fmt::format("FAIL_STAGE=TCP_CONNECT_FAILED ERROR=connect_timeout_{}s"
+                                          " CLIENT_ENDPOINT={} TARGET={}:{}",
+                                          CONNECT_TIMEOUT_SEC, session->session_id(), request.host,
+                                          request.port));
         send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
         close_connection(session->session_id(), "connect_timeout", session);
     });
@@ -1125,31 +1115,33 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
             if (fired->exchange(true)) return;
             std::error_code ignored;
             deadline->cancel(ignored);
-            LOG_WARNING("server", "FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target CLIENT_ENDPOINT=" +
-                        session->session_id() + " TARGET=" + request.host + ":" +
-                        std::to_string(request.port));
+            LOG_WARNING("server", fmt::format("FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target"
+                                              " CLIENT_ENDPOINT={} TARGET={}:{}",
+                                              session->session_id(), request.host, request.port));
             send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
             close_connection(session->session_id(), "ssrf_blocked", session);
             return;
         }
         if (!ip_ec && is_restricted_target(ip)) {
-            LOG_WARNING("server", "SSRF_ALLOWLISTED CLIENT_ENDPOINT=" +
-                        session->session_id() + " TARGET=" + request.host + ":" +
-                        std::to_string(request.port));
+            LOG_WARNING("server", fmt::format("SSRF_ALLOWLISTED CLIENT_ENDPOINT={} TARGET={}:{}",
+                                              session->session_id(), request.host, request.port));
         }
     }
 
-    resolver->async_resolve(request.host, std::to_string(request.port),
-        [this, session, request, tcp_socket, resolver, deadline, fired, self, initial_payload_buf]
-        (const std::error_code& ec, asio::ip::tcp::resolver::results_type results) mutable {
+    resolver->async_resolve(
+        request.host, fmt::to_string(request.port),
+        [this, session, request, tcp_socket, resolver, deadline, fired, self, initial_payload_buf](
+            const std::error_code& ec, asio::ip::tcp::resolver::results_type results) mutable {
             if (fired->load()) return;
             if (ec) {
                 if (fired->exchange(true)) return;
                 std::error_code ignored;
                 deadline->cancel(ignored);
-                LOG_ERROR("server", "FAIL_STAGE=DNS_RESOLVE_FAILED ERROR=" + ec.message() +
-                          " CLIENT_ENDPOINT=" + session->session_id() +
-                          " TARGET=" + request.host + ":" + std::to_string(request.port));
+                LOG_ERROR(
+                    "server",
+                    fmt::format("FAIL_STAGE=DNS_RESOLVE_FAILED ERROR={} CLIENT_ENDPOINT={}"
+                                " TARGET={}:{}",
+                                ec.message(), session->session_id(), request.host, request.port));
                 send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
                 close_connection(session->session_id(), "dns_resolve_failed", session);
                 return;
@@ -1177,19 +1169,18 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                 if (fired->exchange(true)) return;
                 std::error_code ignored;
                 deadline->cancel(ignored);
-                LOG_WARNING("server", "FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target CLIENT_ENDPOINT=" +
-                            session->session_id() + " TARGET=" + request.host + ":" +
-                            std::to_string(request.port) +
-                            " RESOLVED=" + restricted_addr);
+                LOG_WARNING("server", fmt::format("FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target"
+                                                  " CLIENT_ENDPOINT={} TARGET={}:{} RESOLVED={}",
+                                                  session->session_id(), request.host, request.port,
+                                                  restricted_addr));
                 send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
                 close_connection(session->session_id(), "ssrf_blocked_postresolve", session);
                 return;
             }
 
-            LOG_INFO("server", session->session_id() +
-                     ": resolved " + request.host + " to " +
-                     std::to_string(std::distance(results.begin(), results.end())) +
-                     " endpoints, connecting...");
+            LOG_INFO("server", fmt::format("{}: resolved {} to {} endpoints, connecting...",
+                                           session->session_id(), request.host,
+                                           std::distance(results.begin(), results.end())));
             asio::async_connect(*tcp_socket, results,
                 [this, session, request, initial_payload_buf,
                  tcp_socket, resolver, deadline, fired, self]
@@ -1198,18 +1189,19 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                     std::error_code ignored;
                     deadline->cancel(ignored);
                     if (ec2) {
-                        LOG_ERROR("server", "FAIL_STAGE=TCP_CONNECT_FAILED ERROR=" + ec2.message() +
-                                  " CLIENT_ENDPOINT=" + session->session_id() +
-                                  " TARGET=" + request.host + ":" + std::to_string(request.port));
+                        LOG_ERROR("server", fmt::format("FAIL_STAGE=TCP_CONNECT_FAILED ERROR={}"
+                                                        " CLIENT_ENDPOINT={} TARGET={}:{}",
+                                                        ec2.message(), session->session_id(),
+                                                        request.host, request.port));
                         uint8_t reply = get_error_reply_code(ec2);
                         send_socks5_reply(session, reply);
                         close_connection(session->session_id(), "tcp_connect_failed", session);
                         return;
                     }
 
-                    LOG_INFO("server", session->session_id() +
-                             ": connected to target " + request.host + ":" +
-                             std::to_string(request.port));
+                    LOG_INFO("server",
+                             fmt::format("{}: connected to target {}:{}", session->session_id(),
+                                         request.host, request.port));
 
                     // Nagle would hold a short write (a small response tail, or
                     // the SOCKS5 reply path) until the previous segment is
@@ -1329,9 +1321,10 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
 
 void KCPServer::handle_udp_associate(std::shared_ptr<KCPSession> session,
                                       const SOCKS5Request& request) {
-    LOG_WARNING("server", "FAIL_STAGE=SOCKS5_UNSUPPORTED_COMMAND ERROR=udp_associate_unsupported CLIENT_ENDPOINT=" +
-                session->session_id() + " TARGET=" + request.host +
-                ":" + std::to_string(request.port));
+    LOG_WARNING("server",
+                fmt::format("FAIL_STAGE=SOCKS5_UNSUPPORTED_COMMAND"
+                            " ERROR=udp_associate_unsupported CLIENT_ENDPOINT={} TARGET={}:{}",
+                            session->session_id(), request.host, request.port));
     send_socks5_reply(session, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED);
     close_connection(session->session_id(), "udp_associate_unsupported", session);
 }
@@ -1342,16 +1335,15 @@ void KCPServer::send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t r
 
 void KCPServer::send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t reply,
                                    std::string_view host, uint16_t port) {
-    LOG_DEBUG("server", session->session_id() +
-             ": sending SOCKS5 reply=" + std::to_string(reply) +
-             " host=" + std::string(host) + " port=" + std::to_string(port));
+    LOG_DEBUG("server", fmt::format("{}: sending SOCKS5 reply={} host={} port={}",
+                                    session->session_id(), reply, host, port));
     SOCKS5Response resp;
     resp.reply = reply;
     resp.host = std::string(host);
     resp.port = port;
     auto data = resp.build();
-    LOG_DEBUG("server", session->session_id() +
-             ": SOCKS5 reply bytes (" + std::to_string(data.size()) + ")");
+    LOG_DEBUG("server",
+              fmt::format("{}: SOCKS5 reply bytes ({})", session->session_id(), data.size()));
     session->send_data(byte_view(data.data(), data.size()));
 }
 
@@ -1393,9 +1385,9 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
         return;
     }
 
-    LOG_DEBUG("server", session_id + ": forward_tcp_to_kcp (tcp->kcp), wait_send=" +
-              std::to_string(session->wait_send()) +
-              " running=" + std::to_string(session->is_running()));
+    LOG_DEBUG("server",
+              fmt::format("{}: forward_tcp_to_kcp (tcp->kcp), wait_send={} running={}", session_id,
+                          session->wait_send(), static_cast<int>(session->is_running())));
     if (!tcp_socket || !tcp_socket->is_open()) {
         LOG_ERROR("server", session_id + ": forward_tcp_to_kcp - socket not open");
         close_connection(session_id, "tcp2kcp_no_socket", session);
@@ -1416,9 +1408,9 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
     // per wakeup is what pinned every tunnel to ~3 Mbps on a 190ms path.
     // Safe to read wait_send here because we are on the strand.
     if (session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD) {
-        LOG_DEBUG("server", session_id + ": backpressure (wait_send=" +
-                  std::to_string(session->wait_send()) +
-                  " >= threshold=" + std::to_string(KCP_BACKPRESSURE_THRESHOLD) + "), parking read");
+        LOG_DEBUG("server",
+                  fmt::format("{}: backpressure (wait_send={} >= threshold={}), parking read",
+                              session_id, session->wait_send(), KCP_BACKPRESSURE_THRESHOLD));
         // The hook is stored INSIDE the session, so it must hold neither the
         // session nor the server strongly: either would be a reference cycle
         // (session -> hook -> session, and server -> sessions_ -> session ->
@@ -1437,32 +1429,34 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
     }
 
     auto self = shared_from_this();
-    tcp_socket->async_read_some(asio::buffer(*buf),
-        asio::bind_executor(session->strand(),
-        [this, session_id = std::move(session_id), session, tcp_socket, buf, self]
-        (const std::error_code& ec, size_t bytes) mutable {
-            if (ec || bytes == 0) {
-                if (ec == asio::error::eof) {
-                    LOG_INFO("server", session_id + ": TCP closed (EOF)");
-                } else if (ec == asio::error::operation_aborted) {
-                    LOG_DEBUG("server", session_id + ": TCP read cancelled");
-                } else if (ec) {
-                    LOG_ERROR("server", "FAIL_STAGE=TCP_READ_FAILED ERROR=" + ec.message() +
-                              " CLIENT_ENDPOINT=" + session_id + " TARGET=-");
+    tcp_socket->async_read_some(
+        asio::buffer(*buf),
+        asio::bind_executor(
+            session->strand(), [this, session_id = std::move(session_id), session, tcp_socket, buf,
+                                self](const std::error_code& ec, size_t bytes) mutable {
+                if (ec || bytes == 0) {
+                    if (ec == asio::error::eof) {
+                        LOG_INFO("server", session_id + ": TCP closed (EOF)");
+                    } else if (ec == asio::error::operation_aborted) {
+                        LOG_DEBUG("server", session_id + ": TCP read cancelled");
+                    } else if (ec) {
+                        LOG_ERROR("server", "FAIL_STAGE=TCP_READ_FAILED ERROR=" + ec.message() +
+                                                " CLIENT_ENDPOINT=" + session_id + " TARGET=-");
+                    }
+                    // Graceful teardown: the target is gone, but any target data
+                    // already read into KCP's send buffer must still reach the
+                    // client. close_connection() would drop it, so mark the target
+                    // closed and let the session's update loop drain the buffer,
+                    // closing via the drained callback once wait_send() reaches 0.
+                    handle_target_closed(session, tcp_socket);
+                    return;
                 }
-                // Graceful teardown: the target is gone, but any target data
-                // already read into KCP's send buffer must still reach the
-                // client. close_connection() would drop it, so mark the target
-                // closed and let the session's update loop drain the buffer,
-                // closing via the drained callback once wait_send() reaches 0.
-                handle_target_closed(session, tcp_socket);
-                return;
-            }
-            LOG_DEBUG("server", session_id + ": TCP >> KCP read " + std::to_string(bytes) +
-                     " bytes -> KCP send (wait_send=" + std::to_string(session->wait_send()) + ")");
-            session->send_data(byte_view(buf->data(), bytes));
-            forward_tcp_to_kcp(std::move(session_id), session, tcp_socket, buf);
-        }));
+                LOG_DEBUG("server",
+                          fmt::format("{}: TCP >> KCP read {} bytes -> KCP send (wait_send={})",
+                                      session_id, bytes, session->wait_send()));
+                session->send_data(byte_view(buf->data(), bytes));
+                forward_tcp_to_kcp(std::move(session_id), session, tcp_socket, buf);
+            }));
 }
 
 void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
@@ -1501,14 +1495,16 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
     // most one async_read_some (and therefore one async_write) is outstanding
     // on the session at a time, so writes to the target socket never interleave.
     if (session->try_set_forward_read_pending()) {
-        LOG_DEBUG("server", session->session_id() + ": forward_kcp_to_tcp already active, skipping");
+        LOG_DEBUG("server",
+                  session->session_id() + ": forward_kcp_to_tcp already active, skipping");
         return;
     }
     if (!buf) buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
     std::string sid = session->session_id();
-    LOG_DEBUG("server", sid + ": forward_kcp_to_tcp (kcp->tcp), running=" +
-              std::to_string(session->is_running()) +
-              " forward_pending=" + std::to_string(session->is_forward_read_pending()));
+    LOG_DEBUG("server",
+              fmt::format("{}: forward_kcp_to_tcp (kcp->tcp), running={} forward_pending={}", sid,
+                          static_cast<int>(session->is_running()),
+                          static_cast<int>(session->is_forward_read_pending())));
 
     // Check if session is still running before initiating read.
     if (!session->is_running()) {
@@ -1556,77 +1552,77 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
 
     // forward_read_pending is already true (claimed above); the read below is
     // the sole active forward read.
-    LOG_DEBUG("server", sid + ": async_read_some from KCP, buffer=" + std::to_string(FWD_BUF_SIZE));
-    session->async_read_some(asio::buffer(*buf),
-        [this, sid, session, buf, tcp_sock, self]
-        (const std::error_code& ec, size_t bytes) mutable {
-            if (ec == asio::error::eof) {
-                // The client half-closed (FIN): it will send no more data for
-                // the target. Pass that on rather than tearing the session down
-                // -- the target->client direction may still have a whole
-                // response to deliver, and closing here would truncate it.
-                // shutdown_send (not close) so the target sees a clean FIN and
-                // can still write its answer back.
-                LOG_INFO("server", sid + ": client FIN received, closing target write side");
-                session->set_forward_read_pending(false);
-                if (tcp_sock && tcp_sock->is_open()) {
-                    std::error_code shutdown_ec;
-                    tcp_sock->shutdown(asio::ip::tcp::socket::shutdown_send, shutdown_ec);
-                }
-                return;
+    LOG_DEBUG("server", fmt::format("{}: async_read_some from KCP, buffer={}", sid, FWD_BUF_SIZE));
+    session->async_read_some(asio::buffer(*buf), [this, sid, session, buf, tcp_sock, self](
+                                                     const std::error_code& ec,
+                                                     size_t bytes) mutable {
+        if (ec == asio::error::eof) {
+            // The client half-closed (FIN): it will send no more data for
+            // the target. Pass that on rather than tearing the session down
+            // -- the target->client direction may still have a whole
+            // response to deliver, and closing here would truncate it.
+            // shutdown_send (not close) so the target sees a clean FIN and
+            // can still write its answer back.
+            LOG_INFO("server", sid + ": client FIN received, closing target write side");
+            session->set_forward_read_pending(false);
+            if (tcp_sock && tcp_sock->is_open()) {
+                std::error_code shutdown_ec;
+                tcp_sock->shutdown(asio::ip::tcp::socket::shutdown_send, shutdown_ec);
             }
-            if (ec || bytes == 0) {
-                if (ec && ec != asio::error::operation_aborted &&
-                    ec != asio::error::already_started) {
-                    LOG_WARNING("server", "FAIL_STAGE=KCP_NO_RECV ERROR=" + ec.message() +
-                                " CLIENT_ENDPOINT=" + sid + " TARGET=-");
-                } else if (bytes == 0 && !ec) {
-                    LOG_WARNING("server", "FAIL_STAGE=KCP_NO_RECV ERROR=zero_bytes CLIENT_ENDPOINT=" +
-                                sid + " TARGET=-");
-                }
-                close_connection(sid, "kcp2tcp_read", session);
-                return;
+            return;
+        }
+        if (ec || bytes == 0) {
+            if (ec && ec != asio::error::operation_aborted && ec != asio::error::already_started) {
+                LOG_WARNING("server", "FAIL_STAGE=KCP_NO_RECV ERROR=" + ec.message() +
+                                          " CLIENT_ENDPOINT=" + sid + " TARGET=-");
+            } else if (bytes == 0 && !ec) {
+                LOG_WARNING("server", "FAIL_STAGE=KCP_NO_RECV ERROR=zero_bytes CLIENT_ENDPOINT=" +
+                                          sid + " TARGET=-");
             }
+            close_connection(sid, "kcp2tcp_read", session);
+            return;
+        }
 
-            // The target closed while this read was pending: client data can no
-            // longer be delivered, so drop it and stop the loop instead of
-            // writing to a closed socket (which would error and could tear the
-            // session down before its queued target data finished draining).
-            if (session->is_target_closed()) {
-                LOG_DEBUG("server", sid + ": target closed, dropping " +
-                          std::to_string(bytes) + " bytes of client data");
-                session->set_forward_read_pending(false);
-                return;
-            }
+        // The target closed while this read was pending: client data can no
+        // longer be delivered, so drop it and stop the loop instead of
+        // writing to a closed socket (which would error and could tear the
+        // session down before its queued target data finished draining).
+        if (session->is_target_closed()) {
+            LOG_DEBUG("server", fmt::format("{}: target closed, dropping {} bytes of client data",
+                                            sid, bytes));
+            session->set_forward_read_pending(false);
+            return;
+        }
 
-            LOG_DEBUG("server", sid + ": KCP >> TCP read " + std::to_string(bytes) +
-                     " bytes -> TCP write");
-            asio::async_write(*tcp_sock, asio::buffer(buf->data(), bytes),
-                asio::bind_executor(session->strand(),
-                [this, sid, session, buf, tcp_sock, self]
-                (const std::error_code& ec2, size_t written) mutable {
-                    if (ec2) {
-                        if (ec2 != asio::error::operation_aborted) {
-                            LOG_ERROR("server", "FAIL_STAGE=TCP_WRITE_FAILED ERROR=" + ec2.message() +
-                                      " CLIENT_ENDPOINT=" + sid + " TARGET=-");
-                        }
-                        // The target connection failed (it may have been closed
-                        // under us). Treat it like an upstream close: drain any
-                        // queued target data to the client before tearing down.
-                        handle_target_closed(session, tcp_sock);
-                        return;
+        LOG_DEBUG("server", fmt::format("{}: KCP >> TCP read {} bytes -> TCP write", sid, bytes));
+        asio::async_write(
+            *tcp_sock, asio::buffer(buf->data(), bytes),
+            asio::bind_executor(session->strand(), [this, sid, session, buf, tcp_sock, self](
+                                                       const std::error_code& ec2,
+                                                       size_t written) mutable {
+                if (ec2) {
+                    if (ec2 != asio::error::operation_aborted) {
+                        LOG_ERROR("server", "FAIL_STAGE=TCP_WRITE_FAILED ERROR=" + ec2.message() +
+                                                " CLIENT_ENDPOINT=" + sid + " TARGET=-");
                     }
-                    LOG_DEBUG("server", sid + ": TCP write done (" + std::to_string(written) + " bytes), re-arming");
-                    if (session->is_running()) {
-                        // Release the claim so the re-arm below can re-acquire
-                        // it (it is still set from the read registration above).
-                        session->set_forward_read_pending(false);
-                        forward_kcp_to_tcp(session, buf);
-                    } else {
-                        session->set_forward_read_pending(false);
-                    }
-                }));
-        });
+                    // The target connection failed (it may have been closed
+                    // under us). Treat it like an upstream close: drain any
+                    // queued target data to the client before tearing down.
+                    handle_target_closed(session, tcp_sock);
+                    return;
+                }
+                LOG_DEBUG("server",
+                          fmt::format("{}: TCP write done ({} bytes), re-arming", sid, written));
+                if (session->is_running()) {
+                    // Release the claim so the re-arm below can re-acquire
+                    // it (it is still set from the read registration above).
+                    session->set_forward_read_pending(false);
+                    forward_kcp_to_tcp(session, buf);
+                } else {
+                    session->set_forward_read_pending(false);
+                }
+            }));
+    });
 }
 
 void KCPServer::handle_target_closed(std::shared_ptr<KCPSession> session,
@@ -1638,9 +1634,10 @@ void KCPServer::handle_target_closed(std::shared_ptr<KCPSession> session,
         // queued when the FIN arrived, i.e. how much the drained teardown had to
         // flush before the session could close. On a fast link this is only the
         // tail of the last TCP read, so do not read it as a queue gauge.
-        LOG_INFO("server", session->session_id() +
-                 ": target connection closed, draining queued data to client (wait_send=" +
-                 std::to_string(session->wait_send()) + ")");
+        LOG_INFO("server",
+                 fmt::format("{}: target connection closed, draining queued data to client "
+                             "(wait_send={})",
+                             session->session_id(), session->wait_send()));
         session->mark_target_closed();
         // The target will produce no more data, so half-close towards the
         // client now. Queued after everything the target already sent (KCP is
@@ -1850,9 +1847,11 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
         });
     }
 
-    LOG_INFO("server", fmt::format("metrics sweep: sessions={} pkts_sent={} pkts_recv={} bytes_sent={} bytes_recv={}",
-              active_sessions, total_pkts_sent, total_pkts_recv,
-              total_bytes_sent, total_bytes_recv));
+    LOG_INFO(
+        "server",
+        fmt::format(
+            "metrics sweep: sessions={} pkts_sent={} pkts_recv={} bytes_sent={} bytes_recv={}",
+            active_sessions, total_pkts_sent, total_pkts_recv, total_bytes_sent, total_bytes_recv));
 
     cleanup_timer_.expires_after(std::chrono::seconds(30));
     // Hold a shared_ptr like every other async handler (start() does too), so
@@ -1863,16 +1862,15 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
     });
 }
 
-void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr,
-                               std::vector<uint8_t> data) {
+void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr, std::vector<uint8_t> data) {
     // No udp_socket_ state may be inspected here: this runs on a per-session
     // strand while stop() closes the socket on the socket's own strand, and
     // asio forbids concurrent member calls on a shared object (is_open() reads
     // the non-atomic socket state). The identical guard runs inside the
     // dispatch below, on the executor it belongs to.
 
-    LOG_DEBUG("server", "send_to_client: sending " + std::to_string(data.size()) +
-             " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));
+    LOG_DEBUG("server", fmt::format("send_to_client: sending {} bytes to {}:{}", data.size(),
+                                    addr.address().to_string(), addr.port()));
 
     auto buf = std::make_shared<std::vector<uint8_t>>(std::move(data));
     // Initiation is routed through the socket's strand. This is called from a
@@ -1881,42 +1879,36 @@ void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr,
     // asio sockets are shared objects -- concurrent initiation on one is not
     // allowed. Capture self so the server stays alive until the initiation runs.
     auto self = shared_from_this();
-    asio::dispatch(udp_socket_.get_executor(),
-        [this, self, buf, addr]() {
-            if (!running_ || !udp_socket_.is_open()) {
-                return;
-            }
-            udp_socket_.async_send_to(
-                asio::buffer(*buf), addr,
-                [buf, addr, this, self](const std::error_code& ec, size_t bytes_sent) {
-                    if (ec && ec != asio::error::operation_aborted) {
-                        // One completion per datagram, so an unthrottled line
-                        // here is one line per packet whenever sends fail.
-                        uint32_t suppressed = 0;
-                        if (send_error_log_.should_log(suppressed)) {
-                            LOG_ERROR("server", "FAIL_STAGE=UDP_SEND_FAILED ERROR=" + ec.message() +
-                                      " CLIENT_ENDPOINT=" + addr.address().to_string() +
-                                      ":" + std::to_string(addr.port()) + " TARGET=-" +
-                                      (suppressed ? " (" + std::to_string(suppressed) +
-                                                    " more suppressed this interval)" : ""));
-                        }
-                    } else if (!ec) {
-                        LOG_DEBUG("server", "UDP sent " + std::to_string(bytes_sent) +
-                                 " bytes to " + addr.address().to_string() + ":" + std::to_string(addr.port()));
+    asio::dispatch(udp_socket_.get_executor(), [this, self, buf, addr]() {
+        if (!running_ || !udp_socket_.is_open()) {
+            return;
+        }
+        udp_socket_.async_send_to(
+            asio::buffer(*buf), addr,
+            [buf, addr, this, self](const std::error_code& ec, size_t bytes_sent) {
+                if (ec && ec != asio::error::operation_aborted) {
+                    // One completion per datagram, so an unthrottled line
+                    // here is one line per packet whenever sends fail.
+                    uint32_t suppressed = 0;
+                    if (send_error_log_.should_log(suppressed)) {
+                        LOG_ERROR("server", fmt::format("FAIL_STAGE=UDP_SEND_FAILED ERROR={}"
+                                                        " CLIENT_ENDPOINT={}:{} TARGET=-{}",
+                                                        ec.message(), addr.address().to_string(),
+                                                        addr.port(), throttle_suffix(suppressed)));
                     }
-                });
-        });
+                } else if (!ec) {
+                    LOG_DEBUG("server", fmt::format("UDP sent {} bytes to {}:{}", bytes_sent,
+                                                    addr.address().to_string(), addr.port()));
+                }
+            });
+    });
 }
 
 uint8_t KCPServer::get_error_reply_code(const std::error_code& ec) {
-    if (ec == asio::error::connection_refused)
-        return SOCKS5_REPLY_CONNECTION_REFUSED;
-    if (ec == asio::error::network_unreachable)
-        return SOCKS5_REPLY_NETWORK_UNREACHABLE;
-    if (ec == asio::error::host_unreachable)
-        return SOCKS5_REPLY_HOST_UNREACHABLE;
-    if (ec == asio::error::timed_out)
-        return SOCKS5_REPLY_HOST_UNREACHABLE;
+    if (ec == asio::error::connection_refused) return SOCKS5_REPLY_CONNECTION_REFUSED;
+    if (ec == asio::error::network_unreachable) return SOCKS5_REPLY_NETWORK_UNREACHABLE;
+    if (ec == asio::error::host_unreachable) return SOCKS5_REPLY_HOST_UNREACHABLE;
+    if (ec == asio::error::timed_out) return SOCKS5_REPLY_HOST_UNREACHABLE;
     return SOCKS5_REPLY_GENERAL_FAILURE;
 }
 

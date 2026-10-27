@@ -1,6 +1,8 @@
 #include "kcp_proxy/kcp_client_session.hpp"
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
+
+#include <fmt/format.h>
 #include "kcp_proxy/socket_buffer.hpp"
 #include "kcp_proxy/time_util.hpp"
 #if defined(_WIN32)
@@ -46,9 +48,8 @@ KCPClientSession::KCPClientSession(asio::io_context& io,
       connect_timer_(strand()),
       receive_backoff_timer_(strand()) {
     last_rx_us_.store(now_us());
-    LOG_DEBUG("kcp_client", "created conv=" + std::to_string(conv) +
-              " server=" + server_addr_.address().to_string() + ":" +
-              std::to_string(server_addr_.port()));
+    LOG_DEBUG("kcp_client", fmt::format("created conv={} server={}:{}", conv,
+                                        server_addr_.address().to_string(), server_addr_.port()));
 }
 
 KCPClientSession::~KCPClientSession() {
@@ -96,8 +97,7 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
         // retransmit and keepalive into an ERROR log line plus an unthrottled
         // re-arm.
         const int wsa_rc = disable_udp_connreset(*udp_socket_);
-        LOG_DEBUG("kcp_client", std::string("SIO_UDP_CONNRESET disabled (wsa_rc=") +
-                                    std::to_string(wsa_rc) + ")");
+        LOG_DEBUG("kcp_client", fmt::format("SIO_UDP_CONNRESET disabled (wsa_rc={})", wsa_rc));
 #endif
 
         // Raise the kernel UDP send/receive buffers and report any silent clamp.
@@ -146,10 +146,10 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
                 if (ack_v2) enable_fin();
                 connected_.store(true);
                 touch_activity();
-                LOG_INFO("kcp_client", "KCP handshake confirmed with " +
-                         server_addr_.address().to_string() + ":" +
-                         std::to_string(server_addr_.port()) +
-                         (ack_v2 ? " (V2, half-close enabled)" : ""));
+                LOG_INFO("kcp_client",
+                         fmt::format("KCP handshake confirmed with {}:{}{}",
+                                     server_addr_.address().to_string(), server_addr_.port(),
+                                     ack_v2 ? " (V2, half-close enabled)" : ""));
                 if (h) h(true);
             });
 
@@ -157,8 +157,8 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
         connect_timer_.async_wait([this, self, completion](const std::error_code& ec) mutable {
             if (ec == asio::error::operation_aborted) return;
             if (!connect_pending_.exchange(false)) return;
-            LOG_ERROR("kcp_client", "KCP handshake timeout after " +
-                      std::to_string(KCP_HANDSHAKE_TIMEOUT_SEC) + "s");
+            LOG_ERROR("kcp_client",
+                      fmt::format("KCP handshake timeout after {}s", KCP_HANDSHAKE_TIMEOUT_SEC));
             on_close();
             auto h = std::move(*completion);
             *completion = nullptr;
@@ -167,9 +167,9 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
 
         send_connect_hello();
 
-        LOG_INFO("kcp_client", "KCP handshake started with " +
-                 server_addr_.address().to_string() + ":" +
-                 std::to_string(server_addr_.port()));
+        LOG_INFO("kcp_client",
+                 fmt::format("KCP handshake started with {}:{}", server_addr_.address().to_string(),
+                             server_addr_.port()));
     } catch (const std::exception& e) {
         LOG_ERROR("kcp_client", "connect error: " + std::string(e.what()));
         // Tear down cleanly: if running_ was already set (e.g. the failure was
@@ -206,8 +206,7 @@ void KCPClientSession::send_connect_hello() {
         // silently here would leave the SOCKS5 handshake hanging until its
         // 30s deadline, because on_close() disarms every path (ACK read,
         // connect timer) that could complete it.
-        throw std::runtime_error("KCP handshake send failed, ret=" +
-                                 std::to_string(send_ret));
+        throw std::runtime_error(fmt::format("KCP handshake send failed, ret={}", send_ret));
     }
     kcp_.update(now_kcp_ms());
     kcp_.flush();
@@ -284,8 +283,10 @@ void KCPClientSession::on_update_tick() {
     if (is_connected()) {
         const int64_t idle_us = now_us() - last_rx_us_.load();
         if (idle_us > static_cast<int64_t>(KCP_TIMEOUT_SEC) * 1000000) {
-            LOG_WARNING("kcp_client", "idle timeout: no valid data from server for " +
-                        std::to_string(idle_us / 1000000) + "s, closing session");
+            LOG_WARNING("kcp_client",
+                        fmt::format("idle timeout: no valid data from server for {}s, "
+                                    "closing session",
+                                    idle_us / 1000000));
             on_close();
             return;
         }
@@ -322,57 +323,54 @@ void KCPClientSession::do_udp_receive() {
     // packets from the pinned server endpoint.
     udp_socket_->async_receive(
         asio::buffer(udp_recv_buf_),
-        asio::bind_executor(strand(),
-            [this, self](const std::error_code& ec, size_t bytes) {
-                if (ec) {
-                    if (ec != asio::error::operation_aborted &&
-                        running_.load()) {
-                        // UDP sockets surface ICMP Port Unreachable as an error
-                        // on the next receive: connection_refused on Linux/BSD,
-                        // connection_reset (WSAECONNRESET) on Windows. This is
-                        // the NORMAL signal that the server is down or
-                        // restarting, not a fault, so it stays at DEBUG and
-                        // re-arms immediately. (Windows reporting is disabled at
-                        // the source in on_connect; this covers Linux and any
-                        // other error the socket still surfaces.) The server
-                        // classifies these identically -- the client used to log
-                        // them at ERROR with no pacing at all.
-                        if (ec == asio::error::connection_refused ||
-                            ec == asio::error::connection_reset) {
-                            LOG_DEBUG("kcp_client", "UDP ICMP port unreachable received (ignored)");
-                            do_udp_receive();
-                        } else {
-                            uint32_t suppressed = 0;
-                            if (client_udp_recv_error_log().should_log(suppressed)) {
-                                LOG_ERROR("kcp_client", "UDP receive error: " + ec.message() +
-                                          (suppressed ? " (" + std::to_string(suppressed) +
-                                                        " more suppressed this interval)" : ""));
-                            }
-                            // Unknown errors can complete immediately and
-                            // repeatedly with no external pacing, so an
-                            // unbounded re-arm here is a busy spin plus an ERROR
-                            // line per iteration. Re-arm through a short backoff
-                            // instead, bounding the loop to ~100 attempts/s.
-                            auto self2 = shared_from_this();
-                            receive_backoff_timer_.expires_after(
-                                std::chrono::milliseconds(10));
-                            receive_backoff_timer_.async_wait(
-                                [this, self2](const std::error_code& timer_ec) {
-                                    if (!timer_ec) do_udp_receive();
-                                });
+        asio::bind_executor(strand(), [this, self](const std::error_code& ec, size_t bytes) {
+            if (ec) {
+                if (ec != asio::error::operation_aborted && running_.load()) {
+                    // UDP sockets surface ICMP Port Unreachable as an error
+                    // on the next receive: connection_refused on Linux/BSD,
+                    // connection_reset (WSAECONNRESET) on Windows. This is
+                    // the NORMAL signal that the server is down or
+                    // restarting, not a fault, so it stays at DEBUG and
+                    // re-arms immediately. (Windows reporting is disabled at
+                    // the source in on_connect; this covers Linux and any
+                    // other error the socket still surfaces.) The server
+                    // classifies these identically -- the client used to log
+                    // them at ERROR with no pacing at all.
+                    if (ec == asio::error::connection_refused ||
+                        ec == asio::error::connection_reset) {
+                        LOG_DEBUG("kcp_client", "UDP ICMP port unreachable received (ignored)");
+                        do_udp_receive();
+                    } else {
+                        uint32_t suppressed = 0;
+                        if (client_udp_recv_error_log().should_log(suppressed)) {
+                            LOG_ERROR("kcp_client",
+                                      fmt::format("UDP receive error: {}{}", ec.message(),
+                                                  throttle_suffix(suppressed)));
                         }
+                        // Unknown errors can complete immediately and
+                        // repeatedly with no external pacing, so an
+                        // unbounded re-arm here is a busy spin plus an ERROR
+                        // line per iteration. Re-arm through a short backoff
+                        // instead, bounding the loop to ~100 attempts/s.
+                        auto self2 = shared_from_this();
+                        receive_backoff_timer_.expires_after(std::chrono::milliseconds(10));
+                        receive_backoff_timer_.async_wait(
+                            [this, self2](const std::error_code& timer_ec) {
+                                if (!timer_ec) do_udp_receive();
+                            });
                     }
-                    return;
                 }
-                if (!running_.load()) return;
-                // on_receive runs synchronously on the strand and consumes the
-                // buffer (decrypt -> ikcp_input copies into KCP), so we can pass
-                // a view into udp_recv_buf_ and re-arm afterwards -- no copy.
-                if (bytes > 0) {
-                    on_receive(byte_view(udp_recv_buf_.data(), bytes));
-                }
-                do_udp_receive();
-            }));
+                return;
+            }
+            if (!running_.load()) return;
+            // on_receive runs synchronously on the strand and consumes the
+            // buffer (decrypt -> ikcp_input copies into KCP), so we can pass
+            // a view into udp_recv_buf_ and re-arm afterwards -- no copy.
+            if (bytes > 0) {
+                on_receive(byte_view(udp_recv_buf_.data(), bytes));
+            }
+            do_udp_receive();
+        }));
 }
 
 void KCPClientSession::on_receive(byte_view packet) {
@@ -402,8 +400,8 @@ void KCPClientSession::on_receive(byte_view packet) {
     // Plaintext bytes, matching bytes_sent (KCP payload in on_send) -- the
     // encrypted datagram size is already tracked separately as udp_rx_bytes.
     metrics_.bytes_received.fetch_add(decrypt_buf_.size(), std::memory_order_relaxed);
-    LOG_DEBUG("kcp_client", "UDP recv " + std::to_string(packet.size()) +
-              " encrypted -> " + std::to_string(decrypt_buf_.size()) + " decrypted");
+    LOG_DEBUG("kcp_client", fmt::format("UDP recv {} encrypted -> {} decrypted", packet.size(),
+                                        decrypt_buf_.size()));
     int input_ret = feed_kcp_input(decrypt_buf_.data(), decrypt_buf_.size());
     if (input_ret < 0) {
         // Throttled for the same reason as the server side: the server holds
@@ -417,7 +415,7 @@ void KCPClientSession::on_receive(byte_view packet) {
         log_kcp_input_rejected("kcp_client", std::string_view(), input_ret,
                                decrypt_buf_.size());
     } else {
-        LOG_DEBUG("kcp_client", "kcp input ok, peek=" + std::to_string(kcp_.peek_size()));
+        LOG_DEBUG("kcp_client", fmt::format("kcp input ok, peek={}", kcp_.peek_size()));
     }
     try_fulfill_read();
     // ACKs consumed by ikcp_input() are what free send-window space; resuming a
@@ -431,7 +429,7 @@ void KCPClientSession::handle_kcp_output(byte_view data) {
         LOG_DEBUG("kcp_client", "handle_kcp_output - session not running");
         return;
     }
-    LOG_DEBUG("kcp_client", "handle_kcp_output " + std::to_string(data.size()) + " bytes -> encrypt");
+    LOG_DEBUG("kcp_client", fmt::format("handle_kcp_output {} bytes -> encrypt", data.size()));
     // Encrypt straight into the buffer that will back the async UDP send, so a
     // packet costs one allocation instead of two (encrypted + send_buf).
     auto send_buf = std::make_shared<std::vector<uint8_t>>();
@@ -456,9 +454,9 @@ void KCPClientSession::handle_kcp_output(byte_view data) {
         }
         return;
     }
-    LOG_DEBUG("kcp_client", "encrypted -> " + std::to_string(send_buf->size()) +
-             " bytes, sending UDP to " + server_addr_.address().to_string() + ":" +
-             std::to_string(server_addr_.port()));
+    LOG_DEBUG("kcp_client",
+              fmt::format("encrypted -> {} bytes, sending UDP to {}:{}", send_buf->size(),
+                          server_addr_.address().to_string(), server_addr_.port()));
 
     metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
     metrics_.udp_tx_bytes.fetch_add(send_buf->size(), std::memory_order_relaxed);
@@ -473,12 +471,12 @@ void KCPClientSession::handle_kcp_output(byte_view data) {
                     // one line per packet whenever the path is failing.
                     uint32_t suppressed = 0;
                     if (client_udp_send_error_log().should_log(suppressed)) {
-                        LOG_ERROR("kcp_client", "UDP send error: " + ec.message() +
-                                  (suppressed ? " (" + std::to_string(suppressed) +
-                                                " more suppressed this interval)" : ""));
+                        std::string line = fmt::format("UDP send error: {}", ec.message());
+                        line += throttle_suffix(suppressed);
+                        LOG_ERROR("kcp_client", line);
                     }
                 } else if (!ec) {
-                    LOG_DEBUG("kcp_client", "UDP sent " + std::to_string(bytes_sent) + " bytes");
+                    LOG_DEBUG("kcp_client", fmt::format("UDP sent {} bytes", bytes_sent));
                 }
             }));
 }

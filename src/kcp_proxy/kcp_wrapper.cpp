@@ -1,6 +1,7 @@
 #include "kcp_proxy/kcp_wrapper.hpp"
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
+#include <fmt/format.h>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -25,11 +26,10 @@ void log_kcp_input_rejected(std::string_view log_module, std::string_view tag,
     if (!kcp_input_reject_log().should_log(suppressed)) return;
     const std::string prefix = tag.empty() ? std::string()
                                            : std::string(tag) + ": ";
-    LOG_WARNING(std::string(log_module),
-                prefix + "FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_" +
-                std::to_string(ret) + " size=" + std::to_string(size) +
-                (suppressed ? " (" + std::to_string(suppressed) +
-                              " more suppressed this interval)" : ""));
+    std::string line =
+        fmt::format("{}FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_{} size={}", prefix, ret, size);
+    line += throttle_suffix(suppressed);
+    LOG_WARNING(std::string(log_module), line);
 }
 
 KcpWrapper::KcpWrapper(uint32_t conv)
@@ -42,7 +42,7 @@ KcpWrapper::KcpWrapper(uint32_t conv)
           // explicit update(ms) below remains the single time source.
           [this]() -> std::uint32_t { return current_ms_; })) {
     configure();
-    LOG_DEBUG("kcp_wrapper", "created conv=" + std::to_string(conv));
+    LOG_DEBUG("kcp_wrapper", fmt::format("created conv={}", conv));
 }
 
 KcpWrapper::~KcpWrapper() {
@@ -59,12 +59,11 @@ void KcpWrapper::set_output_callback(OutputCallback cb) {
 int KcpWrapper::send(byte_view data) {
     int ret = kcp_->Send(data.data(), data.size());
     if (ret < 0) {
-        LOG_ERROR("kcp_wrapper", "kcp send failed: ret=" + std::to_string(ret) +
-                  " size=" + std::to_string(data.size()) +
-                  " waitsnd=" + std::to_string(wait_send()));
+        LOG_ERROR("kcp_wrapper", fmt::format("kcp send failed: ret={} size={} waitsnd={}", ret,
+                                             data.size(), wait_send()));
     } else {
-        LOG_DEBUG("kcp_wrapper", "kcp send ok: " + std::to_string(data.size()) +
-                  " bytes, waitsnd=" + std::to_string(wait_send()));
+        LOG_DEBUG("kcp_wrapper",
+                  fmt::format("kcp send ok: {} bytes, waitsnd={}", data.size(), wait_send()));
     }
     return ret;
 }
@@ -109,11 +108,10 @@ int KcpWrapper::input(byte_view data) {
         // Detail only, and at DEBUG: the throttled, once-per-datagram line is
         // the caller's (log_kcp_input_rejected), which already carries ret and
         // the size. Logging both made one rejected datagram cost two WARNINGs.
-        LOG_DEBUG("kcp_wrapper", "kcp input failed: ret=" + std::to_string(ret) +
-                  " size=" + std::to_string(data.size()));
+        LOG_DEBUG("kcp_wrapper", fmt::format("kcp input failed: ret={} size={}", ret, data.size()));
     } else {
-        LOG_DEBUG("kcp_wrapper", "kcp input ok: " + std::to_string(data.size()) +
-                  " bytes, peek=" + std::to_string(peek_size()));
+        LOG_DEBUG("kcp_wrapper",
+                  fmt::format("kcp input ok: {} bytes, peek={}", data.size(), peek_size()));
     }
     return ret;
 }
@@ -150,7 +148,7 @@ void KcpWrapper::configure() {
         // SetMtu only refuses when the value cannot even hold a wire header,
         // which no compile-time constant of ours can trigger -- but a silent
         // misconfiguration here would degrade every session, so surface it.
-        LOG_ERROR("kcp_wrapper", "kcp SetMtu refused mtu=" + std::to_string(KCP_MTU));
+        LOG_ERROR("kcp_wrapper", fmt::format("kcp SetMtu refused mtu={}", KCP_MTU));
     }
 }
 
@@ -163,11 +161,10 @@ void KcpWrapper::c_output(const std::uint8_t* buf, std::size_t len) {
     try {
         output_cb_(byte_view(buf, len));
     } catch (const std::exception& e) {
-        LOG_ERROR("kcp_wrapper", "output callback threw: " + std::string(e.what()) +
-                  " len=" + std::to_string(len));
+        LOG_ERROR("kcp_wrapper", fmt::format("output callback threw: {} len={}", e.what(), len));
     } catch (...) {
-        LOG_ERROR("kcp_wrapper", "output callback threw unknown exception, len=" +
-                  std::to_string(len));
+        LOG_ERROR("kcp_wrapper",
+                  fmt::format("output callback threw unknown exception, len={}", len));
     }
 }
 
