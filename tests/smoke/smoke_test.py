@@ -1013,6 +1013,15 @@ def test_ci_runs_this_suite_and_the_whitespace_check():
             "CI must run tests/smoke/smoke_test.py")
     require("git diff --check" in ci,
             "CI must run `git diff --check`")
+    # The formatting gate is only as good as this wiring: a job that runs the
+    # suite without the pinned tool skips it, and a job that does not demand it
+    # passes when the tool is missing. Both halves are load-bearing -- dropping
+    # either one is how the gate ended up never running in the 0.2.0 release.
+    require("clang-format-22" in ci,
+            "CI must install the pinned clang-format for the formatting gate")
+    require("KCP_REQUIRE_CLANG_FORMAT" in ci,
+            "CI must demand the pinned clang-format where it runs the suite, "
+            "otherwise a failed install silently skips the gate")
 
 
 # --------------------------------------------------------------------------- #
@@ -1190,21 +1199,26 @@ def _violations_on_lines(tool: str, relative: str, lines: set[int]) -> list[int]
 def test_clang_format_agrees_with_changed_lines():
     """New lines must be formatted; untouched lines are left alone.
 
-    Skips when clang-format is absent on a developer's machine: a missing dev
-    tool must not fail a local run. In CI it FAILS instead, because the hygiene
-    job installs the pinned version one step earlier -- if the suite still
-    cannot find it, the gate is broken and a green check would be a lie. That
-    is not hypothetical either: the first version of this check reported
-    "the formatting check did NOT run" as a warning annotation while the job
-    passed, so nothing was ever enforced.
+    Skips when clang-format is absent, except in the job that declares it must
+    be there (KCP_REQUIRE_CLANG_FORMAT, set by the hygiene job, which installs
+    the pinned version one step earlier). There a missing tool FAILS the suite:
+    if that job cannot find what it just installed, the gate is broken and a
+    green check would be a lie. That is not hypothetical -- the first version of
+    this check reported "the formatting check did NOT run" as a warning
+    annotation while the job passed, so nothing was ever enforced.
     """
     tool = _clang_format()
     if tool is None:
         detail = (f"clang-format v{CLANG_FORMAT_MAJOR} not found (set CLANG_FORMAT, "
                   f"or install clang-format-{CLANG_FORMAT_MAJOR})")
-        if os.environ.get("CI"):
-            require(False, f"{detail}; CI installs it before running this suite, "
-                           "so the formatting gate would silently not run")
+        # KCP_REQUIRE_CLANG_FORMAT is set by the one CI job that installs the
+        # pinned tool. The suite also runs from ctest in the three build jobs,
+        # which do not install it: failing there would turn a missing dev tool
+        # into a red build on every OS (measured: it broke build-macos on the
+        # first push), so only the job that promises to provide it is held to it.
+        if os.environ.get("KCP_REQUIRE_CLANG_FORMAT"):
+            require(False, f"{detail}; this job installs clang-format before "
+                           "running the suite, so the gate would silently not run")
         print(f"SKIP clang-format: {detail}")
         return
 

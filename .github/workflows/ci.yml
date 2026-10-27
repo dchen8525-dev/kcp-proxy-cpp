@@ -90,6 +90,10 @@ jobs:
         # same set the whitespace step above inspects. Empty on a first push;
         # the suite falls back to HEAD in that case.
         KCP_SMOKE_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        # This is the only job that installs the pinned clang-format, so it is
+        # the only one that may fail when the tool is missing. The build jobs
+        # run the same suite through ctest and do not install it; they skip.
+        KCP_REQUIRE_CLANG_FORMAT: "1"
 
   # The GUI had tests (`npm test`) and a syntax/JSON check (`npm run check`)
   # that CI never ran, so a broken main.js or a malformed electron-builder
