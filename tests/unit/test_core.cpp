@@ -1923,6 +1923,58 @@ TEST_CASE("test_server_unauth_packet_cannot_evict_live_session") {
         "the reconnected session must serve subsequent packets");
 }
 
+TEST_CASE("test_server_stale_handshake_replay_keeps_live_session") {
+    // A retransmitted first datagram of an ALREADY-REPLACED session must be
+    // refused WITHOUT evicting the session that replaced it. get_or_create_session
+    // used to stop and erase the live session first ("authenticated reconnect")
+    // and only then consult the salt tombstone: a stale handshake retransmit --
+    // whose salt the first acceptance tombstoned -- destroyed the live session
+    // and was itself refused, leaving the endpoint with no session and walled
+    // off until the TTL expired. Seen in CI: two client tunnels behind one
+    // relay endpoint; the first tunnel's handshake retransmit killed the second
+    // tunnel's live session mid-transfer.
+    asio::io_context io;
+    const std::string key = "stale_replay_test_key_01";
+    auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1");
+
+    const auto ep = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 41002);
+    const std::vector<uint8_t> connect_req = {0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0, 80};
+    const byte_view req_view(connect_req.data(), connect_req.size());
+
+    // Tunnel A: accepted first; keep a copy of its first datagram -- the stale
+    // handshake retransmit that the relay/NAT path will replay later.
+    const auto salt_a = Crypto::generate_session_salt();
+    Crypto tunnel_a(key, NONCE_DIR_CLIENT, salt_a, false);
+    auto a_first = tunnel_a.encrypt(req_view);
+    auto session_a = server->route_datagram(ep, byte_view(a_first.data(), a_first.size()));
+    CHECK_MESSAGE(session_a != nullptr, "the first tunnel must be accepted");
+
+    // Tunnel B from the SAME endpoint: a genuine reconnect (fresh salt) must
+    // replace A -- the deferred-eviction contract pinned by
+    // test_server_unauth_packet_cannot_evict_live_session.
+    const auto salt_b = Crypto::generate_session_salt();
+    Crypto tunnel_b(key, NONCE_DIR_CLIENT, salt_b, false);
+    auto b_first = tunnel_b.encrypt(req_view);
+    auto session_b = server->route_datagram(ep, byte_view(b_first.data(), b_first.size()));
+    CHECK_MESSAGE(session_b != nullptr, "the reconnecting tunnel must be accepted");
+    CHECK_MESSAGE(session_b != session_a, "the reconnect must replace the old session");
+
+    const auto prev_level = current_log_level();
+    set_log_level(LogLevel::Error);
+
+    // A's stale retransmit arrives after B took over: refused ...
+    CHECK_MESSAGE(server->route_datagram(ep, byte_view(a_first.data(), a_first.size())) == nullptr,
+                  "the stale handshake retransmit must be rejected");
+
+    // ... and B must have survived it: B's own next packet lands on B.
+    auto b_second = tunnel_b.encrypt(req_view);
+    CHECK_MESSAGE(
+        server->route_datagram(ep, byte_view(b_second.data(), b_second.size())) == session_b,
+        "the stale retransmit must not evict the live session");
+
+    set_log_level(prev_level);
+}
+
 TEST_CASE("test_server_rejects_replayed_salt_after_session_death") {
     // A recorded first datagram replayed after its session has died must be
     // rejected. Without the salt tombstone the server's first-packet

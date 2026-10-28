@@ -842,16 +842,44 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 it->second->salt_matches(encrypted_packet)) {
                 return it->second;
             }
-            // This packet decrypted, so it is genuine: a live session still
-            // holding this endpoint under a different salt is a real reconnect
-            // on a reused source port rather than a forgery, and replacing it
-            // is exactly what the deferred eviction above was waiting for.
-            authenticated_reconnect = true;
-            if (it->second) {
-                it->second->stop();
+            const bool live_existing =
+                it->second && it->second->is_alive() && it->second->is_running();
+            if (live_existing) {
+                // The packet authenticated under a DIFFERENT salt than the live
+                // session. A genuine reconnect always carries a fresh random
+                // salt, so before irreversibly evicting the live session, ask
+                // the tombstone table whether this salt belongs to a session
+                // accepted within the TTL: if it does, the datagram is a
+                // retransmitted first datagram of an older tunnel (already
+                // replaced, or whose handshake reply never got back). Evicting
+                // first and rejecting second would destroy the live session and
+                // leave the endpoint with no session at all, walled off until
+                // the TTL expires -- every later packet of the live tunnel is
+                // then refused as ReplayedSalt. Seen in the wild: two client
+                // tunnels behind one NAT/relay endpoint, where a stale
+                // handshake retransmit of the first killed the second. Reject
+                // the stale datagram and keep the live session.
+                const byte_view incoming_salt = session_crypto->session_salt();
+                const std::string incoming_salt_key(
+                    reinterpret_cast<const char*>(incoming_salt.data()), incoming_salt.size());
+                const auto now = std::chrono::steady_clock::now();
+                const auto tomb = salt_tombstones_.find(incoming_salt_key);
+                if (tomb != salt_tombstones_.end() && tomb->second > now) {
+                    rejection = RejectReason::ReplayedSalt;
+                }
             }
-            sessions_.erase(it);
-            drop_replaced_target_locked(sid);
+            if (rejection == RejectReason::None) {
+                // This packet decrypted, so it is genuine: a live session still
+                // holding this endpoint under a different salt is a real reconnect
+                // on a reused source port rather than a forgery, and replacing it
+                // is exactly what the deferred eviction above was waiting for.
+                authenticated_reconnect = true;
+                if (it->second) {
+                    it->second->stop();
+                }
+                sessions_.erase(it);
+                drop_replaced_target_locked(sid);
+            }
         }
         if (sessions_.size() >= MAX_CONCURRENT_SESSIONS) {
             rejection = RejectReason::SessionCap;
