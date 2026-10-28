@@ -143,7 +143,7 @@ vcpkg 查找顺序为 `VCPKG_ROOT` → 仓库内 `vcpkg/` → 自动克隆。不
 ### deb 安装（推荐）
 
 ```bash
-VERSION=0.2.4                       # 换成要安装的版本，见 Releases
+VERSION=0.2.5                       # 换成要安装的版本，见 Releases
 wget https://github.com/dchen8525-dev/kcp-proxy-cpp/releases/download/v$VERSION/kcp-proxy-server_${VERSION}_amd64.deb
 sudo dpkg -i kcp-proxy-server_${VERSION}_amd64.deb
 
@@ -446,6 +446,9 @@ AppImage / NSIS / Portable 并合并 `SHA256SUMS` 发布。
 
 ## 版本与兼容性
 
+- **0.2.5**：概览「今日密钥日期」改为「今日密钥」，直接显示北京日期 + 密钥后缀的合并值，
+  并随表单实时更新；删去与 `socks5://` 行信息重复的「绑定地址」行。协议、线格式、KCP 参数
+  均无变化，0.2.4 与 0.2.5 可互连。
 - **0.2.4**：概览页「运行中」后面显示本次会话已运行时长（`HH:MM:SS`，每秒刷新，停止后隐藏）；
   页面加载完成时补发一次当前状态，修掉自动连接时界面停在「未运行」的问题。协议、线格式、
   KCP 参数均无变化，0.2.3 与 0.2.4 可互连。
