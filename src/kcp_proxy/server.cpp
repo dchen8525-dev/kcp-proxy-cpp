@@ -2043,56 +2043,61 @@ void KCPServer::send_batch_to_client(const asio::ip::udp::endpoint& addr,
     LOG_DEBUG("server", fmt::format("send_batch_to_client: {} datagrams to {}:{}", batch.size(),
                                     addr.address().to_string(), addr.port()));
     auto self = shared_from_this();
-    asio::dispatch(udp_socket_.get_executor(), [this, self, batch = std::move(batch), addr]() {
-        if (!running_ || !udp_socket_.is_open()) {
-            return;
-        }
+    asio::dispatch(
+        udp_socket_.get_executor(), [this, self, batch = std::move(batch), addr]() mutable {
+            if (!running_ || !udp_socket_.is_open()) {
+                return;
+            }
 #if defined(__linux__)
-        // Chunked sendmmsg: the whole burst leaves in ~batch/64 syscalls
-        // instead of one per datagram. MSG_DONTWAIT keeps the strand
-        // non-blocking; whatever the kernel queue refuses right now falls
-        // through to the per-datagram async path, which parks on writability
-        // instead of spinning.
-        int fd = udp_socket_.native_handle();
-        size_t idx = 0;
-        while (idx < batch.size()) {
-            const size_t n = std::min(batch.size() - idx, UDP_BATCH_MAX);
-            struct mmsghdr msgs[UDP_BATCH_MAX];
-            struct iovec iov[UDP_BATCH_MAX];
-            for (size_t i = 0; i < n; ++i) {
-                iov[i].iov_base = batch[idx + i].data();
-                iov[i].iov_len = batch[idx + i].size();
-                std::memset(&msgs[i], 0, sizeof(msgs[i]));
-                msgs[i].msg_hdr.msg_name = const_cast<void*>(addr.data());
-                msgs[i].msg_hdr.msg_namelen = static_cast<socklen_t>(addr.size());
-                msgs[i].msg_hdr.msg_iov = &iov[i];
-                msgs[i].msg_hdr.msg_iovlen = 1;
+            // Chunked sendmmsg: the whole burst leaves in ~batch/64 syscalls
+            // instead of one per datagram. MSG_DONTWAIT keeps the strand
+            // non-blocking; whatever the kernel queue refuses right now falls
+            // through to the per-datagram async path, which parks on writability
+            // instead of spinning. One copy of the peer address: the kernel
+            // only reads msg_name on send, but it wants a writable void*, and
+            // endpoint::data() hands out a const pointer.
+            int fd = udp_socket_.native_handle();
+            sockaddr_storage peer_sa{};
+            std::memcpy(&peer_sa, addr.data(), addr.size());
+            size_t idx = 0;
+            while (idx < batch.size()) {
+                const size_t n = std::min(batch.size() - idx, UDP_BATCH_MAX);
+                struct mmsghdr msgs[UDP_BATCH_MAX];
+                struct iovec iov[UDP_BATCH_MAX];
+                for (size_t i = 0; i < n; ++i) {
+                    iov[i].iov_base = batch[idx + i].data();
+                    iov[i].iov_len = batch[idx + i].size();
+                    std::memset(&msgs[i], 0, sizeof(msgs[i]));
+                    msgs[i].msg_hdr.msg_name = &peer_sa;
+                    msgs[i].msg_hdr.msg_namelen = static_cast<socklen_t>(addr.size());
+                    msgs[i].msg_hdr.msg_iov = &iov[i];
+                    msgs[i].msg_hdr.msg_iovlen = 1;
+                }
+                ssize_t sent = ::sendmmsg(fd, msgs, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                    sent = 0; // nothing accepted this round: remainder goes async
+                }
+                if (sent < 0) break; // unexpected: let the async path surface it
+                for (size_t i = 0; i < static_cast<size_t>(sent); ++i) {
+                    datagram_pool().release(std::move(batch[idx + i]));
+                }
+                idx += static_cast<size_t>(sent);
+                if (static_cast<size_t>(sent) < n) break;
             }
-            ssize_t sent = ::sendmmsg(fd, msgs, n, MSG_DONTWAIT | MSG_NOSIGNAL);
-            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-                sent = 0; // nothing accepted this round: remainder goes async
+            LOG_DEBUG("server", fmt::format("sendmmsg: {} of {} datagrams accepted by the kernel",
+                                            idx, batch.size()));
+            for (size_t i = idx; i < batch.size(); ++i) {
+                initiate_send_to(addr, make_pooled_send(std::move(batch[i])));
             }
-            if (sent < 0) break; // unexpected: let the async path surface it
-            for (size_t i = 0; i < static_cast<size_t>(sent); ++i) {
-                datagram_pool().release(std::move(batch[idx + i]));
-            }
-            idx += static_cast<size_t>(sent);
-            if (static_cast<size_t>(sent) < n) break;
-        }
-        LOG_DEBUG("server", fmt::format("sendmmsg: {} of {} datagrams accepted by the kernel", idx,
-                                        batch.size()));
-        for (size_t i = idx; i < batch.size(); ++i) {
-            initiate_send_to(addr, make_pooled_send(std::move(batch[i])));
-        }
-        return;
+            return;
 #endif
-        // Non-Linux (and the Linux fallback for unsent datagrams is above, so
-        // this only runs off-Linux): per-datagram async initiation, unchanged
-        // from the pre-batching behavior.
-        for (auto& d : batch) {
-            initiate_send_to(addr, make_pooled_send(std::move(d)));
-        }
-    });
+            // Non-Linux (and the Linux fallback for unsent datagrams is above, so
+            // this only runs off-Linux): per-datagram async initiation, unchanged
+            // from the pre-batching behavior.
+            for (auto& d : batch) {
+                initiate_send_to(addr, make_pooled_send(std::move(d)));
+            }
+        });
 }
 
 void KCPServer::initiate_send_to(const asio::ip::udp::endpoint& addr,
