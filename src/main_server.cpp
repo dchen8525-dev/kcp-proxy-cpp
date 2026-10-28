@@ -28,6 +28,9 @@ struct ServerCliOptions {
     unsigned int threads = 1;
     std::string log_level = "INFO";
     std::vector<std::string> allowed_targets;
+    int sndwnd = KCP_SNDWND;
+    int rcvwnd = KCP_RCVWND;
+    int mtu = KCP_MTU;
 };
 
 std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code) {
@@ -70,6 +73,19 @@ std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code
         ->capture_default_str();
     app.add_option("-L,--log-level", o.log_level, "Log level: DEBUG, INFO, WARNING, ERROR")
         ->check(cli::log_level_validator())
+        ->capture_default_str();
+    app.add_option("--sndwnd", o.sndwnd,
+                   "KCP send window in segments (per session). Single-tunnel "
+                   "throughput is roughly sndwnd * (mtu-24) / RTT.")
+        ->check(CLI::Range(KCP_SNDWND_MIN, KCP_SNDWND_MAX))
+        ->capture_default_str();
+    app.add_option("--rcvwnd", o.rcvwnd, "KCP receive window in segments (per session)")
+        ->check(CLI::Range(KCP_RCVWND_MIN, KCP_RCVWND_MAX))
+        ->capture_default_str();
+    app.add_option("--mtu", o.mtu,
+                   "KCP datagram MTU in bytes. Keep both peers equal so FEC "
+                   "framing and MSS behave identically.")
+        ->check(CLI::Range(KCP_MTU_MIN, KCP_MTU_MAX))
         ->capture_default_str();
     app.add_option("--allow-target", o.allowed_targets,
                    "Allow a specific lab/test target past the SSRF guard "
@@ -121,6 +137,11 @@ int main(int argc, char* argv[]) {
 
     std::string& key = opts.key;
     cli::parse_log_level(opts.log_level);
+
+    // Apply before the server (and any session) can exist: the tuning is a
+    // process-global read by every KcpWrapper, and the startup "KCP config"
+    // log line renders it.
+    set_kcp_tuning(opts.sndwnd, opts.rcvwnd, opts.mtu);
 
     try {
         asio::io_context io;

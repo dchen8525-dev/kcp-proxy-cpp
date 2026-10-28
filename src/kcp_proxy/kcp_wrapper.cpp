@@ -142,13 +142,14 @@ int KcpWrapper::wait_send() const {
 }
 
 void KcpWrapper::configure() {
+    const KcpTuning& t = kcp_tuning();
     kcp_->NoDelay(KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC);
-    kcp_->WndSize(KCP_SNDWND, KCP_RCVWND);
-    if (kcp_->SetMtu(KCP_MTU) < 0) {
+    kcp_->WndSize(t.sndwnd, t.rcvwnd);
+    if (kcp_->SetMtu(t.mtu) < 0) {
         // SetMtu only refuses when the value cannot even hold a wire header,
-        // which no compile-time constant of ours can trigger -- but a silent
+        // which the CLI clamp (KCP_MTU_MIN) already excludes -- but a silent
         // misconfiguration here would degrade every session, so surface it.
-        LOG_ERROR("kcp_wrapper", fmt::format("kcp SetMtu refused mtu={}", KCP_MTU));
+        LOG_ERROR("kcp_wrapper", fmt::format("kcp SetMtu refused mtu={}", t.mtu));
     }
 }
 

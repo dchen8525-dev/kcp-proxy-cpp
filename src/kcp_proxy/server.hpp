@@ -18,6 +18,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+// sockaddr_storage for the recvmmsg drain scratch (see the drain members).
+#include <sys/socket.h>
+#endif
 
 namespace kcp_proxy {
 
@@ -264,6 +268,21 @@ private:
     // timer if it is not already running. The timer re-arms every parked slot.
     void park_receive_slot(size_t index);
 
+    // ---------------- Linux batched receive (recvmmsg drain) ----------------
+    // On Linux the 16-slot arming above is replaced by a single readiness
+    // wait: async_wait(wait_read), then one drain that reads up to
+    // UDP_DRAIN_BATCH_MAX datagrams with chunked ::recvmmsg BEFORE routing any
+    // of them -- the same drain/handler decoupling the slots provide, with
+    // ~4 syscalls per event instead of 16. Not used on other platforms.
+    void arm_receive_drain();
+    void handle_receive_drain(const std::error_code& ec);
+    // Scratch storage for one drain event: endpoint + length + buffer per
+    // datagram, sized UDP_DRAIN_BATCH_MAX in start(). Only touched on the
+    // socket's strand.
+    std::vector<sockaddr_storage> drain_addrs_;
+    std::vector<size_t> drain_lens_;
+    std::vector<std::vector<uint8_t>> drain_bufs_;
+
     std::shared_ptr<KCPSession> get_or_create_session(
         const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,
         bool& already_consumed);
@@ -336,6 +355,16 @@ private:
     // Takes ownership of the (already encrypted) datagram so the UDP send can
     // move it without a second copy.
     void send_to_client(const asio::ip::udp::endpoint& addr, std::vector<uint8_t> data);
+    // Batched variant: one flush cycle's worth of encrypted datagrams. On
+    // Linux they leave in chunked ::sendmmsg calls; elsewhere (and for
+    // whatever the kernel queue refuses) each goes through the per-datagram
+    // async initiation below, unchanged.
+    void send_batch_to_client(const asio::ip::udp::endpoint& addr,
+                              std::vector<std::vector<uint8_t>> batch);
+    // The pre-batching initiation: one pooled holder, one async_send_to, one
+    // completion. Must run on the socket's strand.
+    void initiate_send_to(const asio::ip::udp::endpoint& addr,
+                          std::shared_ptr<std::vector<uint8_t>> buf);
     void forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
                             std::shared_ptr<std::vector<uint8_t>> buf = {});
 

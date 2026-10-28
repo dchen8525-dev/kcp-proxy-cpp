@@ -185,6 +185,23 @@ protected:
     // Encrypt KCP output and put it on the wire. The two sessions differ in
     // ownership here, so each implements its own.
     virtual void handle_kcp_output(byte_view data) = 0;
+    // Consume one flush cycle's worth of framed output datagrams in a single
+    // call. `count` entries of `datagrams` are valid; the vector may be longer
+    // (its storage is reused across cycles). The default drains through
+    // handle_kcp_output one datagram at a time, which is byte-identical to the
+    // pre-batching wire. Sessions override this to encrypt the whole burst and
+    // hand it to the wire as one batched send.
+    virtual void handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,
+                                         size_t count);
+
+    // One KCP scheduling cycle: update(now) + flush(), with every framed
+    // output datagram the cycle produces collected and delivered to
+    // handle_kcp_output_batch() in a single call. This is the ONLY sanctioned
+    // way to drive KCP: every former update+flush pair routes through here, so
+    // a burst that used to cost one send syscall per KCP segment now costs one
+    // per cycle (see the Linux sendmmsg/recvmmsg batching). Must run on the
+    // strand.
+    void flush_cycle(uint32_t now_ms);
 
     // ------------------------- shared strand-bound helpers ------------------
     void on_send(byte_view data);
@@ -256,6 +273,31 @@ protected:
     // Strand-only.
     void on_kcp_datagram(byte_view data);
 
+    // ------------------------ output batching -------------------------------
+    // Collect framed datagrams between begin_output_batch/end_output_batch.
+    // Inside a batch the datagrams are copied into out_batch_'s reusable
+    // storage instead of reaching handle_kcp_output one at a time; the closing
+    // end delivers the whole burst in one virtual call. The depth counter makes
+    // nesting safe, and both hooks are exception-safe: a throw from the KCP
+    // internals or from a consumer must leave the depth counter and the
+    // accumulator consistent, or every later flush would batch into a stuck
+    // counter.
+    void begin_output_batch() {
+        ++batch_depth_;
+    }
+    void end_output_batch();
+    // Route one framed datagram either into the open batch or, outside a
+    // batch, straight to handle_kcp_output (the pre-batching behavior).
+    void emit_output(byte_view data);
+
+    // Reusable scratch storage for batched output. Inner buffers keep their
+    // capacity across flush cycles, so the steady state costs zero
+    // allocations per datagram here (the sessions' encrypted buffers are
+    // pooled separately).
+    std::vector<std::vector<uint8_t>> out_batch_;
+    size_t out_batch_used_ = 0;
+    int batch_depth_ = 0;
+
     asio::io_context& io_;
     asio::strand<asio::io_context::executor_type> strand_;
     std::shared_ptr<Crypto> crypto_;
@@ -287,6 +329,12 @@ protected:
     // the tunnel: once the peer has half-closed it can never un-half-close, and
     // both the forwarding loops and the teardown paths need to consult it.
     std::atomic<bool> peer_fin_received_{false};
+    // Set by feed_kcp_input (queued ACKs are invisible to wait_send()) and by
+    // maybe_send_keepalive (its heartbeat is queued after the tick's flush).
+    // The update tick runs kcp_.update()+flush() only when this is set or
+    // wait_send() > 0, so a fully idle session skips the scheduler pass
+    // entirely (see the tick guards in KCPSession/KCPClientSession).
+    std::atomic<bool> needs_flush_{false};
 
     std::atomic<int64_t> last_activity_us_{0};  // steady_clock micros
     // Throttle for the periodic (DEBUG) UDP stats line, to avoid per-tick spam.

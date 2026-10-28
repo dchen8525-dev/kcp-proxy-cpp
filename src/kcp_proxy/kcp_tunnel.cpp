@@ -68,7 +68,7 @@ KcpTunnel::~KcpTunnel() = default;
 void KcpTunnel::on_kcp_datagram(byte_view data) {
     if (!fec_encoder_) {
         // FEC disabled: the wire stays byte-identical to pre-FEC peers.
-        handle_kcp_output(data);
+        emit_output(data);
         return;
     }
     // Frame the datagram: [crypto reserve(28)][fec_hdr(6)][len(2)][payload].
@@ -78,27 +78,90 @@ void KcpTunnel::on_kcp_datagram(byte_view data) {
     // like kcp-go's session writes over the headerOffset region.
     const size_t frame_size = FEC_CRYPTO_RESERVE + 8 + data.size();
     fec_send_buf_.resize(frame_size);
-    std::memcpy(fec_send_buf_.data() + FEC_CRYPTO_RESERVE + 8,
-                data.data(), data.size());
+    std::memcpy(fec_send_buf_.data() + FEC_CRYPTO_RESERVE + 8, data.data(), data.size());
     fec_parity_.clear();
     // Burst-continuity window = the live RTT-derived RTO, like kcp-go's
     // sess.rto: a shard set spread wider than one RTO is not a burst, and the
     // encoder skips its parity while still advancing the seqid.
-    fec_encoder_->Encode(fec_send_buf_.data(), frame_size, kcp_.rto(),
-                         &fec_parity_);
+    fec_encoder_->Encode(fec_send_buf_.data(), frame_size, kcp_.rto(), &fec_parity_);
     // The data shard first, in order, then the parity shards of this set.
-    handle_kcp_output(byte_view(fec_send_buf_.data() + FEC_CRYPTO_RESERVE,
-                                frame_size - FEC_CRYPTO_RESERVE));
+    emit_output(
+        byte_view(fec_send_buf_.data() + FEC_CRYPTO_RESERVE, frame_size - FEC_CRYPTO_RESERVE));
     for (const auto& parity : fec_parity_) {
         // A parity FecPacket is one full-size buffer whose first
         // FEC_CRYPTO_RESERVE bytes are dead weight for the crypto layer, just
         // like a data packet — skip straight to the FEC header.
-        handle_kcp_output(byte_view(parity.data() + FEC_CRYPTO_RESERVE,
-                                    parity.size() - FEC_CRYPTO_RESERVE));
+        emit_output(
+            byte_view(parity.data() + FEC_CRYPTO_RESERVE, parity.size() - FEC_CRYPTO_RESERVE));
     }
 }
 
+void KcpTunnel::emit_output(byte_view data) {
+    if (batch_depth_ == 0) {
+        // Outside a flush cycle there is nothing to batch with: behave exactly
+        // like the pre-batching code path.
+        handle_kcp_output(data);
+        return;
+    }
+    if (out_batch_used_ == out_batch_.size()) out_batch_.emplace_back();
+    auto& slot = out_batch_[out_batch_used_++];
+    // Copy is mandatory here: data points into fec_send_buf_ / the encoder's
+    // parity buffers, both of which are reused by the very next datagram.
+    slot.assign(data.begin(), data.end());
+}
+
+void KcpTunnel::end_output_batch() {
+    if (batch_depth_ > 0) --batch_depth_;
+    if (batch_depth_ > 0 || out_batch_used_ == 0) return;
+    const size_t count = out_batch_used_;
+    out_batch_used_ = 0;
+    // Reset the accumulator BEFORE handing the burst over: if the consumer
+    // throws, the next cycle must still start from a clean slate (a datagram
+    // lost during a teardown-path exception is acceptable; a permanently
+    // wedged depth counter that batches every later flush into nothing is
+    // not). Exceptions are contained for the same reason KcpWrapper::c_output
+    // contains them: one bad consumer must not unwind through KCP's flush
+    // frames into the io_context.
+    try {
+        handle_kcp_output_batch(out_batch_, count);
+    } catch (const std::exception& e) {
+        LOG_ERROR(log_module_, log_msg(fmt::format("batched output consumer threw: {}", e.what())));
+    } catch (...) {
+        LOG_ERROR(log_module_, log_msg("batched output consumer threw (unknown exception)"));
+    }
+}
+
+void KcpTunnel::handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,
+                                        size_t count) {
+    // Default: the pre-batching behavior, one datagram per handle_kcp_output
+    // call. Sessions override this to amortize the wire send.
+    for (size_t i = 0; i < count; ++i) {
+        handle_kcp_output(byte_view(datagrams[i].data(), datagrams[i].size()));
+    }
+}
+
+void KcpTunnel::flush_cycle(uint32_t now_ms) {
+    begin_output_batch();
+    try {
+        kcp_.update(now_ms);
+        kcp_.flush();
+    } catch (...) {
+        // Re-throw after unwinding the batch: kcp internals throwing here is
+        // as fatal today as it was before batching, but the depth counter and
+        // the accumulator must not survive the exception.
+        end_output_batch();
+        throw;
+    }
+    end_output_batch();
+}
+
 int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
+    // ikcp_input queues ACKs and window probes into lists only Flush() reads;
+    // nothing else exposes them (no ackcount accessor on Kcp), so the tick's
+    // idle guard needs this side signal to know a flush is due. Set before
+    // the input itself: a framing-refused call sets it spuriously, which
+    // costs one no-op flush on the next tick and nothing else.
+    needs_flush_.store(true, std::memory_order_relaxed);
     if (!fec_decoder_) {
         // Local FEC is off, so the peer must be sending bare KCP segments. If
         // the header instead carries a FEC type, the peer HAS -fec enabled and
@@ -236,7 +299,7 @@ void KcpTunnel::retry_pending_fin() {
     // (see the KCP_BACKPRESSURE_THRESHOLD note in config.hpp). Gating here
     // keeps a window that cannot drain (dead peer, pending drain) from
     // turning the 10ms tick into a futile retry every interval.
-    if (kcp_.wait_send() >= KCP_SNDWND) return;
+    if (kcp_.wait_send() >= kcp_tuning().sndwnd) return;
     do_send_fin();
 }
 
@@ -259,8 +322,7 @@ void KcpTunnel::do_send_fin() {
         return;
     }
     fin_sent_.store(true);
-    kcp_.update(now_kcp_ms());
-    kcp_.flush();
+    flush_cycle(now_kcp_ms());
     LOG_INFO(log_module_, log_msg("FIN sent (half-close)"));
 }
 
@@ -285,7 +347,7 @@ void KcpTunnel::maybe_resume_write() {
     // Still too full to accept another message: stay parked. The check is
     // against the low watermark, not the park threshold, so a wakeup always
     // admits at least KCP_BACKPRESSURE_BURST_MSGS messages' worth of room.
-    if (kcp_.wait_send() > KCP_BACKPRESSURE_RESUME_THRESHOLD) return;
+    if (kcp_.wait_send() > kcp_tuning().backpressure_resume()) return;
 
     // Take-and-clear BEFORE invoking: the resumed loop usually parks again
     // immediately (the queue refills in a few messages), and it must be able to
@@ -344,8 +406,7 @@ void KcpTunnel::on_send(byte_view data) {
     }
     metrics_.packets_sent.fetch_add(1, std::memory_order_relaxed);
     metrics_.bytes_sent.fetch_add(data.size(), std::memory_order_relaxed);
-    kcp_.update(now_kcp_ms());
-    kcp_.flush();
+    flush_cycle(now_kcp_ms());
 }
 
 void KcpTunnel::async_read_some(asio::mutable_buffer buffer,
@@ -519,6 +580,9 @@ void KcpTunnel::maybe_send_keepalive() {
     // injected on every 10ms tick once the interval passes.
     if (kcp_.send(byte_view(kb.data(), klen)) >= 0) {
         last_keepalive_us_.store(now);
+        // Queued after the tick's flush already ran: flag it so the next tick
+        // flushes the heartbeat instead of skipping the scheduler pass.
+        needs_flush_.store(true, std::memory_order_relaxed);
         LOG_DEBUG(log_module_, log_msg("keepalive sent"));
     }
 }
