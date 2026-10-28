@@ -296,6 +296,12 @@ h1.status {
   gap: 3px;
 }
 
+/* 今日密钥 concatenates a date and up to 128 suffix chars: without a break
+   opportunity that one token can exceed the row and push .main wide. */
+.kv dd code {
+  overflow-wrap: anywhere;
+}
+
 /* The overview rows carry the same ? as the connection form, so their one-line
    explanations live in the bubble instead of pushing a second text row under
    every value. These rows are flex boxes, so the bubble is anchored to the row

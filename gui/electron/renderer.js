@@ -28,8 +28,7 @@ const elements = {
   logContainer: document.getElementById('log-container'),
   ovSocks: document.getElementById('ov-socks'),
   ovUpstream: document.getElementById('ov-upstream'),
-  ovBind: document.getElementById('ov-bind'),
-  ovKeyDate: document.getElementById('ov-keydate'),
+  ovTodayKey: document.getElementById('ov-todaykey'),
   testResult: document.getElementById('test-result'),
   fecEnabled: document.getElementById('fecEnabled'),
   fecPair: document.getElementById('fecPair'),
@@ -39,6 +38,10 @@ const elements = {
 // State
 let config = {};
 let isRunning = false;
+// Today's Beijing date (YYYYMMDD), fetched once per launch. The overview's
+// 今日密钥 row composes it with the form's key suffix, exactly the way
+// utils.js generateKey's daily branch does (date + suffix, no separator).
+let todayKeyDate = '';
 
 // Initialize
 async function init() {
@@ -80,13 +83,17 @@ async function init() {
     appendLog(`读取配置失败: ${err.message}`, 'error');
   }
 
-  // Today's key date for the overview row. Computed in the main process from
-  // utils.js (the same function minting the key), fetched once per launch —
-  // the value only changes at Beijing midnight, and the app restarting is a
-  // natural (if belated) refresh for that edge case.
+  // Today's Beijing date for the overview's 今日密钥 row. Computed in the main
+  // process from utils.js (the same clock that mints the key), fetched once per
+  // launch — the value only changes at Beijing midnight, and the app restarting
+  // is a natural (if belated) refresh for that edge case. The suffix half comes
+  // from the form so the row tracks live edits like the other overview rows.
   try {
     const keyDate = await window.electronAPI.getKeyDate();
-    if (keyDate) elements.ovKeyDate.textContent = keyDate;
+    if (keyDate) {
+      todayKeyDate = keyDate;
+      refreshOverview();
+    }
   } catch { /* keep the HTML placeholder */ }
 
   appendLog('提示：填写完成后点击「启动连接」即可。', 'info');
@@ -110,17 +117,26 @@ function populateForm(config) {
 }
 
 // Keep the overview's read-only summary in sync with the form values. The
-// SOCKS address and 绑定地址 row mirror the actual listen host: 0.0.0.0 when
-// LAN sharing is on (the client binds all interfaces), 127.0.0.1 otherwise.
+// SOCKS address mirrors the actual listen host — 0.0.0.0 when LAN sharing is
+// on (the client binds all interfaces), 127.0.0.1 otherwise — so the dropped
+// 绑定地址 row is still legible right inside this one.
 function refreshOverview() {
   const localPort = elements.localPort.value.trim() || '1080';
   const listenHost = elements.allowLan.checked ? '0.0.0.0' : '127.0.0.1';
   elements.ovSocks.textContent = `socks5://${listenHost}:${localPort}`;
-  elements.ovBind.textContent = listenHost;
 
   const host = elements.serverHost.value.trim();
   const serverPort = elements.serverPort.value.trim() || '8388';
   elements.ovUpstream.textContent = host ? `${host}:${serverPort}` : '—';
+
+  // 今日密钥 = 北京日期 + 密钥后缀，mirroring utils.js generateKey's daily
+  // branch (plain concatenation, no separator). An empty suffix means the key
+  // is not complete, so the row keeps its placeholder instead of showing a
+  // bare date that would never validate.
+  const suffix = elements.keySuffix.value.trim();
+  elements.ovTodayKey.textContent = todayKeyDate && suffix
+    ? todayKeyDate + suffix
+    : '—';
 }
 
 // Sidebar view switching: show the section whose id matches the nav link's
