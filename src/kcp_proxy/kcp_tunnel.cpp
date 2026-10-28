@@ -4,6 +4,7 @@
 #include "kcp_proxy/time_util.hpp"
 #include "kcp/internal/constants.h"
 #include "kcp/internal/fec.h"
+#include "kcp/snmp.h"
 #include <fmt/format.h>
 #include <cstring>
 #include <stdexcept>
@@ -21,17 +22,17 @@ LogThrottle& fec_peer_only_log() {
     return throttle;
 }
 
-KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv,
-                     std::shared_ptr<Crypto> crypto,
-                     std::string log_module, std::string log_tag,
-                     const FecConfig& fec)
+KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv, std::shared_ptr<Crypto> crypto,
+                     std::string log_module, std::string log_tag, const FecConfig& fec,
+                     AdaptiveHooks hooks)
     : io_(io),
       strand_(asio::make_strand(io.get_executor())),
       crypto_(std::move(crypto)),
       kcp_(conv),
       created_us_(now_us()),
       log_module_(std::move(log_module)),
-      log_tag_(std::move(log_tag)) {
+      log_tag_(std::move(log_tag)),
+      hooks_(std::move(hooks)) {
     const int64_t now = now_us();
     last_activity_us_.store(now);
     last_keepalive_us_.store(now);
@@ -71,6 +72,7 @@ void KcpTunnel::on_kcp_datagram(byte_view data) {
         emit_output(data);
         return;
     }
+    metrics_.fec_data_sent.fetch_add(1, std::memory_order_relaxed);
     // Frame the datagram: [crypto reserve(28)][fec_hdr(6)][len(2)][payload].
     // The 28-byte reserve is never written here — handle_kcp_output's
     // encrypt_into treats the region from offset FEC_CRYPTO_RESERVE as the
@@ -83,7 +85,15 @@ void KcpTunnel::on_kcp_datagram(byte_view data) {
     // Burst-continuity window = the live RTT-derived RTO, like kcp-go's
     // sess.rto: a shard set spread wider than one RTO is not a burst, and the
     // encoder skips its parity while still advancing the seqid.
-    fec_encoder_->Encode(fec_send_buf_.data(), frame_size, kcp_.rto(), &fec_parity_);
+    //
+    // Adaptive parity reuses exactly that branch: rto=0 makes every set "not a
+    // burst", so the codec emits no parity and runs no Reed-Solomon work, while
+    // the seqid still advances by parity_shards -- the peer's set grouping
+    // (seqid/data+parity) is untouched and it needs to know nothing. This is
+    // documented behaviour of FecEncoder::Encode, and tests/unit pins it so a
+    // codec upgrade cannot change the meaning of 0 silently.
+    const uint32_t rto = parity_enabled() ? kcp_.rto() : 0u;
+    fec_encoder_->Encode(fec_send_buf_.data(), frame_size, rto, &fec_parity_);
     // The data shard first, in order, then the parity shards of this set.
     emit_output(
         byte_view(fec_send_buf_.data() + FEC_CRYPTO_RESERVE, frame_size - FEC_CRYPTO_RESERVE));
@@ -91,6 +101,7 @@ void KcpTunnel::on_kcp_datagram(byte_view data) {
         // A parity FecPacket is one full-size buffer whose first
         // FEC_CRYPTO_RESERVE bytes are dead weight for the crypto layer, just
         // like a data packet — skip straight to the FEC header.
+        metrics_.fec_parity_sent.fetch_add(1, std::memory_order_relaxed);
         emit_output(
             byte_view(parity.data() + FEC_CRYPTO_RESERVE, parity.size() - FEC_CRYPTO_RESERVE));
     }
@@ -141,6 +152,7 @@ void KcpTunnel::handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>&
 }
 
 void KcpTunnel::flush_cycle(uint32_t now_ms) {
+    apply_rto_floor();
     begin_output_batch();
     try {
         kcp_.update(now_ms);
@@ -267,6 +279,18 @@ std::string KcpTunnel::log_msg(const std::string& text) const {
     return log_tag_ + ": " + text;
 }
 
+void KcpTunnel::apply_rto_floor() {
+    if (!hooks_.rto_floor_gate) return;
+    const bool low_latency = hooks_.rto_floor_gate->low_latency();
+    if (low_latency == rto_low_latency_applied_) return;
+    rto_low_latency_applied_ = low_latency;
+    // nodelay=1 pins rx_minrto to 30ms, nodelay=0 to 100ms. Segments already
+    // in flight keep the deadline they were given; only future ones move.
+    kcp_.set_nodelay(low_latency ? 1 : 0);
+    LOG_DEBUG(log_module_, log_msg(fmt::format("RTO floor -> {}ms (nodelay={})",
+                                               low_latency ? 30 : 100, low_latency ? 1 : 0)));
+}
+
 void KcpTunnel::touch_activity() {
     last_activity_us_.store(now_us());
 }
@@ -361,10 +385,35 @@ void KcpTunnel::maybe_resume_write() {
 
 std::string KcpTunnel::stats_summary() const {
     const auto& m = metrics_;
+    // kcp-cpp keeps its retransmission counters process-wide (kcp::Kcp has no
+    // per-connection accessor), so the snmp_* fields below are whole-process
+    // totals, NOT this tunnel's: with one tunnel in flight they are that
+    // tunnel's numbers, with N tunnels they are the sum. They are printed as
+    // cumulative totals (subtract two lines to get a rate) because that needs no
+    // per-tunnel mutable state and therefore no synchronization: this method runs
+    // both from the update tick (on the strand) and from the close path.
+    //
+    // Why they are here: retransmissions are the only direction-correct loss
+    // signal a sender has (only the receiver can see a datagram go missing), and
+    // they are what a "stop sending parity while the path is clean" policy would
+    // have to key on. The fec_* fields are the other half: they show what FEC is
+    // actually costing on the wire, and whether the codec's burst-skip is
+    // already trimming the parity it emits.
+    const kcp::SnmpSnapshot snmp = kcp::DefaultSnmp().Snapshot();
+    // "off" here means FEC is not configured at all; "econ" is the adaptive
+    // policy deliberately withholding parity right now.
+    const char* parity_mode = !fec_encoder_ ? "off" : (parity_enabled() ? "full" : "econ");
+    // srtt/rto are per-tunnel (unlike the snmp_* counters) and are what an
+    // adaptive send window would key on: a queue the sender built itself shows
+    // up as srtt far above the tunnel's minimum, and that queue is exactly what
+    // makes KCP retransmit segments that were merely waiting.
     return log_msg(fmt::format(
         "stats tx_pkt={} tx_bytes={} rx_pkt={} rx_bytes={} "
         "replay_dropped={} decrypt_err={} encrypt_err={} send_err={} "
-        "fec_repaired={}",
+        "fec_repaired={} fec_data_tx={} fec_parity_tx={} fec_parity={} "
+        "srtt={} rto={} wnd={} nodelay={} "
+        "snmp_out_segs={} snmp_in_segs={} snmp_retrans={} snmp_fast_retrans={} "
+        "snmp_lost={} snmp_repeat={}",
         m.udp_tx_packets.load(std::memory_order_relaxed),
         m.udp_tx_bytes.load(std::memory_order_relaxed),
         m.udp_rx_packets.load(std::memory_order_relaxed),
@@ -373,7 +422,11 @@ std::string KcpTunnel::stats_summary() const {
         m.decrypt_errors.load(std::memory_order_relaxed),
         m.encrypt_errors.load(std::memory_order_relaxed),
         m.send_errors.load(std::memory_order_relaxed),
-        m.fec_repaired.load(std::memory_order_relaxed)));
+        m.fec_repaired.load(std::memory_order_relaxed),
+        m.fec_data_sent.load(std::memory_order_relaxed),
+        m.fec_parity_sent.load(std::memory_order_relaxed), parity_mode, kcp_.kcp().srtt(),
+        kcp_.rto(), kcp_.kcp().snd_wnd(), kcp_.kcp().nodelay(), snmp.out_segs, snmp.in_segs,
+        snmp.retrans_segs, snmp.fast_retrans_segs, snmp.lost_segs, snmp.repeat_segs));
 }
 
 void KcpTunnel::send_data(byte_view data) {

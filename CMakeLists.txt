@@ -6,7 +6,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         CACHE STRING "Vcpkg toolchain file")
 endif()
 
-project(kcp_proxy VERSION 0.2.5 LANGUAGES C CXX)
+project(kcp_proxy VERSION 0.3.0 LANGUAGES C CXX)
 
 # Default build type and compile_commands.json export
 if(NOT CMAKE_BUILD_TYPE)
@@ -275,6 +275,32 @@ if(Python3_Interpreter_FOUND)
             --client $<TARGET_FILE:kcp-proxy-client>
     )
     set_tests_properties(kcp_proxy_e2e_fec_loss PROPERTIES TIMEOUT 300)
+
+    # Adaptive parity (--fec-adaptive): the other half of FEC. Phase 1 proves a
+    # clean path stops emitting parity (and keeps delivering byte-exact data),
+    # phase 2 proves a lossy path never downgrades -- the downgrade is only ever
+    # taken on evidence of a clean path. Both phases use a short probe window so
+    # the suite stays under a minute; the shipped default is 60s.
+    add_test(
+        NAME kcp_proxy_e2e_fec_adaptive
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_ROOT}/tests/e2e/fec_adaptive_e2e.py
+            --server $<TARGET_FILE:kcp-proxy-server>
+            --client $<TARGET_FILE:kcp-proxy-client>
+    )
+    set_tests_properties(kcp_proxy_e2e_fec_adaptive PROPERTIES TIMEOUT 300)
+
+    # Adaptive RTO floor (--rto-adaptive-clean): the retransmission side of the
+    # same problem. A clean path relaxes the 30ms floor to 100ms so queued
+    # datagrams stop being resent as lost; a lossy path must keep 30ms.
+    add_test(
+        NAME kcp_proxy_e2e_rto_adaptive
+        COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_ROOT}/tests/e2e/rto_adaptive_e2e.py
+            --server $<TARGET_FILE:kcp-proxy-server>
+            --client $<TARGET_FILE:kcp-proxy-client>
+    )
+    set_tests_properties(kcp_proxy_e2e_rto_adaptive PROPERTIES TIMEOUT 300)
 else()
     message(STATUS "Python3 interpreter not found: skipping smoke + E2E tests")
 endif()

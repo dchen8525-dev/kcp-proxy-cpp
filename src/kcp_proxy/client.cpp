@@ -53,16 +53,32 @@ bool looks_like_http_request(uint8_t first, uint8_t second) {
 }
 } // namespace
 
-KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host,
-                                uint16_t server_port, std::string key,
-                                std::string listen_host, uint16_t listen_port,
-                                int half_close_grace_sec, const FecConfig& fec)
-    : io_(io), server_host_(std::move(server_host)), server_port_(server_port),
-      key_(std::move(key)), listen_host_(std::move(listen_host)),
-      listen_port_(listen_port), half_close_grace_sec_(half_close_grace_sec),
+KCPProxyClient::KCPProxyClient(asio::io_context& io, std::string server_host, uint16_t server_port,
+                               std::string key, std::string listen_host, uint16_t listen_port,
+                               int half_close_grace_sec, const FecConfig& fec,
+                               const AdaptiveSettings& adaptive)
+    : io_(io),
+      server_host_(std::move(server_host)),
+      server_port_(server_port),
+      key_(std::move(key)),
+      listen_host_(std::move(listen_host)),
+      listen_port_(listen_port),
+      half_close_grace_sec_(half_close_grace_sec),
       fec_(fec),
-      tcp_acceptor_(io_), udp_resolver_(io_), traffic_timer_(io),
-      update_tick_timer_(io), accept_retry_timer_(io) {
+      tcp_acceptor_(io_),
+      udp_resolver_(io_),
+      traffic_timer_(io),
+      update_tick_timer_(io),
+      accept_retry_timer_(io) {
+    if (adaptive.fec_parity && fec_.enabled()) {
+        parity_gate_ = std::make_shared<FecParityGate>();
+        parity_ctl_ =
+            std::make_unique<FecParityController>(*parity_gate_, adaptive.fec_parity_tuning);
+    }
+    if (adaptive.rto_relax_sec > 0) {
+        rto_gate_ = std::make_shared<RtoFloorGate>();
+        rto_ctl_ = std::make_unique<RtoFloorController>(*rto_gate_, adaptive.rto_relax_sec);
+    }
 }
 
 KCPProxyClient::~KCPProxyClient() {
@@ -386,10 +402,9 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     std::shared_ptr<Crypto> crypto;
     std::shared_ptr<KCPClientSession> session;
     try {
-        crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT,
-                                          Crypto::generate_session_salt());
-        session = std::make_shared<KCPClientSession>(
-            io_, server_endpoint_, crypto, KCP_CONV, fec_);
+        crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT, Crypto::generate_session_salt());
+        session = std::make_shared<KCPClientSession>(io_, server_endpoint_, crypto, KCP_CONV, fec_,
+                                                     adaptive_hooks());
     } catch (const std::exception& e) {
         LOG_ERROR("client", std::string("session setup failed, closing connection: ") +
                   e.what());
@@ -855,6 +870,44 @@ void KCPProxyClient::report_traffic() {
         LOG_INFO("traffic", line);
     } else {
         LOG_DEBUG("traffic", line);
+    }
+    sample_adaptive_policies();
+}
+
+// One sample of both adaptive policies, on the same 2s cadence as the traffic
+// reporter. INFO on a transition and only then: each switch is a rare lifecycle
+// event of the transport policy (at most one per policy window, per process),
+// and it is the only way an operator learns that parity stopped being emitted
+// or that the retransmission floor moved.
+void KCPProxyClient::sample_adaptive_policies() {
+    const int64_t now = now_us();
+    if (parity_ctl_) {
+        const auto transition = parity_ctl_->sample(now);
+        if (transition == FecParityController::Transition::kToEconomy) {
+            LOG_INFO("client",
+                     fmt::format("FEC adaptive: parity off after {}s of clean upload traffic "
+                                 "(no fast retransmits); a loss falls back to KCP retransmission",
+                                 parity_ctl_->probe_sec()));
+        } else if (transition == FecParityController::Transition::kToProtected) {
+            LOG_INFO("client",
+                     fmt::format("FEC adaptive: parity on - the peer reported a retransmit; "
+                                 "staying protected for {}s",
+                                 parity_ctl_->hold_sec()));
+        }
+    }
+    if (rto_ctl_) {
+        const auto transition = rto_ctl_->sample(now);
+        if (transition == RtoFloorController::Transition::kToRelaxed) {
+            LOG_INFO("client",
+                     fmt::format("RTO adaptive: floor 30ms -> 100ms after {}s of clean upload "
+                                 "traffic; queued datagrams are no longer mistaken for lost ones",
+                                 rto_ctl_->relax_sec()));
+        } else if (transition == RtoFloorController::Transition::kToLowLatency) {
+            LOG_INFO("client",
+                     fmt::format("RTO adaptive: floor 100ms -> 30ms - the peer reported a "
+                                 "retransmit; staying low-latency for {}s",
+                                 rto_ctl_->hold_sec()));
+        }
     }
 }
 

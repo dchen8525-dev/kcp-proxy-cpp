@@ -31,6 +31,9 @@ struct ServerCliOptions {
     int sndwnd = KCP_SNDWND;
     int rcvwnd = KCP_RCVWND;
     int mtu = KCP_MTU;
+    int fec_probe_sec = FEC_PARITY_PROBE_SEC;
+    int fec_hold_sec = FEC_PARITY_HOLD_SEC;
+    int rto_relax_sec = KCP_RTO_RELAX_SEC;
 };
 
 std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code) {
@@ -99,6 +102,28 @@ std::optional<ServerCliOptions> parse_cli(int argc, char* argv[], int& exit_code
             }
             return {};
         });
+    app.add_option("--fec-adaptive-probe", o.fec_probe_sec,
+                   "For FEC clients (the default is on): stop emitting parity "
+                   "shards after this many seconds of clean download traffic, and "
+                   "resume within seconds of a loss. Wire compatible (the peer "
+                   "needs no support): a skipped set simply has no repair "
+                   "capability, so a loss falls back to KCP retransmission. Works "
+                   "without --fec on this side, since the server adapts its shard "
+                   "parameters to each client. 0 disables adaptive parity.")
+        ->check(CLI::Range(0, 3600))
+        ->capture_default_str();
+    app.add_option("--fec-adaptive-hold", o.fec_hold_sec,
+                   "Seconds to stay protected after evidence of loss")
+        ->check(CLI::Range(5, 3600))
+        ->capture_default_str();
+    app.add_option("--rto-adaptive-clean", o.rto_relax_sec,
+                   "Seconds of clean traffic before the KCP retransmission "
+                   "timeout floor relaxes from 30ms to 100ms, so datagrams "
+                   "merely queued behind a large send window are not resent as "
+                   "lost. Loss evidence restores 30ms within a sample; 0 keeps "
+                   "30ms forever.")
+        ->check(CLI::Range(0, 3600))
+        ->capture_default_str();
 
     try {
         app.parse(argc, argv);
@@ -146,13 +171,32 @@ int main(int argc, char* argv[]) {
     try {
         asio::io_context io;
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
-        auto server = std::make_shared<KCPServer>(io, opts.port, key, opts.host, fec);
+        AdaptiveSettings adaptive;
+        adaptive.fec_parity = opts.fec_probe_sec > 0;
+        adaptive.fec_parity_tuning =
+            FecParityTuning{opts.fec_probe_sec, opts.fec_hold_sec, ADAPTIVE_MIN_SEG_RATE};
+        adaptive.rto_relax_sec = opts.rto_relax_sec;
+        auto server = std::make_shared<KCPServer>(io, opts.port, key, opts.host, fec, adaptive);
         cli::secure_wipe(key);
         server->set_allowed_targets(opts.allowed_targets);
         server->start();
 
         LOG_INFO("main", fmt::format("KCP proxy server started on {}:{} fec={}", opts.host,
                                      server->bound_port(), fec.to_string()));
+        if (adaptive.fec_parity) {
+            LOG_INFO(
+                "main",
+                fmt::format("FEC adaptive parity enabled: probe={}s hold={}s (drops parity while "
+                            "the download path is clean)",
+                            adaptive.fec_parity_tuning.probe_sec,
+                            adaptive.fec_parity_tuning.hold_sec));
+        }
+        LOG_INFO("main",
+                 fmt::format(
+                     "RTO adaptive floor: {} (30ms while the download path loses packets)",
+                     adaptive.rto_relax_sec > 0
+                         ? fmt::format("relaxes to 100ms after {}s clean", adaptive.rto_relax_sec)
+                         : std::string("disabled, always 30ms")));
 
         cli::setup_signal_handler(io, [server]() {
             server->stop();

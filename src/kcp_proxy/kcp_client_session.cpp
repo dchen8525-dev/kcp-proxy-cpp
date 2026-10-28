@@ -45,12 +45,10 @@ LogThrottle& client_udp_send_error_log() {
 
 } // namespace
 
-KCPClientSession::KCPClientSession(asio::io_context& io,
-                                   asio::ip::udp::endpoint server_addr,
-                                   std::shared_ptr<Crypto> crypto,
-                                   uint32_t conv,
-                                   const FecConfig& fec)
-    : KcpTunnel(io, conv, std::move(crypto), "kcp_client", "", fec),
+KCPClientSession::KCPClientSession(asio::io_context& io, asio::ip::udp::endpoint server_addr,
+                                   std::shared_ptr<Crypto> crypto, uint32_t conv,
+                                   const FecConfig& fec, AdaptiveHooks hooks)
+    : KcpTunnel(io, conv, std::move(crypto), "kcp_client", "", fec, std::move(hooks)),
       server_addr_(std::move(server_addr)),
       connect_timer_(strand()),
       receive_backoff_timer_(strand()) {

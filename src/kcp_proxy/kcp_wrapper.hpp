@@ -94,6 +94,15 @@ public:
     // this is not a burst, and parity is skipped for it.
     std::uint32_t rto() const { return kcp_->rto(); }
 
+    // Re-apply ONLY the nodelay flag at runtime (interval/resend/nc stay as
+    // configured; NoDelay treats negatives as "leave unchanged"). nodelay=1
+    // pins rx_minrto to 30ms, nodelay=0 to 100ms -- see rto_floor.hpp for why
+    // the proxy moves between them on a per-path basis. Existing segments keep
+    // the deadline they were given; only future ones use the new floor.
+    void set_nodelay(int nodelay) {
+        kcp_->NoDelay(nodelay, -1, -1, -1);
+    }
+
     void configure();
 
 private:

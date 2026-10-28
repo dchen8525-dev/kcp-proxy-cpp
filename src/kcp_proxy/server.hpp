@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "crypto.hpp"
+#include "fec_parity.hpp"
 #include "kcp_session.hpp"
 #include "logger.hpp"
 #include "socks5.hpp"
@@ -14,6 +15,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -33,7 +35,10 @@ class KCPServer : public std::enable_shared_from_this<KCPServer> {
 public:
     KCPServer(asio::io_context& io, uint16_t port, std::string key,
               std::string host = "0.0.0.0",
-              const FecConfig& fec = FecConfig{});
+              const FecConfig& fec = FecConfig{},
+              // Opt-in adaptive policies. The defaults keep the pre-adaptive
+              // wire (always emit parity) and the 30ms RTO floor.
+              const AdaptiveSettings& adaptive = AdaptiveSettings{});
     ~KCPServer();
 
     void start();
@@ -88,6 +93,21 @@ private:
     // FEC parameters applied to every session this server accepts. Immutable
     // after construction (read from the -fec CLI flag), so it needs no lock.
     FecConfig fec_;
+
+    // Adaptive policies (FEC parity, RTO floor). Process-wide by
+    // design: the loss counters are process-wide and a server process only
+    // sends in one direction (towards its clients). Samples ride the existing
+    // 10ms update tick every FEC_PARITY_SAMPLE_TICKS, on tick_strand_, so each
+    // controller has exactly one writer and needs no lock.
+    std::shared_ptr<FecParityGate> parity_gate_;
+    std::unique_ptr<FecParityController> parity_ctl_;
+    std::shared_ptr<RtoFloorGate> rto_gate_;
+    std::unique_ptr<RtoFloorController> rto_ctl_;
+    int parity_ticks_ = 0;
+    AdaptiveHooks adaptive_hooks() const {
+        return AdaptiveHooks{parity_gate_, rto_gate_};
+    }
+    void sample_adaptive_policies();
 
     // Wipe the plaintext key from memory. Called after the key has been
     // fully consumed (sessions are created lazily, so this is invoked on the

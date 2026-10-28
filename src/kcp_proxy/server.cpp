@@ -6,6 +6,7 @@
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/socket_buffer.hpp"
 #include "kcp_proxy/target_allowlist.hpp"
+#include "kcp_proxy/time_util.hpp"
 #include <asio/read.hpp>
 #include <asio/write.hpp>
 #include <asio/connect.hpp>
@@ -32,9 +33,11 @@
 
 namespace kcp_proxy {
 
-KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
-                     std::string host, const FecConfig& fec)
-    : io_(io), port_(port), host_(std::move(host)),
+KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key, std::string host,
+                     const FecConfig& fec, const AdaptiveSettings& adaptive)
+    : io_(io),
+      port_(port),
+      host_(std::move(host)),
       key_(key),
       fec_(fec),
       // The UDP socket owns its own strand: it is a single shared object, and
@@ -51,7 +54,21 @@ KCPServer::KCPServer(asio::io_context& io, uint16_t port, std::string key,
       // here rather than relying on bind_executor at the call site so the timer
       // and its handler agree on the executor by construction.
       receive_backoff_timer_(udp_socket_.get_executor()),
-      update_tick_timer_(tick_strand_) {}
+      update_tick_timer_(tick_strand_) {
+    // Adaptive parity is meaningful here even without --fec: the server adapts
+    // its shard parameters per session (FEC_ADAPTIVE_DATA_SHARDS when it has
+    // none of its own), so a FEC-framed client still gets a session that can
+    // withhold parity.
+    if (adaptive.fec_parity) {
+        parity_gate_ = std::make_shared<FecParityGate>();
+        parity_ctl_ =
+            std::make_unique<FecParityController>(*parity_gate_, adaptive.fec_parity_tuning);
+    }
+    if (adaptive.rto_relax_sec > 0) {
+        rto_gate_ = std::make_shared<RtoFloorGate>();
+        rto_ctl_ = std::make_unique<RtoFloorController>(*rto_gate_, adaptive.rto_relax_sec);
+    }
+}
 
 KCPServer::~KCPServer() {
     stop();
@@ -875,34 +892,34 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
             // fresh random salt per session, so they never hit their own
             // tombstones; the salt is already known-good here (the packet
             // decrypted successfully).
-                if (rejection == RejectReason::None) {
-                    const byte_view salt = session_crypto->session_salt();
-                    const std::string salt_key(reinterpret_cast<const char*>(salt.data()),
-                                               salt.size());
-                    const auto now = std::chrono::steady_clock::now();
-                    const auto tomb = salt_tombstones_.find(salt_key);
-                    if (tomb != salt_tombstones_.end() && tomb->second > now) {
-                        rejection = RejectReason::ReplayedSalt;
-                    } else {
-                        // Shard parameters for an adapting session: the
-                        // operator's -fec when set (data flows even if the
-                        // client runs different values; only parity repair
-                        // needs agreement), else the documented default.
-                        const FecConfig session_fec =
-                            client_fec_framed
-                                ? (fec_.enabled() ? fec_
-                                                  : FecConfig{FEC_ADAPTIVE_DATA_SHARDS,
-                                                              FEC_ADAPTIVE_PARITY_SHARDS})
-                                : FecConfig{};
-                        if (client_fec_framed) {
-                            // Deferred: logging inside the sessions_mutex_ write
-                            // lock stalls every router/tick/sweep behind the
-                            // console write (the file's own rule, see the
-                            // stale_replaced note above).
-                            log_client_fec_framed = true;
-                            log_client_fec_value = session_fec;
-                        }
-                        session = std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto), sid, session_fec);
+            if (rejection == RejectReason::None) {
+                const byte_view salt = session_crypto->session_salt();
+                const std::string salt_key(reinterpret_cast<const char*>(salt.data()), salt.size());
+                const auto now = std::chrono::steady_clock::now();
+                const auto tomb = salt_tombstones_.find(salt_key);
+                if (tomb != salt_tombstones_.end() && tomb->second > now) {
+                    rejection = RejectReason::ReplayedSalt;
+                } else {
+                    // Shard parameters for an adapting session: the
+                    // operator's -fec when set (data flows even if the
+                    // client runs different values; only parity repair
+                    // needs agreement), else the documented default.
+                    const FecConfig session_fec =
+                        client_fec_framed ? (fec_.enabled() ? fec_
+                                                            : FecConfig{FEC_ADAPTIVE_DATA_SHARDS,
+                                                                        FEC_ADAPTIVE_PARITY_SHARDS})
+                                          : FecConfig{};
+                    if (client_fec_framed) {
+                        // Deferred: logging inside the sessions_mutex_ write
+                        // lock stalls every router/tick/sweep behind the
+                        // console write (the file's own rule, see the
+                        // stale_replaced note above).
+                        log_client_fec_framed = true;
+                        log_client_fec_value = session_fec;
+                    }
+                    session =
+                        std::make_shared<KCPSession>(io_, KCP_CONV, addr, std::move(session_crypto),
+                                                     sid, session_fec, adaptive_hooks());
                     // Record the tombstone only after the session exists: an
                     // insert that then lost make_shared() to an exception would
                     // blacklist a salt that was never accepted for the whole TTL.
@@ -1874,6 +1891,18 @@ void KCPServer::do_update_tick(const std::error_code& ec) {
         do_update_tick(e);
     });
 
+    // Adaptive-parity sampling rides the same 10ms chain and fires every
+    // FEC_PARITY_SAMPLE_MS worth of ticks. Doing it here (rather than in the
+    // 30s cleanup sweep) keeps the reaction to a retransmit -- i.e. turning
+    // parity back on -- within a couple of seconds on both ends. Runs on
+    // tick_strand_, so the controller has exactly one writer.
+    if (parity_ctl_ || rto_ctl_) {
+        if (++parity_ticks_ >= FEC_PARITY_SAMPLE_TICKS) {
+            parity_ticks_ = 0;
+            sample_adaptive_policies();
+        }
+    }
+
     // Phase 1: snapshot weak refs under the shared lock. Copying weak_ptr is
     // cheap and the lock is held only for the copy, so the UDP receive path
     // (which inserts sessions) and the cleanup sweep (which erases them)
@@ -1899,6 +1928,42 @@ void KCPServer::do_update_tick(const std::error_code& ec) {
             asio::dispatch(session->strand(), [ws]() mutable {
                 if (auto s = ws.lock()) s->on_update_tick();
             });
+        }
+    }
+}
+
+// One adaptive-parity sample (every FEC_PARITY_SAMPLE_TICKS of the 10ms tick).
+// INFO on a transition and only then: the switch is a rare lifecycle event of
+// the transport policy, and it is the only way an operator learns that FEC
+// parity silently stopped being emitted.
+void KCPServer::sample_adaptive_policies() {
+    const int64_t now = now_us();
+    if (parity_ctl_) {
+        const auto transition = parity_ctl_->sample(now);
+        if (transition == FecParityController::Transition::kToEconomy) {
+            LOG_INFO("server",
+                     fmt::format("FEC adaptive: parity off after {}s of clean download traffic "
+                                 "(no fast retransmits); a loss falls back to KCP retransmission",
+                                 parity_ctl_->probe_sec()));
+        } else if (transition == FecParityController::Transition::kToProtected) {
+            LOG_INFO("server",
+                     fmt::format("FEC adaptive: parity on - a client reported a retransmit; "
+                                 "staying protected for {}s",
+                                 parity_ctl_->hold_sec()));
+        }
+    }
+    if (rto_ctl_) {
+        const auto transition = rto_ctl_->sample(now);
+        if (transition == RtoFloorController::Transition::kToRelaxed) {
+            LOG_INFO("server",
+                     fmt::format("RTO adaptive: floor 30ms -> 100ms after {}s of clean download "
+                                 "traffic; queued datagrams are no longer mistaken for lost ones",
+                                 rto_ctl_->relax_sec()));
+        } else if (transition == RtoFloorController::Transition::kToLowLatency) {
+            LOG_INFO("server",
+                     fmt::format("RTO adaptive: floor 100ms -> 30ms - a client reported a "
+                                 "retransmit; staying low-latency for {}s",
+                                 rto_ctl_->hold_sec()));
         }
     }
 }

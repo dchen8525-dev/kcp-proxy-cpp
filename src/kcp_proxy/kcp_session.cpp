@@ -10,12 +10,10 @@
 
 namespace kcp_proxy {
 
-KCPSession::KCPSession(asio::io_context& io, uint32_t conv,
-                       asio::ip::udp::endpoint remote_addr,
-                       std::shared_ptr<Crypto> crypto,
-                       std::string session_id,
-                       const FecConfig& fec)
-    : KcpTunnel(io, conv, std::move(crypto), "kcp_session", session_id, fec),
+KCPSession::KCPSession(asio::io_context& io, uint32_t conv, asio::ip::udp::endpoint remote_addr,
+                       std::shared_ptr<Crypto> crypto, std::string session_id, const FecConfig& fec,
+                       AdaptiveHooks hooks)
+    : KcpTunnel(io, conv, std::move(crypto), "kcp_session", session_id, fec, std::move(hooks)),
       session_id_(std::move(session_id)),
       remote_addr_(std::move(remote_addr)) {
     // Mark the session running immediately (synchronously). Previously running_

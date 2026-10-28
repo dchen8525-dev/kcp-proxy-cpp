@@ -338,6 +338,69 @@ static_assert(FEC_WIRE_DATAGRAM_MAX + 28 /* IP + UDP headers */ <= 1500,
 constexpr int FEC_ADAPTIVE_DATA_SHARDS = 10;
 constexpr int FEC_ADAPTIVE_PARITY_SHARDS = 3;
 
+// ---------------------- Adaptive parity (opt-in, sender-local) --------------
+// FEC used to pay its 3/13 = 23% wire overhead unconditionally, including on a
+// path that loses nothing. Adaptive parity (on by default whenever FEC is
+// enabled) lets each endpoint stop emitting
+// parity shards while ITS OWN path is clean, without telling the peer and
+// without touching the wire format: the shard geometry (data:parity) stays
+// exactly as configured, so the peer's decoder keeps grouping by seqid and a
+// set that arrives with 10 data shards and 0 parity is a complete set (see
+// FecDecoder::Decode). A skipped set simply loses its repair capability; a loss
+// falls back to KCP retransmission, i.e. to the pre-FEC behaviour.
+//
+// Why the encoder is driven with rto=0 rather than a new codec entry point:
+// FecEncoder::Encode already skips parity when the previous data packet is
+// older than the rto window ("not a burst"), advancing the seqid by
+// parity_shards exactly as a parity emission would. Passing 0 makes every set
+// take that path, so no dependency patch is needed and the set boundary stays
+// aligned for the peer. tests/unit pins this contract so a codec upgrade
+// cannot break it silently.
+//
+// Seconds of clean traffic before dropping parity. Longer = fewer wrong
+// guesses on a flaky path, less gain on a clean one.
+constexpr int FEC_PARITY_PROBE_SEC = 60;
+// After any evidence of loss, stay protected this long before probing again.
+// It bounds the cost of a wrong downgrade to "one retransmit burst per hold".
+constexpr int FEC_PARITY_HOLD_SEC = 300;
+
+// Controller sampling cadence. Both ends evaluate one sample every ~2s: fast
+// enough to turn protection back on within a couple of seconds of a loss,
+// sparse enough that each sample carries many segments and the "idle vs clean"
+// distinction stays meaningful. The server counts update ticks instead of
+// arming a second timer, so the value is expressed in both units.
+constexpr int FEC_PARITY_SAMPLE_MS = 2000;
+constexpr int FEC_PARITY_SAMPLE_TICKS = FEC_PARITY_SAMPLE_MS / KCP_INTERVAL_MS;
+static_assert(FEC_PARITY_SAMPLE_TICKS > 0, "sample interval must span at least one KCP tick");
+
+// A sample window only counts as evidence of a clean path when it carried at
+// least this many KCP segments per second (~0.55 Mbit/s at 1400B). Without it,
+// an idle tunnel would "accumulate cleanliness" for free and a bulk transfer
+// that starts after a quiet minute would begin unprotected.
+//
+// Shared by every adaptive policy (fec_parity.hpp, rto_floor.hpp): "the window
+// carried real traffic" means the same thing to all of them.
+constexpr double ADAPTIVE_MIN_SEG_RATE = 50.0;
+// Historical name, kept because the FEC policy documented it first.
+constexpr double FEC_PARITY_MIN_SEG_RATE = ADAPTIVE_MIN_SEG_RATE;
+
+// -------- Adaptive RTO floor (see rto_floor.hpp) --------
+// KCP's nodelay mode pins the retransmission timeout floor at 30ms (kRtoNdl)
+// instead of 100ms. That floor is what makes a lost segment recover fast, and
+// it is also what makes a CLEAN fast path retransmit datagrams that were never
+// lost: a 1024-segment window is ~1.4 MB, which at 150 Mbit/s takes 75ms to
+// drain, so segments near the end of a burst pass their 30ms deadline while
+// still queued. Measured on loopback: 1355 retransmissions over 15001 segments
+// (9%), of which the peer received 1172 as DUPLICATES (snmp_repeat confirms it).
+// Raising the floor to 100ms removed all of them (retrans=0 repeat=0), at the
+// cost of slower recovery on a lossy path (~40% at 2% loss, worse at 8%).
+//
+// So the floor follows the path: 30ms while it is losing packets, 100ms only
+// after a sustained clean window. The relaxation is a reaction to evidence,
+// never a default, so a lossy link behaves exactly as it did before.
+constexpr int KCP_RTO_RELAX_SEC = 15;
+constexpr int KCP_RTO_HOLD_SEC = 60;
+
 struct FecConfig {
     int data_shards = 0;    // 0 = disabled
     int parity_shards = 0;  // 0 = disabled

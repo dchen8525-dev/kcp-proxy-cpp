@@ -857,6 +857,230 @@ TEST_CASE("test_fec_codec_repairs_lost_shards") {
     }
 }
 
+// ---------------------- adaptive parity (--fec-adaptive) --------------------
+// Two contracts hold the whole feature up:
+//   1. the codec's rto=0 path is exactly "skip this set's parity, keep the
+//      seqid advanced" -- the tunnel relies on it for the wire format, and the
+//      peer must still decode the NEXT set;
+//   2. the controller provably flips the gate on the measured signal and
+//      nothing else (clean traffic -> economy, a fast retransmit -> protected
+//      plus a hold, idle traffic -> no decision).
+
+TEST_CASE("test_fec_rto_zero_skips_parity_and_keeps_set_alignment") {
+    using kcp::internal::FecDecoder;
+    using kcp::internal::FecEncoder;
+
+    constexpr int kData = 10;
+    constexpr int kParity = 3;
+    auto encoder = FecEncoder::New(kData, kParity, 0);
+    auto decoder = FecDecoder::New(kData, kParity);
+    REQUIRE_MESSAGE(encoder != nullptr, "FecEncoder::New(10,3,0) must succeed");
+    REQUIRE_MESSAGE(decoder != nullptr, "FecDecoder::New(10,3) must succeed");
+
+    // --- Set 1: adaptive "economy" -- rto=0 means every packet is treated as
+    // "not part of a burst", which is the codec's documented SkipParity()
+    // branch. No parity packet may be emitted, and after 10 data packets the
+    // seqid must have advanced by data+parity = 13 (not 10): that advancement
+    // is what keeps the peer's seqid/data+parity grouping aligned.
+    std::vector<std::vector<uint8_t>> skipped_frames;
+    for (int i = 0; i < kData; i++) {
+        std::vector<uint8_t> frame(8 + 64);
+        for (size_t j = 0; j < 64; j++) {
+            frame[8 + j] = static_cast<uint8_t>(i * 7 + j);
+        }
+        std::vector<std::vector<uint8_t>> emitted;
+        encoder->Encode(frame.data(), frame.size(), 0, &emitted);
+        CHECK_MESSAGE(emitted.empty(), "rto=0 must emit no parity for the set");
+        skipped_frames.push_back(frame);
+    }
+    CHECK_MESSAGE(encoder->next() == static_cast<uint32_t>(kData + kParity),
+                  "a skipped set must still advance the seqid by data+parity");
+
+    // --- Set 2: protected -- parity comes back, and it must describe THIS set.
+    // If the skipped set had advanced the seqid by only data, or not at all, the
+    // encoder and a stock 10:3 decoder would disagree about where the set
+    // boundary is and the rebuild below would fail.
+    std::vector<std::vector<uint8_t>> protected_frames;
+    std::vector<std::vector<uint8_t>> parity;
+    for (int i = 0; i < kData; i++) {
+        std::vector<uint8_t> frame(8 + 64);
+        for (size_t j = 0; j < 64; j++) {
+            frame[8 + j] = static_cast<uint8_t>(100 + i * 3 + j);
+        }
+        std::vector<std::vector<uint8_t>> emitted;
+        // rto=500ms: back-to-back packets are one burst, so parity is built.
+        encoder->Encode(frame.data(), frame.size(), 500, &emitted);
+        protected_frames.push_back(frame);
+        for (auto& p : emitted)
+            parity.push_back(std::move(p));
+    }
+    CHECK_MESSAGE(parity.size() == static_cast<size_t>(kParity),
+                  "a protected 10:3 set must emit exactly 3 parity packets");
+    CHECK_MESSAGE(encoder->next() == static_cast<uint32_t>(2 * (kData + kParity)),
+                  "two complete sets must have consumed exactly two seqid spans");
+
+    // Feed every data packet of both sets, then set 2's parity minus one dropped
+    // data shard: exactly that shard must be rebuilt, byte-exact.
+    for (const auto& frame : skipped_frames) {
+        decoder->Decode(frame.data(), frame.size());
+    }
+    const size_t dropped = 4;
+    std::vector<std::vector<uint8_t>> rebuilt;
+    for (size_t i = 0; i < protected_frames.size(); i++) {
+        if (i == dropped) continue;
+        for (auto& shard :
+             decoder->Decode(protected_frames[i].data(), protected_frames[i].size())) {
+            rebuilt.push_back(std::move(shard));
+        }
+    }
+    for (const auto& p : parity) {
+        for (auto& shard : decoder->Decode(p.data(), p.size())) {
+            rebuilt.push_back(std::move(shard));
+        }
+    }
+    REQUIRE_MESSAGE(rebuilt.size() == 1,
+                    "exactly the one dropped shard of the protected set must be rebuilt");
+    const auto& shard = rebuilt.front();
+    REQUIRE(shard.size() >= 2);
+    const uint16_t declared =
+        static_cast<uint16_t>(shard[0]) | static_cast<uint16_t>(shard[1] << 8);
+    CHECK_MESSAGE(declared == 2 + 64, "rebuilt length field must count itself plus the payload");
+    for (size_t j = 0; j < 64; j++) {
+        CHECK_MESSAGE(shard[2 + j] == static_cast<uint8_t>(100 + dropped * 3 + j),
+                      "rebuilt payload must match the dropped original byte-for-byte");
+    }
+}
+
+TEST_CASE("test_fec_parity_controller_state_machine") {
+    FecParityGate gate;
+    CHECK_MESSAGE(gate.enabled(), "a fresh gate must allow parity (pre-adaptive default)");
+
+    FecParityTuning tuning;
+    tuning.probe_sec = 4;
+    tuning.hold_sec = 10;
+    tuning.min_seg_rate = 50.0;
+    FecParityController ctl(gate, tuning);
+    CHECK(ctl.probe_sec() == 4);
+
+    using Transition = FecParityController::Transition;
+    int64_t now = 1'000'000; // arbitrary monotonic origin, micros
+    uint64_t segs = 0;
+    uint64_t fast = 0;
+
+    // The first sample only establishes a baseline: it must never transition,
+    // however much history the counters already carry.
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+
+    // Two idle seconds: below min_seg_rate, so it counts as neither clean nor
+    // lossy. An idle tunnel must not "accumulate cleanliness" for free.
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    CHECK(ctl.clean_us() == 0);
+
+    // 2s of real traffic (400 segments = 200/s >= 50/s): half of the probe.
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    CHECK(gate.enabled());
+
+    // Another clean 2s reaches the 4s probe: parity goes off.
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kToEconomy);
+    CHECK_FALSE(gate.enabled());
+    CHECK(ctl.economy());
+
+    // One fast retransmit is enough to go back, immediately.
+    fast += 1;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kToProtected);
+    CHECK(gate.enabled());
+    CHECK_FALSE(ctl.economy());
+
+    // Inside the 10s hold clean traffic is ignored, so a single probe cannot
+    // start a new countdown early: 4 windows = 8s, still short of the hold.
+    for (int i = 0; i < 4; i++) {
+        segs += 400;
+        now += 2'000'000;
+        CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    }
+    CHECK(gate.enabled());
+
+    // Past the hold the clean clock restarts from zero: 2s is short of the
+    // 4s probe again, and only the following window downgrades.
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kToEconomy);
+    CHECK_FALSE(gate.enabled());
+}
+
+TEST_CASE("test_rto_floor_controller_state_machine") {
+    // The adaptive RTO floor is the fix for self-inflicted retransmissions: a
+    // 1024-segment window is ~1.4 MB, which at 150 Mbit/s takes 75ms to drain,
+    // so with the 30ms floor (nodelay=1) segments near the end of a burst are
+    // resent while still queued. Relaxing to 100ms removes them, but must only
+    // happen on evidence of a CLEAN path -- a lossy one keeps the fast floor.
+    RtoFloorGate gate;
+    CHECK_MESSAGE(gate.low_latency(), "a fresh gate must keep the 30ms floor");
+
+    RtoFloorController ctl(gate, /*relax_sec=*/4, /*hold_sec=*/10, /*min_seg_rate=*/50.0);
+    CHECK(ctl.relax_sec() == 4);
+
+    using Transition = RtoFloorController::Transition;
+    int64_t now = 1'000'000;
+    uint64_t segs = 0;
+    uint64_t fast = 0;
+
+    // Baseline sample: never transitions, and leaves the floor alone.
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    CHECK(gate.low_latency());
+
+    // Idle window: below min_seg_rate, so it does not count as clean.
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+
+    // 2s of real traffic: half the relax window, still low-latency.
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    CHECK(gate.low_latency());
+
+    // The second clean window reaches 4s: relax to the 100ms floor.
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kToRelaxed);
+    CHECK_FALSE(gate.low_latency());
+    CHECK(ctl.relaxed());
+
+    // One fast retransmit puts the 30ms floor back immediately, and starts the
+    // hold: clean traffic cannot relax it again until the hold expires.
+    fast += 1;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kToLowLatency);
+    CHECK(gate.low_latency());
+
+    for (int i = 0; i < 4; i++) { // 8s of clean traffic, hold is 10s
+        segs += 400;
+        now += 2'000'000;
+        CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+        CHECK(gate.low_latency());
+    }
+
+    // Past the hold the clean clock starts from zero: 2s is short of 4s, the
+    // following window relaxes again.
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kNone);
+    CHECK(gate.low_latency());
+    segs += 400;
+    now += 2'000'000;
+    CHECK(ctl.on_sample(segs, fast, now) == Transition::kToRelaxed);
+    CHECK_FALSE(gate.low_latency());
+}
+
 TEST_CASE("test_fec_frame_layout_at_crypto_reserve") {
     // The tunnel frames KCP datagrams at header_offset = FEC_CRYPTO_RESERVE,
     // i.e. the FEC header starts AFTER the 28-byte region the crypto layer

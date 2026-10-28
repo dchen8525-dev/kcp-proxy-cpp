@@ -30,6 +30,9 @@ struct ClientCliOptions {
     int sndwnd = KCP_SNDWND;
     int rcvwnd = KCP_RCVWND;
     int mtu = KCP_MTU;
+    int fec_probe_sec = FEC_PARITY_PROBE_SEC;
+    int fec_hold_sec = FEC_PARITY_HOLD_SEC;
+    int rto_relax_sec = KCP_RTO_RELAX_SEC;
 };
 
 // Rejects a FEC string the codec would not accept. Mirrors parse_fec_config's
@@ -89,6 +92,27 @@ std::optional<ClientCliOptions> parse_cli(int argc, char* argv[], int& exit_code
     app.add_option("-L,--log-level", o.log_level, "Log level: DEBUG, INFO, WARNING, ERROR")
         ->check(cli::log_level_validator())
         ->capture_default_str();
+    app.add_option("--fec-adaptive-probe", o.fec_probe_sec,
+                   "With FEC enabled (the default is on): stop emitting parity "
+                   "shards after this many seconds of clean upload traffic, and "
+                   "resume within seconds of a loss. Wire compatible (the peer "
+                   "needs no support): a skipped set simply has no repair "
+                   "capability, so a loss falls back to KCP retransmission. "
+                   "0 disables adaptive parity and always emits parity.")
+        ->check(CLI::Range(0, 3600))
+        ->capture_default_str();
+    app.add_option("--fec-adaptive-hold", o.fec_hold_sec,
+                   "Seconds to stay protected after evidence of loss")
+        ->check(CLI::Range(5, 3600))
+        ->capture_default_str();
+    app.add_option("--rto-adaptive-clean", o.rto_relax_sec,
+                   "Seconds of clean traffic before the KCP retransmission "
+                   "timeout floor relaxes from 30ms to 100ms, so datagrams "
+                   "merely queued behind a large send window are not resent as "
+                   "lost. Loss evidence restores 30ms within a sample; 0 keeps "
+                   "30ms forever.")
+        ->check(CLI::Range(0, 3600))
+        ->capture_default_str();
     app.add_option("--half-close-grace", o.half_close_grace_sec,
                    "Seconds a half-closed tunnel may go without target payload "
                    "before it is reclaimed")
@@ -138,17 +162,44 @@ int main(int argc, char* argv[]) {
     std::string& key = opts.key;
     cli::parse_log_level(opts.log_level);
 
+    // Adaptive parity only means something when this end actually frames FEC:
+    // with --fec off there is no parity to withhold, so refuse the combination
+    // loudly instead of accepting a flag that silently does nothing.
+    // Adaptive parity is ON by default: FEC is also opt-in, so this only
+    // changes the behaviour of an operator who enabled FEC, and what it changes
+    // is paying for redundancy on a path that measured clean. --fec-adaptive-probe
+    // 0 restores the always-protected wire.
+    AdaptiveSettings adaptive;
+    adaptive.fec_parity = opts.fec_probe_sec > 0;
+    adaptive.fec_parity_tuning =
+        FecParityTuning{opts.fec_probe_sec, opts.fec_hold_sec, ADAPTIVE_MIN_SEG_RATE};
+    adaptive.rto_relax_sec = opts.rto_relax_sec;
+
     try {
         asio::io_context io;
         asio::executor_work_guard<asio::io_context::executor_type> work_guard(io.get_executor());
         auto client = std::make_shared<KCPProxyClient>(io, opts.server_host, opts.server_port, key,
                                                        opts.listen_host, opts.listen_port,
-                                                       opts.half_close_grace_sec, fec);
+                                                       opts.half_close_grace_sec, fec, adaptive);
         cli::secure_wipe(key);
         client->start();
 
         LOG_INFO("main", fmt::format("KCP proxy client started, SOCKS5 on {}:{} fec={}",
                                      opts.listen_host, opts.listen_port, fec.to_string()));
+        if (adaptive.fec_parity && fec.enabled()) {
+            LOG_INFO(
+                "main",
+                fmt::format("FEC adaptive parity enabled: probe={}s hold={}s (drops parity while "
+                            "the upload path is clean)",
+                            adaptive.fec_parity_tuning.probe_sec,
+                            adaptive.fec_parity_tuning.hold_sec));
+        }
+        LOG_INFO("main",
+                 fmt::format(
+                     "RTO adaptive floor: {} (30ms while the upload path loses packets)",
+                     adaptive.rto_relax_sec > 0
+                         ? fmt::format("relaxes to 100ms after {}s clean", adaptive.rto_relax_sec)
+                         : std::string("disabled, always 30ms")));
 
         cli::setup_signal_handler(io, [client]() {
             client->stop();

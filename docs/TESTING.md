@@ -10,13 +10,40 @@ ctest --test-dir build -C Release --output-on-failure
 python tests/smoke/smoke_test.py
 ```
 
-`ctest` runs five tests:
+`ctest` runs eight tests:
 
 - `kcp_proxy_smoke` — the packaging / deployment smoke tests (same script CI runs).
 - `kcp_proxy_test` — the unit suite below.
 - `kcp_proxy_e2e_tunnel` — an offline end-to-end tunnel test (see below).
 - `kcp_proxy_e2e_robustness` — the negative/robustness suite (see below).
 - `kcp_proxy_e2e_adversarial` — the adversarial suite (see below).
+- `kcp_proxy_e2e_fec_loss` — FEC repair through an 8% lossy UDP relay (below).
+- `kcp_proxy_e2e_fec_adaptive` — adaptive parity: off on a clean path, on on a lossy one (below).
+- `kcp_proxy_e2e_rto_adaptive` — adaptive retransmission floor: 100ms on a clean path, 30ms on a lossy one (below).
+
+## FEC suites
+
+Both spawn the same server/client pair as `tunnel_e2e.py`, but put a userspace
+UDP relay between them that silently drops a fixed fraction of datagrams.
+
+`tests/e2e/fec_loss_e2e.py` proves the pair still delivers byte-exact payload at
+8% loss in both directions with `--fec 10:3`, and that the client's
+`fec_repaired` counter (DEBUG stats line) actually moves — a broken codec wiring
+would still pass the payload assertion via plain KCP retransmission. Phase 2
+repeats the transfer with FEC off as the control.
+
+`tests/e2e/fec_adaptive_e2e.py` proves the other half: adaptive parity is on by
+default once FEC is enabled, so with a 6s probe window a clean path must log
+`FEC adaptive: parity off` on both ends
+and end the session in `fec_parity=econ` with far fewer parity datagrams than
+3-per-10, while an 8% lossy path must stay in `full` protection and keep
+repairing. Both phases assert byte-exact delivery: adaptive parity changes how
+much redundancy rides along, never what is carried.
+
+`tests/e2e/rto_adaptive_e2e.py` covers the retransmission floor. On a clean path
+the client must log `RTO adaptive: floor 30ms -> 100ms` and end with `nodelay=0`
+in its stats line; under 8% loss the session must end at `nodelay=1`. Both phases
+assert byte-exact delivery.
 
 ## End-to-end tunnel test
 

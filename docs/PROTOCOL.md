@@ -158,7 +158,8 @@ unavailable, the reply uses `0.0.0.0:0`; it does not echo the target address.
 ## KCP Settings
 
 - `conv = 1`
-- `nodelay = 1`
+- `nodelay = 1`（初始值；`--rto-adaptive-clean` 会在链路持续干净后把重传超时下限放宽到
+  100ms，等价于临时切到 `nodelay = 0`。这是纯本端行为，不影响互通）
 - `interval = 10ms`
 - `fast resend = 5`
 - `nc = 1`

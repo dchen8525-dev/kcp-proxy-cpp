@@ -10,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -24,7 +25,11 @@ public:
                    std::string listen_host = "127.0.0.1",
                    uint16_t listen_port = 1080,
                    int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC,
-                   const FecConfig& fec = FecConfig{});
+                   const FecConfig& fec = FecConfig{},
+                   // Opt-in adaptive policies. The defaults keep the
+                   // pre-adaptive wire (always emit parity) and the 30ms RTO
+                   // floor (low-latency retransmission).
+                   const AdaptiveSettings& adaptive = AdaptiveSettings{});
     ~KCPProxyClient();
 
     void start();
@@ -80,6 +85,25 @@ private:
     // FEC parameters applied to every session this client opens. Immutable
     // after construction (from the -fec CLI flag / GUI config), no lock needed.
     FecConfig fec_;
+
+    // Adaptive policies (FEC parity, RTO floor). One decision
+    // per process for each: the counters they key on are process-wide and this
+    // process only ever sends in one direction (its upload), so a per-tunnel
+    // controller would re-learn the same fact once per TCP connection. The
+    // gates are shared with every tunnel; a controller is null unless the
+    // operator opted in, which is what keeps the default send path identical
+    // to the pre-adaptive code.
+    std::shared_ptr<FecParityGate> parity_gate_;
+    std::unique_ptr<FecParityController> parity_ctl_;
+    std::shared_ptr<RtoFloorGate> rto_gate_;
+    std::unique_ptr<RtoFloorController> rto_ctl_;
+    // What the tunnels should obey right now (null gates = policy off).
+    AdaptiveHooks adaptive_hooks() const {
+        return AdaptiveHooks{parity_gate_, rto_gate_};
+    }
+    // Drives both controllers; called from the 2s traffic heartbeat, so the
+    // sample cadence is the reporter's.
+    void sample_adaptive_policies();
 
     void wipe_key();
 

@@ -21,7 +21,7 @@ class KCPClientSession : public KcpTunnel {
 public:
     KCPClientSession(asio::io_context& io, asio::ip::udp::endpoint server_addr,
                      std::shared_ptr<Crypto> crypto, uint32_t conv = KCP_CONV,
-                     const FecConfig& fec = FecConfig{});
+                     const FecConfig& fec = FecConfig{}, AdaptiveHooks hooks = {});
     ~KCPClientSession() override;
 
     // Async-friendly: connect dispatches onto the strand so the upper layer

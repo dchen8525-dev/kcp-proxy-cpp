@@ -2,7 +2,9 @@
 
 #include "config.hpp"
 #include "crypto.hpp"
+#include "fec_parity.hpp"
 #include "kcp_wrapper.hpp"
+#include "rto_floor.hpp"
 #include "byte_view.hpp"
 #include "kcp/internal/constants.h"
 #include <asio.hpp>
@@ -25,6 +27,31 @@ class FecDecoder;
 }
 
 namespace kcp_proxy {
+
+// Per-process adaptive decisions a tunnel obeys. Both are read-only for a
+// tunnel and shared by every session, so a decision made once (by the client's
+// traffic timer or the server's update tick) applies immediately everywhere.
+// A null gate means "this policy is off", which is what keeps the default path
+// byte-identical to the pre-adaptive code.
+// Operator intent, resolved once at startup from the CLI. A policy is only
+// instantiated when it is asked for here, so the defaults reproduce the
+// pre-adaptive behaviour exactly.
+struct AdaptiveSettings {
+    // Drop FEC parity while the sending direction looks clean (on by default
+    // when FEC is enabled; --fec-adaptive-probe 0 turns the policy off).
+    bool fec_parity = false;
+    FecParityTuning fec_parity_tuning;
+    // Seconds of clean traffic before the RTO floor relaxes to 100ms
+    // (--rto-adaptive-clean); 0 keeps the 30ms floor forever.
+    int rto_relax_sec = KCP_RTO_RELAX_SEC;
+};
+
+struct AdaptiveHooks {
+    // May a tunnel emit FEC parity? (fec_parity.hpp)
+    std::shared_ptr<const FecParityGate> parity_gate;
+    // May a tunnel keep the aggressive 30ms RTO floor? (rto_floor.hpp)
+    std::shared_ptr<const RtoFloorGate> rto_floor_gate;
+};
 
 // Is this decrypted plaintext the 6-byte FEC header of a peer whose -fec is
 // enabled? [seqid(4)][type(2, little-endian)], type in {0xf1 data, 0xf2 parity,
@@ -57,6 +84,24 @@ struct SessionMetrics {
     // datagrams the network lost but FEC recovered). Zero forever when FEC is
     // disabled. Counted only when the rebuilt datagram was accepted by KCP.
     std::atomic<uint64_t> fec_repaired{0};
+
+    // FEC accounting, one increment per datagram actually put on the wire:
+    // fec_data_sent counts data shards, fec_parity_sent counts parity shards.
+    // Together they are the redundancy this tunnel is paying for:
+    //   wire overhead   = parity / (data + parity)
+    //   shard sets skipped = 1 - (parity / parity_shards)
+    //                          / (data / data_shards)
+    // The second form matters because the codec ALREADY skips parity for shard
+    // sets that are not a burst (FecEncoder::Encode's rto window), so a measured
+    // overhead well below parity/(data+parity) means that path is live and doing
+    // work. Both stay zero when FEC is disabled.
+    //
+    // Needed in addition to udp_tx_packets, which also counts the ACK-only
+    // datagrams the KCP state machine emits on its own: during a bidirectional
+    // transfer those inflate the packet count by ~15% and would understate the
+    // parity ratio.
+    std::atomic<uint64_t> fec_data_sent{0};
+    std::atomic<uint64_t> fec_parity_sent{0};
 
     // UDP datagram level (used for peer-to-peer loss localization): every
     // encrypted datagram handed to the peer counts as one TX, every datagram
@@ -171,8 +216,15 @@ public:
 
 protected:
     KcpTunnel(asio::io_context& io, uint32_t conv, std::shared_ptr<Crypto> crypto,
-              std::string log_module, std::string log_tag,
-              const FecConfig& fec = FecConfig{});
+              std::string log_module, std::string log_tag, const FecConfig& fec = FecConfig{},
+              AdaptiveHooks hooks = {});
+
+    // May this tunnel emit parity shards for the sets it completes? True unless
+    // an adaptive gate says the path has been clean and the operator opted in
+    // (see FEC_PARITY_* in config.hpp). Read once per emitted datagram.
+    bool parity_enabled() const {
+        return !hooks_.parity_gate || hooks_.parity_gate->enabled();
+    }
 
     // ------------------------- hooks for the concrete session ---------------
     // May the tunnel accept new application data? Checked off-strand, before a
@@ -367,6 +419,18 @@ protected:
     std::vector<uint8_t> fec_send_buf_;
     // Same type as kcp::internal::FecPacket (an alias for vector<uint8_t>).
     std::vector<std::vector<uint8_t>> fec_parity_;
+    // Adaptive-parity decision shared with every other tunnel of this process.
+    // Null unless the policy is enabled, which is what keeps
+    // the default path byte-identical to the pre-adaptive code.
+    AdaptiveHooks hooks_;
+    // Last nodelay mode pushed into kcp_ (true = 30ms floor). Strand-only: the
+    // comparison and the push both happen in flush_cycle.
+    bool rto_low_latency_applied_ = true;
+
+    // Push the adaptive RTO floor into the codec if the policy changed. Called
+    // from flush_cycle (strand-bound, every tick), so a policy flip reaches a
+    // live tunnel within one 10ms tick without any cross-thread wakeup.
+    void apply_rto_floor();
 };
 
 } // namespace kcp_proxy

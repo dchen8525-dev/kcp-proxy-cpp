@@ -18,11 +18,9 @@ namespace kcp_proxy {
 // the machinery shared with the client session.
 class KCPSession : public KcpTunnel {
 public:
-    KCPSession(asio::io_context& io, uint32_t conv,
-               asio::ip::udp::endpoint remote_addr,
-               std::shared_ptr<Crypto> crypto,
-               std::string session_id,
-               const FecConfig& fec = FecConfig{});
+    KCPSession(asio::io_context& io, uint32_t conv, asio::ip::udp::endpoint remote_addr,
+               std::shared_ptr<Crypto> crypto, std::string session_id,
+               const FecConfig& fec = FecConfig{}, AdaptiveHooks hooks = {});
     ~KCPSession() override;
 
     void start();
