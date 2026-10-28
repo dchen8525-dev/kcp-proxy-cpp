@@ -27,6 +27,9 @@ struct ClientCliOptions {
     uint16_t listen_port = 1080;
     int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC;
     std::string log_level = "INFO";
+    int sndwnd = KCP_SNDWND;
+    int rcvwnd = KCP_RCVWND;
+    int mtu = KCP_MTU;
 };
 
 // Rejects a FEC string the codec would not accept. Mirrors parse_fec_config's
@@ -70,6 +73,19 @@ std::optional<ClientCliOptions> parse_cli(int argc, char* argv[], int& exit_code
         ->check(cli::positive_decimal("PORT"))
         ->check(CLI::Range(1, 65535))
         ->capture_default_str();
+    app.add_option("--sndwnd", o.sndwnd,
+                   "KCP send window in segments (per session). Single-tunnel "
+                   "throughput is roughly sndwnd * (mtu-24) / RTT.")
+        ->check(CLI::Range(KCP_SNDWND_MIN, KCP_SNDWND_MAX))
+        ->capture_default_str();
+    app.add_option("--rcvwnd", o.rcvwnd, "KCP receive window in segments (per session)")
+        ->check(CLI::Range(KCP_RCVWND_MIN, KCP_RCVWND_MAX))
+        ->capture_default_str();
+    app.add_option("--mtu", o.mtu,
+                   "KCP datagram MTU in bytes. Keep both peers equal so FEC "
+                   "framing and MSS behave identically.")
+        ->check(CLI::Range(KCP_MTU_MIN, KCP_MTU_MAX))
+        ->capture_default_str();
     app.add_option("-L,--log-level", o.log_level, "Log level: DEBUG, INFO, WARNING, ERROR")
         ->check(cli::log_level_validator())
         ->capture_default_str();
@@ -110,6 +126,10 @@ int main(int argc, char* argv[]) {
     // parse_fec_config already accepted this text in the validator; parsing it
     // again here is what turns it into the shard pair (fails closed).
     FecConfig fec;
+
+    // Apply before any session can exist: the tuning is a process-global read
+    // by every KcpWrapper, and the startup "KCP config" log line renders it.
+    set_kcp_tuning(opts.sndwnd, opts.rcvwnd, opts.mtu);
     if (!opts.fec_text.empty() && !parse_fec_config(opts.fec_text, fec)) {
         std::cerr << "Error: --fec " << opts.fec_text << " is invalid" << std::endl;
         return 1;

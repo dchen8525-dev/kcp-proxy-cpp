@@ -88,6 +88,20 @@ private:
     bool is_active() const override { return running_.load(); }
     void shut_down() override;
     void handle_kcp_output(byte_view data) override;
+    void handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,
+                                 size_t count) override;
+    // Put one flush cycle's encrypted datagrams on the wire. On Linux the
+    // whole burst goes out in chunked ::sendmmsg calls (MSG_DONTWAIT, so the
+    // strand never blocks); anything the kernel would not take immediately
+    // falls back to the per-datagram async path below, which also serves
+    // every other platform unchanged.
+    void send_batch_wire(std::vector<std::vector<uint8_t>> batch);
+    // The pre-batching send path: one pooled buffer, one async_send, one
+    // completion. Shared by the single-datagram hook and the batch fallback.
+    void start_async_send(std::vector<uint8_t> data);
+    // Encrypt one framed datagram into a pooled buffer. Returns false (with
+    // a deferred teardown posted) when the crypto layer refused.
+    bool encrypt_for_wire(byte_view data, std::vector<uint8_t>& out);
 
     void on_connect(std::function<void(bool)> handler);
     void send_connect_hello();

@@ -1,8 +1,10 @@
 #include "kcp_proxy/kcp_session.hpp"
+#include "kcp_proxy/buffer_pool.hpp"
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
 #include "kcp_proxy/time_util.hpp"
 #include <fmt/format.h>
+#include <numeric>
 #include <cstring>
 #include <utility>
 
@@ -33,8 +35,8 @@ KCPSession::~KCPSession() {
     state_flags_.fetch_and(static_cast<uint8_t>(~RUNNING));
 }
 
-void KCPSession::set_send_callback(std::function<void(std::vector<uint8_t>)> cb) {
-    send_callback_ = std::move(cb);
+void KCPSession::set_send_callback(std::function<void(std::vector<std::vector<uint8_t>>)> cb) {
+    send_batch_callback_ = std::move(cb);
 }
 
 void KCPSession::start() {
@@ -57,7 +59,7 @@ void KCPSession::stop() {
         // Clear send callback FIRST to prevent any further output during flush.
         // This ensures no packets are sent after session closes, avoiding
         // crypto counter mismatch with client's new session.
-        send_callback_ = nullptr;
+        send_batch_callback_ = nullptr;
 
         // Drop a parked tcp->kcp loop: its hook holds the target socket and the
         // read buffer, and a stale hook could restart a loop on a stopped
@@ -66,8 +68,8 @@ void KCPSession::stop() {
 
         // Clear pending flags to prevent race conditions when session is
         // reused or when checking stale sessions in the map.
-        state_flags_.fetch_and(static_cast<uint8_t>(
-            ~(FORWARD_READ_PENDING | SOCKS5_READ_PENDING | CONNECT_PENDING)));
+        state_flags_.fetch_and(
+            static_cast<uint8_t>(~(FORWARD_READ_PENDING | SOCKS5_READ_PENDING | CONNECT_PENDING)));
 
         // Notify any pending reader so its caller can clean up rather than
         // wait forever for data that will never arrive.
@@ -83,25 +85,29 @@ void KCPSession::shut_down() {
 }
 
 void KCPSession::receive_data(byte_view encrypted_data, std::function<void()> after) {
-    LOG_DEBUG("kcp_session", fmt::format("{}: receive_data {} encrypted bytes",
-              session_id_, encrypted_data.size()));
+    LOG_DEBUG("kcp_session", fmt::format("{}: receive_data {} encrypted bytes", session_id_,
+                                         encrypted_data.size()));
     // Copy now: the caller's buffer may be reused before the strand picks up.
-    std::vector<uint8_t> copy(encrypted_data.begin(), encrypted_data.end());
+    // The copy lands in a pooled buffer so ingress datagrams do not malloc.
+    auto holder = std::make_shared<PooledBuffer>(datagram_pool());
+    holder->data.assign(encrypted_data.begin(), encrypted_data.end());
     auto self = shared_from_this();
-    asio::dispatch(strand(), [this, self, data = std::move(copy),
-                              after = std::move(after)]() mutable {
-        on_receive(std::move(data));
-        if (after) after();
-    });
+    asio::dispatch(strand(),
+                   [this, self, holder = std::move(holder), after = std::move(after)]() mutable {
+                       on_receive(holder->data);
+                       if (after) after();
+                   });
 }
 
-void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
+void KCPSession::on_receive(byte_view encrypted) {
     if (!is_running()) {
-        LOG_WARNING("kcp_session", fmt::format("{}: on_receive while not running, dropping {} bytes",
-                    session_id_, encrypted.size()));
+        LOG_WARNING("kcp_session",
+                    fmt::format("{}: on_receive while not running, dropping {} bytes", session_id_,
+                                encrypted.size()));
         return;
     }
-    std::error_code ec = crypto_->decrypt_into(byte_view(encrypted.data(), encrypted.size()), decrypt_buf_);
+    std::error_code ec =
+        crypto_->decrypt_into(byte_view(encrypted.data(), encrypted.size()), decrypt_buf_);
     metrics_.udp_rx_packets.fetch_add(1, std::memory_order_relaxed);
     metrics_.udp_rx_bytes.fetch_add(encrypted.size(), std::memory_order_relaxed);
     if (ec == crypto_errors::errc::replay) {
@@ -116,8 +122,9 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
         // Per-packet attacker-controlled noise: the decrypt_errors metric
         // above remains the INFO-visible signal, so keep the log at DEBUG
         // (AGENTS.md §8: no per-packet spam at INFO).
-        LOG_DEBUG("kcp_session", fmt::format("FAIL_STAGE=DECRYPT_FAILED ERROR={} CLIENT_ENDPOINT={} TARGET=-",
-                    ec.message(), session_id_));
+        LOG_DEBUG("kcp_session",
+                  fmt::format("FAIL_STAGE=DECRYPT_FAILED ERROR={} CLIENT_ENDPOINT={} TARGET=-",
+                              ec.message(), session_id_));
         return;
     }
     touch_activity();
@@ -125,8 +132,9 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
     // Plaintext bytes, matching bytes_sent (KCP payload in on_send) -- the
     // encrypted datagram size is already tracked separately as udp_rx_bytes.
     metrics_.bytes_received.fetch_add(decrypt_buf_.size(), std::memory_order_relaxed);
-    LOG_DEBUG("kcp_session", fmt::format("{}: decrypt OK {} -> {} bytes, peek_before={}",
-              session_id_, encrypted.size(), decrypt_buf_.size(), kcp_.peek_size()));
+    LOG_DEBUG("kcp_session",
+              fmt::format("{}: decrypt OK {} -> {} bytes, peek_before={}", session_id_,
+                          encrypted.size(), decrypt_buf_.size(), kcp_.peek_size()));
     int input_ret = feed_kcp_input(decrypt_buf_.data(), decrypt_buf_.size());
     if (input_ret < 0) {
         // Throttled: any peer holding the session key can make kcp input
@@ -138,11 +146,10 @@ void KCPSession::on_receive(std::vector<uint8_t> encrypted) {
         // shards of the set and already queued them into KCP. Bailing out
         // would leave those bytes unread until the next 10ms tick and skip
         // the parked-write resume, so the post-processing below always runs.
-        log_kcp_input_rejected("kcp_session", session_id_, input_ret,
-                               decrypt_buf_.size());
+        log_kcp_input_rejected("kcp_session", session_id_, input_ret, decrypt_buf_.size());
     } else {
         LOG_DEBUG("kcp_session", fmt::format("{}: kcp input ok, peek_after={} wait_send={}",
-                  session_id_, kcp_.peek_size(), kcp_.wait_send()));
+                                             session_id_, kcp_.peek_size(), kcp_.wait_send()));
     }
     try_fulfill_read();
     // ikcp_input() is where the peer's ACKs are consumed, and consuming an ACK
@@ -199,8 +206,15 @@ void KCPSession::on_update_tick() {
     // visible over time without spamming INFO (see AGENTS.md #8).
     maybe_log_stats();
 
-    kcp_.update(now_kcp_ms());
-    kcp_.flush();
+    // Idle skip: with nothing queued or in flight and no ACKs/probes pending,
+    // update()+flush() produce zero bytes -- the scheduler pass is pure CPU.
+    // wait_send() covers everything in flight (segments awaiting RTO-driven
+    // retransmit) and needs_flush_ covers what only Input can set (queued
+    // ACKs, window probes), so a session that just received a datagram still
+    // flushes on the very next tick, exactly like before.
+    if (kcp_.wait_send() > 0 || needs_flush_.exchange(false, std::memory_order_relaxed)) {
+        flush_cycle(now_kcp_ms());
+    }
     if (pending_read_handler_) {
         try_fulfill_read();
     }
@@ -246,47 +260,86 @@ void KCPSession::on_update_tick() {
 
     // Re-arm is NOT done here. This method is driven by KCPServer's single
     // shared 10ms tick timer (do_update_tick), which collapses N per-session
-    // timer-heap entries into one. Fixed 10ms cadence: we intentionally do
-    // NOT use ikcp_check() to sleep longer when idle -- with the vendored
-    // ikcp, ikcp_update always advances ts_flush to current+interval, so
-    // ikcp_check returns ~10ms ahead even when idle; there is no idle-sleep
-    // win to be had.
+    // timer-heap entries into one. The update/flush pair above is skipped for
+    // fully idle sessions; the cadence itself stays 10ms. (ikcp_check is
+    // still useless here: update advances ts_flush to current+interval even
+    // when idle, so Check() always reports ~10ms ahead.)
+}
+
+bool KCPSession::encrypt_for_wire(byte_view data, std::vector<uint8_t>& out) {
+    // Pooled buffer: the datagram moves through send_batch_callback_ into the
+    // UDP send and returns to the freelist when the async send completes.
+    out = datagram_pool().acquire();
+    std::error_code ec = crypto_->encrypt_into(data, out);
+    if (!ec) return true;
+    metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
+    datagram_pool().release(std::move(out));
+    // An undeliverable segment is a permanent hole in the byte stream, so
+    // keeping the session alive would only hang the peer's connection
+    // until its idle sweep -- e.g. once the nonce counter reaches
+    // MAX_COUNTER every encrypt refuses, and an EVP failure is equally
+    // unrecoverable. Tear down now; the client reconnects with a fresh
+    // session (and a fresh counter base). stop() is safe to run from
+    // inside the kcp flush: it clears the send callback (silencing the
+    // remaining fragments of this flush via the not-active branch) and never
+    // re-enters KCP.
+    LOG_ERROR("kcp_session",
+              fmt::format("{}: encrypt error ({}), closing session", session_id_, ec.message()));
+    shut_down();
+    return false;
 }
 
 void KCPSession::handle_kcp_output(byte_view data) {
     // Post-stop this fires for every remaining fragment of an in-flight flush
     // (stop() clears the send callback first, and the encrypt-failure teardown
     // below lands here too), so it is expected teardown noise, not a fault.
-    if (!is_active() || !send_callback_) {
-        LOG_DEBUG("kcp_session", fmt::format("{}: << handle_kcp_output - not running, dropping {} bytes",
-                    session_id_, data.size()));
+    if (!is_active() || !send_batch_callback_) {
+        LOG_DEBUG("kcp_session",
+                  fmt::format("{}: << handle_kcp_output - not running, dropping {} bytes",
+                              session_id_, data.size()));
         return;
     }
-    LOG_DEBUG("kcp_session", fmt::format("{}: handle_kcp_output {} bytes -> encrypt",
-              session_id_, data.size()));
+    LOG_DEBUG("kcp_session",
+              fmt::format("{}: handle_kcp_output {} bytes -> encrypt", session_id_, data.size()));
     std::vector<uint8_t> encrypted;
-    std::error_code ec = crypto_->encrypt_into(data, encrypted);
-    if (ec) {
-        metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
-        // An undeliverable segment is a permanent hole in the byte stream, so
-        // keeping the session alive would only hang the peer's connection
-        // until its idle sweep -- e.g. once the nonce counter reaches
-        // MAX_COUNTER every encrypt refuses, and an EVP failure is equally
-        // unrecoverable. Tear down now; the client reconnects with a fresh
-        // session (and a fresh counter base). stop() is safe to run from
-        // inside the kcp flush: it clears the send callback (silencing the
-        // remaining fragments of this flush via the branch above) and never
-        // re-enters KCP.
-        LOG_ERROR("kcp_session", fmt::format("{}: encrypt error ({}), closing session",
-                  session_id_, ec.message()));
-        shut_down();
-        return;
-    }
-    LOG_DEBUG("kcp_session", fmt::format("{}: encrypted -> {} bytes -> send_callback",
-              session_id_, encrypted.size()));
+    if (!encrypt_for_wire(data, encrypted)) return;
+    LOG_DEBUG("kcp_session", fmt::format("{}: encrypted -> {} bytes -> send_callback", session_id_,
+                                         encrypted.size()));
     metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
     metrics_.udp_tx_bytes.fetch_add(encrypted.size(), std::memory_order_relaxed);
-    send_callback_(std::move(encrypted));
+    // Single-datagram emission (teardown paths, anything outside a flush
+    // cycle): still one wire batch of size one.
+    std::vector<std::vector<uint8_t>> one;
+    one.push_back(std::move(encrypted));
+    send_batch_callback_(std::move(one));
+}
+
+void KCPSession::handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,
+                                         size_t count) {
+    if (!is_active() || !send_batch_callback_) {
+        LOG_DEBUG("kcp_session",
+                  fmt::format("{}: << handle_kcp_output_batch - not running, dropping {} datagrams",
+                              session_id_, count));
+        return;
+    }
+    LOG_DEBUG("kcp_session", fmt::format("{}: handle_kcp_output_batch {} datagrams -> encrypt",
+                                         session_id_, count));
+    std::vector<std::vector<uint8_t>> encrypted;
+    encrypted.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        std::vector<uint8_t> buf;
+        if (!encrypt_for_wire(datagrams[i], buf)) return; // shut_down already ran
+        metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
+        metrics_.udp_tx_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
+        encrypted.push_back(std::move(buf));
+    }
+    LOG_DEBUG("kcp_session", fmt::format("{}: encrypted {} datagrams ({} bytes) -> batched send",
+                                         session_id_, encrypted.size(),
+                                         std::accumulate(encrypted.begin(), encrypted.end(),
+                                                         size_t{0}, [](size_t s, const auto& v) {
+                                                             return s + v.size();
+                                                         })));
+    send_batch_callback_(std::move(encrypted));
 }
 
 } // namespace kcp_proxy

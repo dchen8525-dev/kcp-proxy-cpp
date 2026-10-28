@@ -1,5 +1,6 @@
 #include "kcp_proxy/server.hpp"
 #include "kcp_proxy/address.hpp"
+#include "kcp_proxy/buffer_pool.hpp"
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/config.hpp"
 #include "kcp_proxy/logger.hpp"
@@ -14,6 +15,14 @@
 #include <mswsock.h>
 // SIO_UDP_CONNRESET and the disable_udp_connreset() wrapper live in
 // socket_buffer.hpp, which both ends include (see its comment for why).
+#endif
+#if defined(__linux__)
+// sendmmsg/recvmmsg for the batched wire paths, sockaddr_in/_in6 for the
+// drain endpoint decode, MSG_DONTWAIT/MSG_NOSIGNAL, errno.
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #endif
 #include <algorithm>
 #include <chrono>
@@ -112,6 +121,15 @@ void KCPServer::start() {
     LOG_INFO("server", fmt::format("SIO_UDP_CONNRESET disabled (wsa_rc={})", wsa_rc));
 #endif
 
+#if defined(__linux__)
+    // Scratch storage for the recvmmsg drain (one slot per drainable
+    // datagram). UDP_DRAIN_BATCH_MAX * UDP_RECV_BUF_SIZE = 1 MiB resident,
+    // strand-confined, allocated once per server.
+    drain_bufs_.assign(UDP_DRAIN_BATCH_MAX, std::vector<uint8_t>(UDP_RECV_BUF_SIZE, 0));
+    drain_addrs_.assign(UDP_DRAIN_BATCH_MAX, sockaddr_storage{});
+    drain_lens_.assign(UDP_DRAIN_BATCH_MAX, 0);
+#endif
+
     running_ = true;
 
     cleanup_timer_.expires_after(std::chrono::seconds(30));
@@ -129,12 +147,17 @@ void KCPServer::start() {
     const auto bound_ep = udp_socket_.local_endpoint(bind_ec);
     const uint16_t bound_port = bind_ec ? port_ : bound_ep.port();
     LOG_INFO("server", fmt::format("listening on {}:{}", host_, bound_port));
+#if defined(__linux__)
+    const char* udp_recv_mode = "recvmmsg-drain(256)";
+#else
+    const std::string udp_recv_mode = fmt::format("{}", UDP_RECV_SLOTS);
+#endif
     LOG_INFO("server",
              fmt::format("diagnostics udp_bind={} udp_port={} udp_recv_slots={}"
                          " crypto=AES-128-GCM/HKDF-SHA256"
                          " socks5_mode=CONNECT_ONLY udp_associate=unsupported"
                          " log_level={}",
-                         host_, bound_port, UDP_RECV_SLOTS, log_level_name(current_log_level())));
+                         host_, bound_port, udp_recv_mode, log_level_name(current_log_level())));
     LOG_INFO("server", kcp_config_line());
     LOG_INFO("server", fec_config_line(fec_));
     const std::string fec_mode =
@@ -215,10 +238,131 @@ void KCPServer::stop() {
 
 void KCPServer::do_receive() {
     if (!running_) return;
+#if defined(__linux__)
+    arm_receive_drain();
+#else
     for (size_t i = 0; i < UDP_RECV_SLOTS; ++i) {
         arm_receive_slot(i);
     }
+#endif
 }
+
+#if defined(__linux__)
+void KCPServer::arm_receive_drain() {
+    // One outstanding readiness wait replaces the 16 outstanding receives of
+    // the slot model. Initiated through the socket's strand like every other
+    // socket operation (start() calls do_receive() off the strand).
+    auto self = shared_from_this();
+    asio::dispatch(udp_socket_.get_executor(), [this, self]() {
+        if (!running_) return;
+        udp_socket_.async_wait(asio::ip::udp::socket::wait_read,
+                               asio::bind_executor(udp_socket_.get_executor(),
+                                                   [this, self](const std::error_code& ec) {
+                                                       handle_receive_drain(ec);
+                                                   }));
+    });
+}
+
+void KCPServer::handle_receive_drain(const std::error_code& wait_ec) {
+    if (wait_ec == asio::error::operation_aborted || !running_) return;
+    if (wait_ec) {
+        // Readiness wait itself failed: same throttled park as the slot path.
+        uint32_t suppressed = 0;
+        if (recv_error_log_.should_log(suppressed)) {
+            LOG_ERROR("server", fmt::format("UDP readiness wait error: {}{}", wait_ec.message(),
+                                            throttle_suffix(suppressed)));
+        }
+        // Reuse the slot backoff timer: it re-arms via arm_receive_slot in the
+        // slot model, so it is only meaningful here if we re-arm the drain
+        // with it. Keep it simple: a bounded retry through the same timer.
+        if (!recv_backoff_armed_) {
+            recv_backoff_armed_ = true;
+            auto self = shared_from_this();
+            receive_backoff_timer_.expires_after(std::chrono::milliseconds(10));
+            receive_backoff_timer_.async_wait(asio::bind_executor(
+                udp_socket_.get_executor(), [this, self](const std::error_code& timer_ec) {
+                    recv_backoff_armed_ = false;
+                    if (!timer_ec && running_) arm_receive_drain();
+                }));
+        }
+        return;
+    }
+
+    // Drain phase: read everything the kernel currently holds (bounded by
+    // UDP_DRAIN_BATCH_MAX) BEFORE routing any of it, so the kernel buffer
+    // cannot overflow while route_datagram() runs its allocations and strand
+    // dispatches -- the same handler/drain decoupling the slot model buys,
+    // with one recvmmsg per 64 datagrams instead of one recvmsg per datagram.
+    int fd = udp_socket_.native_handle();
+    size_t drained = 0;
+    bool transient_error = false;
+    while (running_ && drained < UDP_DRAIN_BATCH_MAX) {
+        const size_t want = std::min(UDP_DRAIN_BATCH_MAX - drained, UDP_BATCH_MAX);
+        struct mmsghdr msgs[UDP_BATCH_MAX];
+        struct iovec iov[UDP_BATCH_MAX];
+        for (size_t i = 0; i < want; ++i) {
+            iov[i].iov_base = drain_bufs_[drained + i].data();
+            iov[i].iov_len = drain_bufs_[drained + i].size();
+            std::memset(&msgs[i], 0, sizeof(msgs[i]));
+            msgs[i].msg_hdr.msg_name = &drain_addrs_[drained + i];
+            msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
+            msgs[i].msg_hdr.msg_iov = &iov[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        ssize_t n = ::recvmmsg(fd, msgs, static_cast<unsigned int>(want), MSG_DONTWAIT, nullptr);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            transient_error = true;
+            break;
+        }
+        for (int i = 0; i < n; ++i) {
+            drain_lens_[drained + i] = msgs[i].msg_len;
+        }
+        drained += static_cast<size_t>(n);
+        if (static_cast<size_t>(n) < want) break; // drained
+    }
+    if (!running_) return; // stop() raced the drain; the socket is gone
+
+    // Route phase. Same per-datagram logic as handle_receive: containment
+    // (route_datagram never throws out), zero-length drops, and the running_
+    // check happen inside route_datagram's callees as before.
+    for (size_t i = 0; i < drained; ++i) {
+        const size_t len = drain_lens_[i];
+        if (len == 0 || len > drain_bufs_[i].size()) continue;
+        // Decode the source endpoint. Only AF_INET/AF_INET6 can arrive on a
+        // UDP socket; anything else (never seen in practice) drops the frame.
+        const sockaddr_storage& ss = drain_addrs_[i];
+        asio::ip::udp::endpoint endpoint;
+        if (ss.ss_family == AF_INET) {
+            const auto* sin = reinterpret_cast<const sockaddr_in*>(&ss);
+            endpoint.address(asio::ip::address_v4(ntohl(sin->sin_addr.s_addr)));
+            endpoint.port(ntohs(sin->sin_port));
+        } else if (ss.ss_family == AF_INET6) {
+            const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+            asio::ip::address_v6::bytes_type bytes{};
+            std::memcpy(bytes.data(), sin6->sin6_addr.s6_addr, bytes.size());
+            endpoint.address(asio::ip::address_v6(bytes, sin6->sin6_scope_id));
+            endpoint.port(ntohs(sin6->sin6_port));
+        } else {
+            continue;
+        }
+        LOG_DEBUG("server", fmt::format("UDP recv {} bytes from {}:{}", len,
+                                        endpoint.address().to_string(), endpoint.port()));
+        route_datagram(endpoint, byte_view(drain_bufs_[i].data(), len));
+    }
+
+    if (transient_error) {
+        uint32_t suppressed = 0;
+        int err = errno; // recvmmsg failed outside EAGAIN/EINTR
+        if (recv_error_log_.should_log(suppressed)) {
+            LOG_ERROR("server", fmt::format("UDP receive error: {}{}", std::strerror(err),
+                                            throttle_suffix(suppressed)));
+        }
+    }
+    arm_receive_drain();
+}
+#endif // __linux__
 
 void KCPServer::arm_receive_slot(size_t index) {
     // Initiate through the socket's strand. Callers are already on it (every
@@ -239,11 +383,10 @@ void KCPServer::arm_receive_slot(size_t index) {
             // state it touches -- auth_attempts_window_, the LogThrottles, the
             // backoff flag -- is only safe if that is guaranteed rather than
             // inferred.
-            asio::bind_executor(
-                udp_socket_.get_executor(),
-                [this, self, index](const std::error_code& ec, size_t bytes) {
-                    handle_receive(index, ec, bytes);
-                }));
+            asio::bind_executor(udp_socket_.get_executor(),
+                                [this, self, index](const std::error_code& ec, size_t bytes) {
+                                    handle_receive(index, ec, bytes);
+                                }));
     });
 }
 
@@ -780,10 +923,10 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                     // dropping the datagram is then the right answer. Same
                     // reason drained_cb_ is a weak_ptr (see start_forwarding).
                     session->set_send_callback(
-                        [w = weak_from_this(), addr](std::vector<uint8_t> data) {
+                        [w = weak_from_this(), addr](std::vector<std::vector<uint8_t>> data) {
                             auto server = w.lock();
                             if (!server) return;
-                            server->send_to_client(addr, std::move(data));
+                            server->send_batch_to_client(addr, std::move(data));
                         });
                     sessions_[sid] = session;
                     total_sessions = sessions_.size();
@@ -1347,10 +1490,9 @@ void KCPServer::send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t r
     session->send_data(byte_view(data.data(), data.size()));
 }
 
-void KCPServer::forward_tcp_to_kcp(std::string session_id,
-                                    std::shared_ptr<KCPSession> session,
-                                    std::shared_ptr<asio::ip::tcp::socket> tcp_socket,
-                                    std::shared_ptr<std::vector<uint8_t>> buf) {
+void KCPServer::forward_tcp_to_kcp(std::string session_id, std::shared_ptr<KCPSession> session,
+                                   std::shared_ptr<asio::ip::tcp::socket> tcp_socket,
+                                   std::shared_ptr<std::vector<uint8_t>> buf) {
     if (!session) {
         LOG_ERROR("server", session_id + ": forward_tcp_to_kcp - no session");
         close_connection(session_id, "tcp2kcp_no_session");
@@ -1362,8 +1504,8 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
     // ever ran on more than one thread.
     if (!session->strand().running_in_this_thread()) {
         auto self = shared_from_this();
-        asio::dispatch(session->strand(), [this, self, session_id = std::move(session_id),
-                                           session, tcp_socket, buf]() mutable {
+        asio::dispatch(session->strand(), [this, self, session_id = std::move(session_id), session,
+                                           tcp_socket, buf]() mutable {
             forward_tcp_to_kcp(std::move(session_id), session, tcp_socket, buf);
         });
         return;
@@ -1407,10 +1549,11 @@ void KCPServer::forward_tcp_to_kcp(std::string session_id,
     // KcpTunnel::park_write) -- sleeping on a fixed timer and reading one buffer
     // per wakeup is what pinned every tunnel to ~3 Mbps on a 190ms path.
     // Safe to read wait_send here because we are on the strand.
-    if (session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD) {
-        LOG_DEBUG("server",
-                  fmt::format("{}: backpressure (wait_send={} >= threshold={}), parking read",
-                              session_id, session->wait_send(), KCP_BACKPRESSURE_THRESHOLD));
+    if (session->wait_send() >= kcp_tuning().backpressure_threshold()) {
+        LOG_DEBUG(
+            "server",
+            fmt::format("{}: backpressure (wait_send={} >= threshold={}), parking read", session_id,
+                        session->wait_send(), kcp_tuning().backpressure_threshold()));
         // The hook is stored INSIDE the session, so it must hold neither the
         // session nor the server strongly: either would be a reference cycle
         // (session -> hook -> session, and server -> sessions_ -> session ->
@@ -1872,7 +2015,9 @@ void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr, std::vector<
     LOG_DEBUG("server", fmt::format("send_to_client: sending {} bytes to {}:{}", data.size(),
                                     addr.address().to_string(), addr.port()));
 
-    auto buf = std::make_shared<std::vector<uint8_t>>(std::move(data));
+    // Pooled holder: one fused allocation per datagram (control block +
+    // holder); the buffer itself recycles when the async send completes.
+    auto buf = make_pooled_send(std::move(data));
     // Initiation is routed through the socket's strand. This is called from a
     // per-session strand (the session's send callback), while the receive path
     // re-arms on the io_context; with -T > 1 those are different threads, and
@@ -1883,25 +2028,93 @@ void KCPServer::send_to_client(const asio::ip::udp::endpoint& addr, std::vector<
         if (!running_ || !udp_socket_.is_open()) {
             return;
         }
-        udp_socket_.async_send_to(
-            asio::buffer(*buf), addr,
-            [buf, addr, this, self](const std::error_code& ec, size_t bytes_sent) {
-                if (ec && ec != asio::error::operation_aborted) {
-                    // One completion per datagram, so an unthrottled line
-                    // here is one line per packet whenever sends fail.
-                    uint32_t suppressed = 0;
-                    if (send_error_log_.should_log(suppressed)) {
-                        LOG_ERROR("server", fmt::format("FAIL_STAGE=UDP_SEND_FAILED ERROR={}"
-                                                        " CLIENT_ENDPOINT={}:{} TARGET=-{}",
-                                                        ec.message(), addr.address().to_string(),
-                                                        addr.port(), throttle_suffix(suppressed)));
-                    }
-                } else if (!ec) {
-                    LOG_DEBUG("server", fmt::format("UDP sent {} bytes to {}:{}", bytes_sent,
-                                                    addr.address().to_string(), addr.port()));
-                }
-            });
+        initiate_send_to(addr, buf);
     });
+}
+
+void KCPServer::send_batch_to_client(const asio::ip::udp::endpoint& addr,
+                                     std::vector<std::vector<uint8_t>> batch) {
+    if (batch.empty()) return;
+    if (batch.size() == 1) {
+        // Degenerate burst: identical to the single-datagram path.
+        send_to_client(addr, std::move(batch[0]));
+        return;
+    }
+    LOG_DEBUG("server", fmt::format("send_batch_to_client: {} datagrams to {}:{}", batch.size(),
+                                    addr.address().to_string(), addr.port()));
+    auto self = shared_from_this();
+    asio::dispatch(udp_socket_.get_executor(), [this, self, batch = std::move(batch), addr]() {
+        if (!running_ || !udp_socket_.is_open()) {
+            return;
+        }
+#if defined(__linux__)
+        // Chunked sendmmsg: the whole burst leaves in ~batch/64 syscalls
+        // instead of one per datagram. MSG_DONTWAIT keeps the strand
+        // non-blocking; whatever the kernel queue refuses right now falls
+        // through to the per-datagram async path, which parks on writability
+        // instead of spinning.
+        int fd = udp_socket_.native_handle();
+        size_t idx = 0;
+        while (idx < batch.size()) {
+            const size_t n = std::min(batch.size() - idx, UDP_BATCH_MAX);
+            struct mmsghdr msgs[UDP_BATCH_MAX];
+            struct iovec iov[UDP_BATCH_MAX];
+            for (size_t i = 0; i < n; ++i) {
+                iov[i].iov_base = batch[idx + i].data();
+                iov[i].iov_len = batch[idx + i].size();
+                std::memset(&msgs[i], 0, sizeof(msgs[i]));
+                msgs[i].msg_hdr.msg_name = const_cast<void*>(addr.data());
+                msgs[i].msg_hdr.msg_namelen = static_cast<socklen_t>(addr.size());
+                msgs[i].msg_hdr.msg_iov = &iov[i];
+                msgs[i].msg_hdr.msg_iovlen = 1;
+            }
+            ssize_t sent = ::sendmmsg(fd, msgs, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                sent = 0; // nothing accepted this round: remainder goes async
+            }
+            if (sent < 0) break; // unexpected: let the async path surface it
+            for (size_t i = 0; i < static_cast<size_t>(sent); ++i) {
+                datagram_pool().release(std::move(batch[idx + i]));
+            }
+            idx += static_cast<size_t>(sent);
+            if (static_cast<size_t>(sent) < n) break;
+        }
+        LOG_DEBUG("server", fmt::format("sendmmsg: {} of {} datagrams accepted by the kernel", idx,
+                                        batch.size()));
+        for (size_t i = idx; i < batch.size(); ++i) {
+            initiate_send_to(addr, make_pooled_send(std::move(batch[i])));
+        }
+        return;
+#endif
+        // Non-Linux (and the Linux fallback for unsent datagrams is above, so
+        // this only runs off-Linux): per-datagram async initiation, unchanged
+        // from the pre-batching behavior.
+        for (auto& d : batch) {
+            initiate_send_to(addr, make_pooled_send(std::move(d)));
+        }
+    });
+}
+
+void KCPServer::initiate_send_to(const asio::ip::udp::endpoint& addr,
+                                 std::shared_ptr<std::vector<uint8_t>> buf) {
+    udp_socket_.async_send_to(
+        asio::buffer(*buf), addr,
+        [buf, addr, this, self = shared_from_this()](const std::error_code& ec, size_t bytes_sent) {
+            if (ec && ec != asio::error::operation_aborted) {
+                // One completion per datagram, so an unthrottled line
+                // here is one line per packet whenever sends fail.
+                uint32_t suppressed = 0;
+                if (send_error_log_.should_log(suppressed)) {
+                    LOG_ERROR("server", fmt::format("FAIL_STAGE=UDP_SEND_FAILED ERROR={}"
+                                                    " CLIENT_ENDPOINT={}:{} TARGET=-{}",
+                                                    ec.message(), addr.address().to_string(),
+                                                    addr.port(), throttle_suffix(suppressed)));
+                }
+            } else if (!ec) {
+                LOG_DEBUG("server", fmt::format("UDP sent {} bytes to {}:{}", bytes_sent,
+                                                addr.address().to_string(), addr.port()));
+            }
+        });
 }
 
 uint8_t KCPServer::get_error_reply_code(const std::error_code& ec) {

@@ -884,10 +884,11 @@ void KCPProxyClient::forward_client_to_kcp(std::shared_ptr<asio::ip::tcp::socket
     // KcpTunnel::park_write). Mirrors the server's forward_tcp_to_kcp; the fixed
     // timer this replaces capped every tunnel at one FWD_BUF_SIZE read per
     // 4*KCP_INTERVAL_MS, i.e. ~3 Mbps regardless of the path.
-    if (session->wait_send() >= KCP_BACKPRESSURE_THRESHOLD) {
-        LOG_DEBUG("client", fmt::format("forward_client_to_kcp: backpressure (wait_send={} >= "
-                                        "threshold={}), parking read",
-                                        session->wait_send(), KCP_BACKPRESSURE_THRESHOLD));
+    if (session->wait_send() >= kcp_tuning().backpressure_threshold()) {
+        LOG_DEBUG("client",
+                  fmt::format("forward_client_to_kcp: backpressure (wait_send={} >= "
+                              "threshold={}), parking read",
+                              session->wait_send(), kcp_tuning().backpressure_threshold()));
         // Weak refs only: the hook lives in the session and must not create a
         // cycle back to it (or to the client object that owns it).
         std::weak_ptr<KCPClientSession> weak_session = session;
@@ -910,8 +911,9 @@ void KCPProxyClient::forward_client_to_kcp(std::shared_ptr<asio::ip::tcp::socket
                 // Session died while parked (idle timeout, server restart,
                 // handshake failure). Same reasoning as above: the app must
                 // see its socket close rather than hang until it writes.
-                LOG_DEBUG("client", "forward_client_to_kcp: resumed on a dead "
-                                    "session, closing local socket");
+                LOG_DEBUG("client",
+                          "forward_client_to_kcp: resumed on a dead "
+                          "session, closing local socket");
                 std::error_code ignored;
                 client_socket->close(ignored);
                 return;
@@ -922,9 +924,11 @@ void KCPProxyClient::forward_client_to_kcp(std::shared_ptr<asio::ip::tcp::socket
     }
 
     auto self = shared_from_this();
-    client_socket->async_read_some(asio::buffer(*buf),
-        asio::bind_executor(session->strand(),
-        [this, self, client_socket, session, buf, guard](const std::error_code& ec, size_t bytes) mutable {
+    client_socket->async_read_some(
+        asio::buffer(*buf),
+        asio::bind_executor(session->strand(), [this, self, client_socket, session, buf, guard](
+                                                   const std::error_code& ec,
+                                                   size_t bytes) mutable {
             if (ec == asio::error::eof) {
                 LOG_INFO("client", "client disconnected (EOF)");
                 // Half-close, mirroring the server's target-EOF path: the local

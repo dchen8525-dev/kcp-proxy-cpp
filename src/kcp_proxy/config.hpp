@@ -150,6 +150,22 @@ constexpr size_t SOCKS5_REPLY_BUF_SIZE = 512;
 // the default), which is negligible next to the buffers it protects.
 constexpr size_t UDP_RECV_SLOTS = 16;
 
+// Max datagrams per batched Linux syscall: one ::sendmmsg call on the send
+// side (a flush cycle walks its burst in chunks of this size) and one
+// ::recvmmsg call per drain round on the receive side. 64 keeps the on-stack
+// mmsghdr/iovec arrays at a few KiB while amortizing one syscall over a
+// window-sized burst.
+constexpr size_t UDP_BATCH_MAX = 64;
+
+// Linux receive drain: max datagrams read from the kernel buffer per
+// readability event before routing starts. Reading them all BEFORE routing
+// keeps the drain decoupled from handler cost (the same property the
+// UDP_RECV_SLOTS arming provides on other platforms), and one event now costs
+// ~4 recvmmsg calls instead of 16 recvmsg calls -- fewer syscalls, and the
+// kernel buffer cannot overflow between two of our reads unless the peer
+// burst exceeds 256 datagrams within one handler invocation.
+constexpr size_t UDP_DRAIN_BATCH_MAX = 256;
+
 // UDP socket kernel buffer sizes (SO_RCVBUF / SO_SNDBUF). The OS defaults are
 // typically far too small for KCP over a lossy WAN link: when the kernel buffer
 // overflows, the OS silently drops UDP datagrams, which KCP then mistakes for
@@ -167,11 +183,9 @@ constexpr int UDP_SO_SNDBUF_BYTES = 4 * 1024 * 1024;
 // of segments; otherwise ikcp_send fails (it returns -1 once
 // snd_nxt - snd_una >= snd_wnd, i.e. wait_send() >= KCP_SNDWND) and on_send
 // tears the session down mid-transfer instead of backpressuring.
-constexpr int KCP_MAX_SEGMENTS_PER_MSG =
-    static_cast<int>((FWD_BUF_SIZE + (KCP_MTU - KCP_SEGMENT_OVERHEAD) - 1) /
-                     (KCP_MTU - KCP_SEGMENT_OVERHEAD));
-constexpr int KCP_BACKPRESSURE_THRESHOLD =
-    KCP_SNDWND - KCP_MAX_SEGMENTS_PER_MSG - 8;
+constexpr int KCP_MAX_SEGMENTS_PER_MSG = static_cast<int>(
+    (FWD_BUF_SIZE + (KCP_MTU - KCP_SEGMENT_OVERHEAD) - 1) / (KCP_MTU - KCP_SEGMENT_OVERHEAD));
+constexpr int KCP_BACKPRESSURE_THRESHOLD = KCP_SNDWND - KCP_MAX_SEGMENTS_PER_MSG - 8;
 
 // Hysteresis band for resuming a parked write loop, in whole messages.
 // When KCP's send queue is full the tcp->kcp loop parks (see
@@ -187,13 +201,73 @@ constexpr int KCP_BACKPRESSURE_BURST_MSGS = 4;
 // drain point. Kept strictly below KCP_BACKPRESSURE_THRESHOLD and above zero
 // for every legal window size.
 constexpr int KCP_BACKPRESSURE_RESUME_THRESHOLD =
-    KCP_BACKPRESSURE_THRESHOLD -
-    KCP_BACKPRESSURE_BURST_MSGS * KCP_MAX_SEGMENTS_PER_MSG;
+    KCP_BACKPRESSURE_THRESHOLD - KCP_BACKPRESSURE_BURST_MSGS * KCP_MAX_SEGMENTS_PER_MSG;
 
 static_assert(KCP_BACKPRESSURE_RESUME_THRESHOLD > 0,
               "KCP_SNDWND too small for the backpressure hysteresis band");
 static_assert(KCP_BACKPRESSURE_RESUME_THRESHOLD < KCP_BACKPRESSURE_THRESHOLD,
               "resume watermark must sit below the park threshold");
+
+// ------------------------- Runtime KCP tuning (CLI) -------------------------
+// The constants above are defaults; --sndwnd/--rcvwnd/--mtu override them once
+// at startup, before any session exists, so the process-global tuning below
+// needs no synchronization. Everything derived from the window/MTU (the
+// backpressure watermarks, the per-message segment bound) is computed from the
+// live tuning rather than the constants, because a runtime window smaller than
+// KCP_BACKPRESSURE_THRESHOLD would otherwise make the park threshold sit ABOVE
+// ikcp_send's refusal point: the tcp->kcp loop would never park and on_send
+// would tear sessions down mid-transfer instead of backpressuring.
+//
+// Wire compatibility: windows are per-endpoint and may be asymmetric. MTU is
+// also per-endpoint (the receiver accepts any segment size), but keep both
+// peers equal so FEC framing and MSS behave identically.
+struct KcpTuning {
+    int sndwnd = KCP_SNDWND;
+    int rcvwnd = KCP_RCVWND;
+    int mtu = KCP_MTU;
+
+    // Largest whole FWD_BUF_SIZE message measured in segments at the live MSS
+    // (mirrors the KCP_MAX_SEGMENTS_PER_MSG derivation above).
+    int max_segments_per_msg() const {
+        const int mss = mtu - KCP_SEGMENT_OVERHEAD;
+        return static_cast<int>((FWD_BUF_SIZE + mss - 1) / mss);
+    }
+    int backpressure_threshold() const {
+        return sndwnd - max_segments_per_msg() - 8;
+    }
+    int backpressure_resume() const {
+        return backpressure_threshold() - KCP_BACKPRESSURE_BURST_MSGS * max_segments_per_msg();
+    }
+};
+
+inline KcpTuning& kcp_tuning() {
+    static KcpTuning tuning;
+    return tuning;
+}
+
+// Bounds. Window minimum keeps the hysteresis band positive at the smallest
+// legal MTU (MSS 552 -> 30 segments per message -> 4*30 + 30 + 8 = 158 needed;
+// 256 leaves margin). Window maximum bounds worst-case per-session memory
+// (4096 segments x ~1.4 KB x both ends of the band). MTU spans Ethernet
+// minimum (576) to jumbo frames (9000); larger values would also exceed the
+// 8 KiB datagram-pool recycling bound and inflate FEC_DATAGRAM_MAX buffers.
+constexpr int KCP_SNDWND_MIN = 256;
+constexpr int KCP_SNDWND_MAX = 4096;
+constexpr int KCP_RCVWND_MIN = 256;
+constexpr int KCP_RCVWND_MAX = 4096;
+constexpr int KCP_MTU_MIN = 576;
+constexpr int KCP_MTU_MAX = 9000;
+
+inline int clamp_kcp_value(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+inline void set_kcp_tuning(int sndwnd, int rcvwnd, int mtu) {
+    auto& t = kcp_tuning();
+    t.sndwnd = clamp_kcp_value(sndwnd, KCP_SNDWND_MIN, KCP_SNDWND_MAX);
+    t.rcvwnd = clamp_kcp_value(rcvwnd, KCP_RCVWND_MIN, KCP_RCVWND_MAX);
+    t.mtu = clamp_kcp_value(mtu, KCP_MTU_MIN, KCP_MTU_MAX);
+}
 
 // Crypto configuration
 constexpr size_t NONCE_SIZE = 12;
@@ -384,15 +458,18 @@ inline constexpr char KCP_CONTROL_FIN[] = "KCP_PROXY_FIN_V1";
 inline constexpr char KCP_CONTROL_KEEPALIVE[] = "KCP_PROXY_KEEPALIVE_V1";
 
 // One-line summary of the KCP settings actually in force, rendered from the
-// constants above. Server, client and (eventually) the Android CPP_REMOTE peer
-// log this exact string at startup so a mismatch between two ends of a tunnel
-// is visible in the logs instead of showing up as a mysterious handshake
-// failure. Keep the field order stable — it is greppable output.
+// live tuning (defaults equal the constants above; --sndwnd/--rcvwnd/--mtu
+// change what this prints, so the log always reflects the wire behaviour).
+// Server, client and (eventually) the Android CPP_REMOTE peer log this exact
+// string at startup so a mismatch between two ends of a tunnel is visible in
+// the logs instead of showing up as a mysterious handshake failure. Keep the
+// field order stable — it is greppable output.
 inline std::string kcp_config_line() {
+    const KcpTuning& t = kcp_tuning();
     return fmt::format(
         "KCP config conv={} mtu={} nodelay={} interval={} resend={} nc={} "
         "sndWnd={} rcvWnd={} timeout={}s",
-        KCP_CONV, KCP_MTU, KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC, KCP_SNDWND, KCP_RCVWND,
+        KCP_CONV, t.mtu, KCP_NODELAY, KCP_INTERVAL_MS, KCP_RESEND, KCP_NC, t.sndwnd, t.rcvwnd,
         KCP_TIMEOUT_SEC);
 }
 

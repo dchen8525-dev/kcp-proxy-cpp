@@ -1,4 +1,5 @@
 #include "kcp_proxy/kcp_client_session.hpp"
+#include "kcp_proxy/buffer_pool.hpp"
 #include "kcp_proxy/byte_view.hpp"
 #include "kcp_proxy/logger.hpp"
 
@@ -10,6 +11,12 @@
 #include <mswsock.h>
 // SIO_UDP_CONNRESET and the disable_udp_connreset() wrapper live in
 // socket_buffer.hpp, which the server includes too.
+#endif
+#if defined(__linux__)
+// sendmmsg / MSG_DONTWAIT / MSG_NOSIGNAL for the batched wire send.
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #endif
 #include <algorithm>
 #include <cstring>
@@ -208,8 +215,7 @@ void KCPClientSession::send_connect_hello() {
         // connect timer) that could complete it.
         throw std::runtime_error(fmt::format("KCP handshake send failed, ret={}", send_ret));
     }
-    kcp_.update(now_kcp_ms());
-    kcp_.flush();
+    flush_cycle(now_kcp_ms());
 }
 
 void KCPClientSession::close() {
@@ -236,8 +242,7 @@ void KCPClientSession::on_close() {
     // It is still best-effort: the UDP socket closes immediately below, so only
     // segments that flush synchronously into async sends actually leave.
     try {
-        kcp_.update(now_kcp_ms());
-        kcp_.flush();
+        flush_cycle(now_kcp_ms());
     } catch (...) {}
 
     running_.store(false);
@@ -292,8 +297,12 @@ void KCPClientSession::on_update_tick() {
         }
     }
 
-    kcp_.update(now_kcp_ms());
-    kcp_.flush();
+    // Idle skip, same contract as KCPSession::on_update_tick: wait_send()
+    // covers segments in flight, needs_flush_ covers the ACKs and probes only
+    // Input can queue, so skipping a fully idle session changes no wire byte.
+    if (kcp_.wait_send() > 0 || needs_flush_.exchange(false, std::memory_order_relaxed)) {
+        flush_cycle(now_kcp_ms());
+    }
     if (pending_read_handler_) try_fulfill_read();
 
     // Safety net for a parked client->kcp write loop (see
@@ -310,9 +319,9 @@ void KCPClientSession::on_update_tick() {
 
     // Re-arm is NOT done here: this method is driven by KCPProxyClient's
     // single shared 10ms tick timer (do_update_tick), which collapses N
-    // per-session timer-heap entries into one. Fixed 10ms cadence -- we
-    // intentionally do NOT use ikcp_check to sleep longer when idle (see
-    // KCPSession::on_update_tick).
+    // per-session timer-heap entries into one. The cadence stays 10ms; fully
+    // idle sessions skip only the update/flush pass (see above, and
+    // KCPSession::on_update_tick for why ikcp_check is no help either).
 }
 
 void KCPClientSession::do_udp_receive() {
@@ -424,48 +433,139 @@ void KCPClientSession::on_receive(byte_view packet) {
     maybe_resume_write();
 }
 
+bool KCPClientSession::encrypt_for_wire(byte_view data, std::vector<uint8_t>& out) {
+    // Encrypt straight into a pooled buffer that backs the UDP send: a
+    // steady-state packet costs one fused allocation (the holder), the buffer
+    // itself recycles when the send completes.
+    out = datagram_pool().acquire();
+    std::error_code ec = crypto_->encrypt_into(data, out);
+    if (!ec) return true;
+    metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
+    datagram_pool().release(std::move(out));
+    // An undeliverable segment is a permanent hole in the byte stream, so
+    // the session must be torn down rather than left to hang until the
+    // idle timeout (e.g. once the nonce counter reaches MAX_COUNTER every
+    // encrypt refuses). The shutdown is DEFERRED via post(): this callback
+    // runs from inside a kcp flush -- including on_close()'s best-effort
+    // final flush, whose own failing segments would re-enter shut_down()
+    // and recurse if it ran synchronously. The latched flag keeps one
+    // failure to one log line + one teardown request.
+    if (!encrypt_teardown_.exchange(true)) {
+        LOG_ERROR("kcp_client", "encrypt error (" + ec.message() + "), closing session");
+        // shared_from_this() yields shared_ptr<KcpTunnel>; the posted
+        // teardown needs the derived type so the protected shut_down()
+        // stays accessible through the object expression.
+        auto self = std::static_pointer_cast<KCPClientSession>(shared_from_this());
+        asio::post(strand(), [self]() {
+            self->shut_down();
+        });
+    }
+    return false;
+}
+
 void KCPClientSession::handle_kcp_output(byte_view data) {
     if (!udp_socket_ || !running_.load()) {
         LOG_DEBUG("kcp_client", "handle_kcp_output - session not running");
         return;
     }
     LOG_DEBUG("kcp_client", fmt::format("handle_kcp_output {} bytes -> encrypt", data.size()));
-    // Encrypt straight into the buffer that will back the async UDP send, so a
-    // packet costs one allocation instead of two (encrypted + send_buf).
-    auto send_buf = std::make_shared<std::vector<uint8_t>>();
-    std::error_code ec = crypto_->encrypt_into(data, *send_buf);
-    if (ec) {
-        metrics_.encrypt_errors.fetch_add(1, std::memory_order_relaxed);
-        // An undeliverable segment is a permanent hole in the byte stream, so
-        // the session must be torn down rather than left to hang until the
-        // idle timeout (e.g. once the nonce counter reaches MAX_COUNTER every
-        // encrypt refuses). The shutdown is DEFERRED via post(): this callback
-        // runs from inside a kcp flush -- including on_close()'s best-effort
-        // final flush, whose own failing segments would re-enter shut_down()
-        // and recurse if it ran synchronously. The latched flag keeps one
-        // failure to one log line + one teardown request.
-        if (!encrypt_teardown_.exchange(true)) {
-            LOG_ERROR("kcp_client", "encrypt error (" + ec.message() + "), closing session");
-            // shared_from_this() yields shared_ptr<KcpTunnel>; the posted
-            // teardown needs the derived type so the protected shut_down()
-            // stays accessible through the object expression.
-            auto self = std::static_pointer_cast<KCPClientSession>(shared_from_this());
-            asio::post(strand(), [self]() { self->shut_down(); });
-        }
+    std::vector<uint8_t> encrypted;
+    if (!encrypt_for_wire(data, encrypted)) return;
+    LOG_DEBUG("kcp_client",
+              fmt::format("encrypted -> {} bytes, sending UDP to {}:{}", encrypted.size(),
+                          server_addr_.address().to_string(), server_addr_.port()));
+    metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
+    metrics_.udp_tx_bytes.fetch_add(encrypted.size(), std::memory_order_relaxed);
+    start_async_send(std::move(encrypted));
+}
+
+void KCPClientSession::handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,
+                                               size_t count) {
+    if (!udp_socket_ || !running_.load()) {
+        LOG_DEBUG(
+            "kcp_client",
+            fmt::format("handle_kcp_output_batch - not running, dropping {} datagrams", count));
         return;
     }
-    LOG_DEBUG("kcp_client",
-              fmt::format("encrypted -> {} bytes, sending UDP to {}:{}", send_buf->size(),
-                          server_addr_.address().to_string(), server_addr_.port()));
+    LOG_DEBUG("kcp_client", fmt::format("handle_kcp_output_batch {} datagrams -> encrypt", count));
+    std::vector<std::vector<uint8_t>> encrypted;
+    encrypted.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        std::vector<uint8_t> buf;
+        if (!encrypt_for_wire(datagrams[i], buf)) return; // teardown already posted
+        metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
+        metrics_.udp_tx_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
+        encrypted.push_back(std::move(buf));
+    }
+    send_batch_wire(std::move(encrypted));
+}
 
-    metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
-    metrics_.udp_tx_bytes.fetch_add(send_buf->size(), std::memory_order_relaxed);
+void KCPClientSession::send_batch_wire(std::vector<std::vector<uint8_t>> batch) {
+    if (!udp_socket_ || !running_.load()) return;
+#if defined(__linux__)
+    if (batch.size() > 1 && udp_socket_->is_open()) {
+        // One flush cycle can carry a window's worth of segments (plus FEC
+        // parity); walk it in UDP_BATCH_MAX-sized sendmmsg chunks. MSG_DONTWAIT
+        // keeps the strand non-blocking: whatever the kernel queue refuses
+        // right now falls back to the async path below, which parks on socket
+        // writability instead of busy-looping.
+        int fd = udp_socket_->native_handle();
+        size_t idx = 0;
+        bool fast_path_ok = true;
+        while (idx < batch.size()) {
+            const size_t n = std::min(batch.size() - idx, UDP_BATCH_MAX);
+            struct mmsghdr msgs[UDP_BATCH_MAX];
+            struct iovec iov[UDP_BATCH_MAX];
+            for (size_t i = 0; i < n; ++i) {
+                iov[i].iov_base = batch[idx + i].data();
+                iov[i].iov_len = batch[idx + i].size();
+                std::memset(&msgs[i], 0, sizeof(msgs[i]));
+                // Connected socket: no msg_name, the kernel uses the peer.
+                msgs[i].msg_hdr.msg_iov = &iov[i];
+                msgs[i].msg_hdr.msg_iovlen = 1;
+            }
+            ssize_t sent = ::sendmmsg(fd, msgs, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                sent = 0; // nothing accepted this round: remainder goes async
+            }
+            if (sent < 0) {
+                // Unexpected failure (e.g. EMSGSIZE): let the per-datagram async
+                // path surface the real error completion for the remainder.
+                fast_path_ok = false;
+                break;
+            }
+            for (size_t i = 0; i < static_cast<size_t>(sent); ++i) {
+                datagram_pool().release(std::move(batch[idx + i]));
+            }
+            idx += static_cast<size_t>(sent);
+            if (static_cast<size_t>(sent) < n) break;
+        }
+        LOG_DEBUG("kcp_client", fmt::format("sendmmsg: {} of {} datagrams accepted by the kernel",
+                                            idx, batch.size()));
+        // Whatever the kernel queue refused (or a failed fast path left over)
+        // goes through the per-datagram async path, which parks on writability.
+        for (size_t i = idx; i < batch.size(); ++i)
+            start_async_send(std::move(batch[i]));
+        return;
+    }
+#endif
+    for (auto& d : batch)
+        start_async_send(std::move(d));
+}
 
+void KCPClientSession::start_async_send(std::vector<uint8_t> data) {
+    if (!udp_socket_ || !running_.load()) return;
+    auto buf = make_pooled_send(std::move(data));
     auto self = shared_from_this();
+    // NOTE: copy-capture, not a move init-capture. `asio::buffer(*buf)`
+    // and the lambda below are arguments of the same call, and MSVC evaluates
+    // them right-to-left: a `buf = std::move(buf)` capture empties the
+    // shared_ptr before buffer() dereferences it (SIGSEGV, caught by ASAN). The
+    // holder is refcounted anyway, so a copy costs one atomic increment.
     udp_socket_->async_send(
-        asio::buffer(*send_buf),
-        asio::bind_executor(strand(),
-            [this, self, send_buf](const std::error_code& ec, size_t bytes_sent) {
+        asio::buffer(*buf),
+        asio::bind_executor(
+            strand(), [this, self, buf](const std::error_code& ec, size_t bytes_sent) {
                 if (ec && ec != asio::error::operation_aborted) {
                     // One completion per datagram: an unthrottled line here is
                     // one line per packet whenever the path is failing.

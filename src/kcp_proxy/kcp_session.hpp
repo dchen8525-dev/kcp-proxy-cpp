@@ -119,14 +119,15 @@ public:
     // same source endpoint after a client reconnect).
     bool salt_matches(byte_view packet) const { return crypto_->matches_salt(packet); }
 
-    // Takes ownership of the (already encrypted) datagram so the server's UDP
-    // send can move it without an extra copy.
-    void set_send_callback(std::function<void(std::vector<uint8_t>)> cb);
+    // Takes ownership of the (already encrypted) datagrams of one flush cycle
+    // so the server's UDP send can batch them onto the wire without a copy
+    // per datagram.
+    void set_send_callback(std::function<void(std::vector<std::vector<uint8_t>>)> cb);
 
 private:
     std::string session_id_;
     asio::ip::udp::endpoint remote_addr_;
-    std::function<void(std::vector<uint8_t>)> send_callback_;
+    std::function<void(std::vector<std::vector<uint8_t>>)> send_batch_callback_;
 
     // Packed atomic flags to reduce cache line contention
     std::atomic<uint8_t> state_flags_{0};
@@ -151,9 +152,16 @@ private:
     bool is_active() const override { return is_running(); }
     void shut_down() override;
     void handle_kcp_output(byte_view data) override;
+    void handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,
+                                 size_t count) override;
+    // Encrypt one framed datagram into a pooled buffer. Returns false (after
+    // tearing the session down) when the crypto layer refused: an undeliverable
+    // segment is a permanent hole in the byte stream, so hanging around would
+    // only stall the peer until its idle timeout.
+    bool encrypt_for_wire(byte_view data, std::vector<uint8_t>& out);
 
     // Both assume they run on strand_.
-    void on_receive(std::vector<uint8_t> encrypted);
+    void on_receive(byte_view encrypted);
     void on_inject_decrypted(std::vector<uint8_t> decrypted);
 };
 

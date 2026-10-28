@@ -562,7 +562,7 @@ TEST_CASE("test_async_read_some_rejects_stacked_reads") {
                                             Crypto::generate_session_salt());
     auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
     auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "unit-test-session");
-    session->set_send_callback([](std::vector<uint8_t>) {});
+    session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
     session->start();
     io.poll();
     io.restart();
@@ -1158,8 +1158,9 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
         // goes to the unstarted server's socket and drops) must be replaced
         // before any of that runs.
         std::vector<std::vector<uint8_t>> replies;
-        session->set_send_callback([&replies](std::vector<uint8_t> wire) {
-            replies.push_back(std::move(wire));
+        session->set_send_callback([&replies](std::vector<std::vector<uint8_t>> wire) {
+            for (auto& d : wire)
+                replies.push_back(std::move(d));
         });
         io.restart();
         io.poll();
@@ -1167,7 +1168,7 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
         // A second (duplicate) datagram drives handle_kcp_data, which reads
         // the queued HELLO and answers. The datagram itself may be a KCP
         // duplicate — only its strand dispatch matters here.
-        auto dup_seg = hello_seg;  // same sn -> KCP dedups, framing still drives
+        auto dup_seg = hello_seg; // same sn -> KCP dedups, framing still drives
         const std::vector<uint8_t> framed_second = frame_segment(dup_seg, *fec_encoder);
         auto second = client_crypto.encrypt(byte_view(framed_second.data(), framed_second.size()));
         CHECK_MESSAGE(
@@ -1181,21 +1182,21 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
         auto [plain, type] = decrypt_reply(replies.front(), client_crypto,
                                            "the reply must decrypt with the client's key");
         CHECK_MESSAGE(type == kcp::kTypeData,
-                    "a FEC-speaking client must receive FEC-framed replies");
+                      "a FEC-speaking client must receive FEC-framed replies");
         // Unwrap [fec_hdr(6)|len(2)|segment] and verify the ACK payload.
-        const uint16_t declared = static_cast<uint16_t>(plain[6]) |
-                                  static_cast<uint16_t>(plain[7] << 8);
+        const uint16_t declared =
+            static_cast<uint16_t>(plain[6]) | static_cast<uint16_t>(plain[7] << 8);
         CHECK_MESSAGE(declared + 6 == plain.size(),
-                    "the reply's FEC length field must match its size");
+                      "the reply's FEC length field must match its size");
         KcpWrapper unwrapper(KCP_CONV);
         CHECK_MESSAGE(unwrapper.input(byte_view(plain.data() + 8, plain.size() - 8)) >= 0,
-                    "the unwrapped reply must be a valid KCP segment");
+                      "the unwrapped reply must be a valid KCP segment");
         std::vector<uint8_t> ack;
         CHECK_MESSAGE(
             unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
             "the unwrapped reply must carry HELLO_ACK_V2");
         CHECK_MESSAGE(std::memcmp(ack.data(), KCP_CONTROL_HELLO_ACK_V2, ack.size()) == 0,
-                    "the ACK payload must be exactly HELLO_ACK_V2");
+                      "the ACK payload must be exactly HELLO_ACK_V2");
 
         session->stop();
     }
@@ -1226,8 +1227,9 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
         CHECK_MESSAGE(session != nullptr, "a bare first packet must create a session");
         // Collector installed before polling (same ordering as part A).
         std::vector<std::vector<uint8_t>> replies;
-        session->set_send_callback([&replies](std::vector<uint8_t> wire) {
-            replies.push_back(std::move(wire));
+        session->set_send_callback([&replies](std::vector<std::vector<uint8_t>> wire) {
+            for (auto& d : wire)
+                replies.push_back(std::move(d));
         });
         io.restart();
         io.poll();
@@ -1244,11 +1246,11 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
                                            "the bare reply must decrypt with the client's key");
         (void)type;
         CHECK_MESSAGE(!looks_like_fec_frame(plain.data(), plain.size()),
-                    "a bare client must keep receiving bare datagrams");
+                      "a bare client must keep receiving bare datagrams");
         // The bare plaintext IS the KCP segment: it must unwrap to HELLO_ACK_V2.
         KcpWrapper unwrapper(KCP_CONV);
         CHECK_MESSAGE(unwrapper.input(byte_view(plain.data(), plain.size())) >= 0,
-                    "the bare reply must be a valid KCP segment");
+                      "the bare reply must be a valid KCP segment");
         std::vector<uint8_t> ack;
         CHECK_MESSAGE(
             unwrapper.recv(ack) == static_cast<int>(std::strlen(KCP_CONTROL_HELLO_ACK_V2)),
@@ -1262,8 +1264,7 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
     //         for FEC-speaking clients. --------------------------------------
     {
         asio::io_context io;
-        auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1",
-                                                  FecConfig{10, 3});
+        auto server = std::make_shared<KCPServer>(io, 8388, key, "127.0.0.1", FecConfig{10, 3});
         const auto salt = Crypto::generate_session_salt();
         Crypto client_crypto(key, NONCE_DIR_CLIENT, salt, false);
         KcpWrapper peer(KCP_CONV);
@@ -1284,8 +1285,9 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
         CHECK_MESSAGE(session != nullptr, "a bare first packet must create a session (C)");
         // Collector installed before polling (same ordering as part A).
         std::vector<std::vector<uint8_t>> replies;
-        session->set_send_callback([&replies](std::vector<uint8_t> wire) {
-            replies.push_back(std::move(wire));
+        session->set_send_callback([&replies](std::vector<std::vector<uint8_t>> wire) {
+            for (auto& d : wire)
+                replies.push_back(std::move(d));
         });
         io.restart();
         io.poll();
@@ -1305,7 +1307,6 @@ TEST_CASE("test_server_adapts_fec_per_client_framing") {
                     "an explicit server -fec must not frame towards a bare client");
         session->stop();
     }
-
 }
 
 TEST_CASE("test_fec_off_detects_a_fec_peer") {
@@ -1875,10 +1876,12 @@ TEST_CASE("test_session_oversized_kcp_message_fails_read") {
         session->receive_data(byte_view(wire.data(), wire.size()));
     });
     // Session output -> decrypt -> peer ikcp_input, so ACKs can flow back.
-    session->set_send_callback([&](std::vector<uint8_t> wire) {
+    session->set_send_callback([&](std::vector<std::vector<uint8_t>> wire) {
         try {
-            auto plain = peer_crypto.decrypt(byte_view(wire.data(), wire.size()));
-            (void)peer.input(byte_view(plain.data(), plain.size()));
+            for (const auto& d : wire) {
+                auto plain = peer_crypto.decrypt(byte_view(d.data(), d.size()));
+                (void)peer.input(byte_view(plain.data(), plain.size()));
+            }
         } catch (const std::exception&) {
             // Best effort; a datagram the peer cannot decrypt is not the point.
         }
@@ -1935,7 +1938,7 @@ TEST_CASE("test_session_oversized_kcp_message_fails_read") {
     pump_until(big_failed, 120);
     CHECK_MESSAGE(big_failed, "a message larger than FWD_BUF_SIZE must fail the read");
     CHECK_MESSAGE(big_ec == asio::error::message_size,
-                "path 2 must report message_size, not a truncated success");
+                  "path 2 must report message_size, not a truncated success");
 }
 
 TEST_CASE("test_session_stop_makes_inert") {
@@ -1945,11 +1948,13 @@ TEST_CASE("test_session_stop_makes_inert") {
     // crashing the shared 10ms update tick.
     asio::io_context io;
     auto crypto = std::make_shared<Crypto>("remote_test_key_123456", NONCE_DIR_SERVER,
-                                            Crypto::generate_session_salt());
+                                           Crypto::generate_session_salt());
     auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
     auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "stop-inert");
     bool sent = false;
-    session->set_send_callback([&](std::vector<uint8_t>) { sent = true; });
+    session->set_send_callback([&](std::vector<std::vector<uint8_t>>) {
+        sent = true;
+    });
     session->start();
     io.poll();
     io.restart();
@@ -1988,7 +1993,7 @@ TEST_CASE("test_session_drained_callback_on_target_closed") {
                                             Crypto::generate_session_salt());
     auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
     auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "drain");
-    session->set_send_callback([](std::vector<uint8_t>) {});
+    session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
     session->start();
     io.poll();
     io.restart();
@@ -2021,7 +2026,7 @@ TEST_CASE("test_session_drained_deferred_while_send_buffer_nonempty") {
                                             Crypto::generate_session_salt());
     auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
     auto session = std::make_shared<KCPSession>(io, 1, endpoint, crypto, "drain-defer");
-    session->set_send_callback([](std::vector<uint8_t>) {});
+    session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
     session->start();
     io.poll();
     io.restart();
@@ -2088,11 +2093,12 @@ TEST_CASE("test_session_half_close_fin_gate_and_delivery") {
     {
         auto server_crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, byte_view{}, true);
         Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
-        auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto,
-                                                    "fin-gate");
+        auto session =
+            std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto, "fin-gate");
         std::vector<std::vector<uint8_t>> emitted;
-        session->set_send_callback([&](std::vector<uint8_t> wire) {
-            emitted.push_back(std::move(wire));
+        session->set_send_callback([&](std::vector<std::vector<uint8_t>> wire) {
+            for (auto& d : wire)
+                emitted.push_back(std::move(d));
         });
         session->start();
         io.restart();
@@ -2159,7 +2165,7 @@ TEST_CASE("test_session_half_close_fin_gate_and_delivery") {
         auto server_crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, byte_view{}, true);
         Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
         auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto, "fin-rx");
-        session->set_send_callback([](std::vector<uint8_t>) {});
+        session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
         session->start();
         io.restart();
         io.poll();
@@ -2204,7 +2210,7 @@ TEST_CASE("test_session_half_close_fin_gate_and_delivery") {
         Crypto peer_crypto(key, NONCE_DIR_CLIENT, salt, false);
         auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, server_crypto,
                                                     "fin-foreign");
-        session->set_send_callback([](std::vector<uint8_t>) {});
+        session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
         session->start();
         io.restart();
         io.poll();
@@ -2908,13 +2914,15 @@ TEST_CASE("test_session_target_close_drops_parked_write_hook") {
         auto wire = peer_crypto.encrypt(plain);
         session->receive_data(byte_view(wire.data(), wire.size()));
     });
-    session->set_send_callback([&](std::vector<uint8_t> wire) {
-        auto plain = peer_crypto.decrypt(byte_view(wire.data(), wire.size()));
-        if (peer.input(byte_view(plain.data(), plain.size())) < 0) {
+    session->set_send_callback([&](std::vector<std::vector<uint8_t>> wire) {
+        for (const auto& d : wire) {
+            auto plain = peer_crypto.decrypt(byte_view(d.data(), d.size()));
+            if (peer.input(byte_view(plain.data(), plain.size())) < 0) {
             // The session only emits genuine segments with the same conv; a
             // refusal here would mean the back-to-back wiring is broken and
             // every later wait_send assertion would be measuring nothing.
-            throw std::runtime_error("peer kcp input refused a session datagram");
+                throw std::runtime_error("peer kcp input refused a session datagram");
+            }
         }
     });
 
