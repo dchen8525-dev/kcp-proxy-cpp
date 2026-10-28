@@ -365,6 +365,17 @@ def test_service_scripts():
         require("date +%z" in text,
                 f"{path} must derive the local fallback from the host's UTC offset")
 
+    # The wrapper-side FEC validation must reject a multi-colon value BEFORE
+    # the d/p split: "10:3:5" otherwise passes the [0-9:] character class with
+    # d=10/p=5 (the middle field silently dropped), reaches the server as
+    # --fec 10:3:5, and crash-loops systemd on a value parse_fec_config can
+    # never accept. install-service.sh's installer-stage regex anchors the
+    # same rule; this pins the runtime (journald-visible) guard in both.
+    for path in ("scripts/deploy/install-service.sh", "scripts/package/package.py"):
+        require("*:*:*)" in read(path),
+                f"{path} wrapper FEC validation must reject multi-colon values "
+                f"(a typo'd DATA:PARITY must abort the wrapper, not crash-loop the server)")
+
     # Both fallback copies run under POSIX sh in the deb postinst, where bashisms
     # abort the whole install: $((10#...)) and ${var:off:len} are both bash-only.
     # Whole-line comments are skipped -- they legitimately name the bashisms --

@@ -222,6 +222,14 @@ FEC="${FEC:-}"
 FEC_ARGS=""
 case "$FEC" in
     ""|0:0) ;;
+    # Exactly one colon: "10:3:5" would otherwise slip through the character
+    # class below with d=10/p=5 (the middle field silently dropped) and reach
+    # the server as --fec 10:3:5, which parse_fec_config refuses -- a systemd
+    # crash loop instead of a clean, named startup error.
+    *:*:*)
+        echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2
+        exit 1
+        ;;
     *[!0-9:]*)
         echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2
         exit 1

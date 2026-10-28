@@ -228,9 +228,12 @@ SERVER_BIN=/usr/local/bin/kcp-proxy/kcp-proxy-server
 
 # Same fail-closed shape as the installer's validate_fec: a corrupted FEC line
 # must abort here (visible in journald) instead of crash-looping the server on
-# a --fec it refuses.
+# a --fec it refuses. The multi-colon arm matters for the same reason as in
+# the deb wrapper: "10:3:5" would otherwise pass the character class with
+# d=10/p=5 (middle field dropped) and only fail later, inside the server.
 case "$FEC" in
     ""|0:0) ;;
+    *:*:*) echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2; exit 1 ;;
     *[!0-9:]*) echo "ERROR: invalid FEC='$FEC' in /etc/kcp-proxy/server.env" >&2; exit 1 ;;
     *)
         d=${FEC%%:*}; p=${FEC##*:}
