@@ -65,6 +65,10 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
             result.error = "empty domain";
             return result;
         }
+        // domain_len is a uint8_t, so it is already capped at 255 and the total
+        // below can never exceed 4 + 1 + 255 + 2 = 262 bytes. `need` therefore
+        // cannot be inflated by a hostile length byte, and the enclosing
+        // `data.size() < need` check is the only bound needed.
         need = 4 + 1 + domain_len + 2;
     } else {
         result.status = SOCKS5ParseStatus::Invalid;

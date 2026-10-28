@@ -222,6 +222,39 @@ TEST_CASE("test_crypto_empty_payload_is_authenticated") {
     CHECK_THROWS_AS((void)(window.decrypt(byte_view(wire))), std::runtime_error);
 }
 
+// Regression: a Crypto whose FIRST datagram failed authentication must not be
+// reusable for a different salt. derive_session_keys() wipes the PSK once the
+// key schedule is baked in, so a rollback can only ever fail closed -- never
+// silently derive a key from an EMPTY PSK, which would produce a well-formed
+// but wrong key and turn a rejected forgery into a confusing decryption
+// mismatch (or, worse, let encrypt_impl emit traffic under it).
+TEST_CASE("test_crypto_failed_first_packet_never_rederives_from_empty_psk") {
+    const std::string key = "remote_test_key_123456";
+    const std::vector<uint8_t> plain{'p', 'a', 'y'};
+    auto salt_a = Crypto::generate_session_salt();
+    auto salt_b = Crypto::generate_session_salt();
+
+    Crypto sender_a(key, NONCE_DIR_CLIENT, salt_a);
+    Crypto sender_b(key, NONCE_DIR_CLIENT, salt_b);
+    auto pkt_a = sender_a.encrypt(byte_view(plain.data(), plain.size()));
+    auto pkt_b = sender_b.encrypt(byte_view(plain.data(), plain.size()));
+
+    // Forge the first datagram: the salt is now "learned" but unproven.
+    std::vector<uint8_t> forged = pkt_a;
+    for (size_t i = forged.size() - TAG_SIZE; i < forged.size(); ++i) forged[i] ^= 0xA5;
+
+    Crypto server(key, NONCE_DIR_SERVER, {}, true);
+    CHECK_THROWS_AS((void)(server.decrypt(byte_view(forged))), std::runtime_error);
+
+    // The instance must not become a valid session for ANY salt. Before the
+    // guard in derive_session_keys() this silently produced a key derived from
+    // an empty PSK, so the call "succeeded" into a dead-end key.
+    CHECK_THROWS_AS((void)(server.decrypt(byte_view(pkt_b.data(), pkt_b.size()))),
+                    std::runtime_error);
+    CHECK_THROWS_AS((void)(server.decrypt(byte_view(pkt_a.data(), pkt_a.size()))),
+                    std::runtime_error);
+}
+
 // The server allocates a session from the first datagram, keyed by the salt it
 // carries. That allocation must never happen for a packet whose tag did not
 // verify -- otherwise one spoofed 44-byte datagram per (ip,port) is enough to

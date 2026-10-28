@@ -333,7 +333,13 @@ void KCPSession::handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>
     encrypted.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         std::vector<uint8_t> buf;
-        if (!encrypt_for_wire(datagrams[i], buf)) return; // shut_down already ran
+        if (!encrypt_for_wire(datagrams[i], buf)) {
+            // encrypt_for_wire already shut the session down. Recycle the
+            // buffers this batch has encrypted so far instead of letting them
+            // die with this frame.
+            for (auto& d : encrypted) datagram_pool().release(std::move(d));
+            return;
+        }
         metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
         metrics_.udp_tx_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
         encrypted.push_back(std::move(buf));

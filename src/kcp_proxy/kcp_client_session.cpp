@@ -500,7 +500,13 @@ void KCPClientSession::handle_kcp_output_batch(const std::vector<std::vector<uin
     encrypted.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         std::vector<uint8_t> buf;
-        if (!encrypt_for_wire(datagrams[i], buf)) return; // teardown already posted
+        if (!encrypt_for_wire(datagrams[i], buf)) {
+            // Teardown is already posted by encrypt_for_wire. Recycle what this
+            // batch already encrypted before giving up, instead of letting the
+            // pooled buffers die with this frame.
+            for (auto& d : encrypted) datagram_pool().release(std::move(d));
+            return;
+        }
         metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
         metrics_.udp_tx_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
         encrypted.push_back(std::move(buf));
@@ -509,7 +515,14 @@ void KCPClientSession::handle_kcp_output_batch(const std::vector<std::vector<uin
 }
 
 void KCPClientSession::send_batch_wire(std::vector<std::vector<uint8_t>> batch) {
-    if (!udp_socket_ || !running_.load()) return;
+    if (!udp_socket_ || !running_.load()) {
+        // Return every pooled buffer before dropping the burst. Without this
+        // the buffers are destroyed here without going back to the freelist,
+        // which silently defeats the pool on exactly the teardown path that
+        // produces the biggest bursts.
+        for (auto& d : batch) datagram_pool().release(std::move(d));
+        return;
+    }
 #if defined(__linux__)
     if (batch.size() > 1 && udp_socket_->is_open()) {
         // One flush cycle can carry a window's worth of segments (plus FEC
@@ -519,7 +532,6 @@ void KCPClientSession::send_batch_wire(std::vector<std::vector<uint8_t>> batch) 
         // writability instead of busy-looping.
         int fd = udp_socket_->native_handle();
         size_t idx = 0;
-        bool fast_path_ok = true;
         while (idx < batch.size()) {
             const size_t n = std::min(batch.size() - idx, UDP_BATCH_MAX);
             struct mmsghdr msgs[UDP_BATCH_MAX];
@@ -537,9 +549,10 @@ void KCPClientSession::send_batch_wire(std::vector<std::vector<uint8_t>> batch) 
                 sent = 0; // nothing accepted this round: remainder goes async
             }
             if (sent < 0) {
-                // Unexpected failure (e.g. EMSGSIZE): let the per-datagram async
-                // path surface the real error completion for the remainder.
-                fast_path_ok = false;
+                // Unexpected failure (e.g. EMSGSIZE): stop the fast path and let
+                // the per-datagram async path below surface the real error
+                // completion for the remainder. `idx` is unchanged, so the
+                // remainder is exactly what the kernel refused.
                 break;
             }
             for (size_t i = 0; i < static_cast<size_t>(sent); ++i) {
@@ -562,7 +575,12 @@ void KCPClientSession::send_batch_wire(std::vector<std::vector<uint8_t>> batch) 
 }
 
 void KCPClientSession::start_async_send(std::vector<uint8_t> data) {
-    if (!udp_socket_ || !running_.load()) return;
+    if (!udp_socket_ || !running_.load()) {
+        // Same reasoning as send_batch_wire: recycle instead of dropping the
+        // buffer on the teardown path.
+        datagram_pool().release(std::move(data));
+        return;
+    }
     auto buf = make_pooled_send(std::move(data));
     auto self = shared_from_this();
     // NOTE: copy-capture, not a move init-capture. `asio::buffer(*buf)`

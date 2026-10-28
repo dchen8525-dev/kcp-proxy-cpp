@@ -170,6 +170,19 @@ void Crypto::derive_session_keys(byte_view session_salt) {
     if (session_salt.size() != SESSION_SALT_SIZE) {
         throw std::runtime_error("session salt must be exactly SESSION_SALT_SIZE bytes");
     }
+    // Fail closed if the PSK is already gone. derive_session_keys() wipes key_
+    // once the schedule is baked in, so a second call can only happen after
+    // forget_learned_salt() rolled back a salt commitment. Deriving HKDF from an
+    // EMPTY ikm would silently produce a well-formed but wrong key for that
+    // salt -- every packet would then fail to decrypt in a way that looks like a
+    // key mismatch rather than the reuse bug it is -- and encrypt_impl would
+    // happily encrypt under it. Refuse instead: the caller must allocate a fresh
+    // Crypto for a new salt.
+    if (key_.empty()) {
+        LOG_ERROR("crypto",
+                  "derive_session_keys: PSK unavailable (this Crypto already learned a salt)");
+        throw std::runtime_error("cannot re-derive session keys: PSK was already consumed");
+    }
     // Build the HKDF salt: fixed app salt + per-session random salt.
     std::string hkdf_salt(APP_SALT);
     hkdf_salt.append(reinterpret_cast<const char*>(session_salt.data()), session_salt.size());
@@ -223,6 +236,36 @@ void Crypto::derive_session_keys(byte_view session_salt) {
         key_.clear();
         key_.shrink_to_fit();
     }
+}
+
+void Crypto::forget_learned_salt() {
+    // Undo the salt commitment made by derive_session_keys() when the datagram
+    // that carried the salt failed to authenticate.
+    //
+    // The PSK cannot be restored -- derive_session_keys() cleanses and frees key_
+    // once the schedule is baked in -- so afterwards this instance can never
+    // derive a key again: derive_session_keys() refuses when key_ is empty
+    // instead of deriving HKDF from an EMPTY ikm. That is deliberate. An empty
+    // PSK would yield a well-formed but WRONG key, which looks exactly like a
+    // key mismatch and would let encrypt_impl put traffic on the wire under it.
+    //
+    // In practice no caller reaches that dead end: the server's auth path builds
+    // a fresh Crypto per candidate session (get_or_create_session) and discards
+    // it when the first datagram fails, and the client generates its salt at
+    // construction so its first decrypt never learns one.
+    //
+    // The derived key material goes too, so a forgotten instance holds nothing
+    // usable rather than stale keys for a salt it just dropped.
+    OPENSSL_cleanse(encrypt_key_.data(), encrypt_key_.size());
+    OPENSSL_cleanse(decrypt_key_.data(), decrypt_key_.size());
+    encrypt_key_.fill(0);
+    decrypt_key_.fill(0);
+    salt_set_ = false;
+    session_salt_.clear();
+    any_received_ = false;
+    highest_received_ = 0;
+    replay_window_.reset();
+    encrypt_counter_.store(0, std::memory_order_relaxed);
 }
 
 Crypto::~Crypto() {
@@ -443,7 +486,16 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
 
         // 1) Learn or verify the per-session salt carried in cleartext.
         byte_view salt(ciphertext.data(), SESSION_SALT_SIZE);
-        if (!salt_set_) {
+        // True only on the server's very first datagram, i.e. this call is
+        // about to learn the salt. Learning is a COMMITMENT (derive_session_keys
+        // sets salt_set_ and wipes the PSK), so it must not survive a packet
+        // that then fails to authenticate: otherwise one unauthenticated
+        // datagram from anyone able to reach the port would pin this Crypto to
+        // a salt of the attacker's choosing, and every subsequent honest
+        // datagram would be rejected by the mismatch check below -- a
+        // one-shot, free denial of the whole tunnel. Roll back on failure.
+        const bool learning_salt = !salt_set_;
+        if (learning_salt) {
             // Server side: this is the first packet of a brand-new session. Derive
             // the per-session key from the salt received on the wire.
             derive_session_keys(salt);
@@ -469,6 +521,7 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
                 return fmt::format("decrypt: wrong direction byte {} (expected {})",
                                    nonce[8], peer_direction_);
             });
+            if (learning_salt) forget_learned_salt();
             return std::make_error_code(std::errc::permission_denied);
         }
 
@@ -496,6 +549,7 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
                 return fmt::format("decrypt: counter {} outside the nonce space",
                                    counter);
             });
+            if (learning_salt) forget_learned_salt();
             return std::make_error_code(std::errc::permission_denied);
         }
 
@@ -550,6 +604,10 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
             // callers emit throttled rejections, so keep this at DEBUG.
             LOG_DEBUG("crypto", fmt::format("decrypt: AEAD tag verification failed (corrupted/wrong key), counter={}", counter));
             out.clear();
+            // The salt learned at the top of this call was never proven: it
+            // came off an unauthenticated datagram. Invalidate it so the next
+            // honest first packet (or the correct one) may still seed the key.
+            if (learning_salt) forget_learned_salt();
             return make_error_code(crypto_errors::errc::auth_failed);
         }
 

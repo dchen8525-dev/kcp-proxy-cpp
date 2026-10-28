@@ -132,6 +132,19 @@ private:
     // or on the first decrypt (server, which learns the salt from the wire).
     // The PSK copy held in key_ is wiped afterwards.
     void derive_session_keys(byte_view session_salt);
+    // Roll back the salt commitment made by derive_session_keys() when the
+    // datagram that carried the salt failed to authenticate. Without it, one
+    // unauthenticated datagram would pin this instance to an attacker-chosen
+    // salt and every honest datagram would afterwards be rejected by the
+    // mismatch check -- a free, one-shot denial of the tunnel.
+    //
+    // Because derive_session_keys() wipes the PSK, an instance that has
+    // forgotten a salt can never derive a new key: a later learn fails closed
+    // (derive_session_keys refuses an empty PSK) rather than silently deriving
+    // from empty key material. That is safe because the only server path that
+    // learns a salt allocates a fresh Crypto per candidate session
+    // (KCPServer::get_or_create_session) and discards it on failure.
+    void forget_learned_salt();
 
     // HKDF-Expand for SHA-256 producing exactly OKM_LEN bytes.
     static void hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
