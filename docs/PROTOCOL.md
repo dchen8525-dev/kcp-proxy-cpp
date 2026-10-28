@@ -95,7 +95,7 @@ silent for longer than `KCP_KEEPALIVE_SEC` (30s). The heartbeat payload is the f
 own KCP message. The receiver recognizes an exact match of `magic || session_salt` in
 `try_fulfill_read` and drops it instead of forwarding it into the downstream TCP socket. Scoping the
 sentinel with the per-session salt (unique random bytes shared by both peers) guarantees a genuine
-payload — even the bare 21-byte magic — can never be mistaken for a heartbeat, so no real stream data
+payload — even the bare 22-byte magic — can never be mistaken for a heartbeat, so no real stream data
 is ever silently dropped.
 
 **Android CPP_REMOTE must build and drop the same `magic || session_salt`** heartbeat; otherwise it
@@ -111,7 +111,7 @@ sweep).
 
 `KCP_PROXY_FIN_V1` closes that gap. It is sent as its own KCP message, payload `magic || session_salt`,
 scoped by the per-session salt exactly like the keepalive — so only the peer sharing this session's salt
-can produce one, and no genuine payload can collide with it. The two magics differ in length (16 vs 21
+can produce one, and no genuine payload can collide with it. The two magics differ in length (16 vs 22
 bytes), so neither sentinel can be mistaken for the other.
 
 - **Who sends it.** The server, when its target connection reaches EOF or a target write fails (queued

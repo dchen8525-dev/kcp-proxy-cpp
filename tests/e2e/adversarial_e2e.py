@@ -242,17 +242,34 @@ def dump_logs(log_paths, lines=12):
             print("      " + line, file=sys.stderr)
 
 
-def start_pair(server_exe, client_exe, udp_port, socks_port, key, log_dir, tag,
-               allow_target=None, log_level="INFO"):
-    """Server + client on loopback. ``allow_target`` is one "HOST:PORT" string
-    (repeatable by calling with a list) for the phases that need a local
-    target despite the SSRF guard."""
+def start_server(server_exe, udp_port, key, log_dir, tag, allow_target=None,
+                 log_level="INFO"):
+    """Server only.
+
+    The restart phases must restart the SERVER, never the pair: the client under
+    test is the one that is supposed to survive the restart. Starting a second
+    client there leaked a process on every run (the discarded Proc was never
+    stopped, so it kept running, holding its UDP socket and its log file until
+    the machine rebooted), and on Windows -- where SO_REUSEADDR lets a second
+    socket bind a port that is already bound -- it could even answer the SOCKS
+    connections this phase measures, quietly turning "the surviving client
+    recovered" into "some other client answered".
+    """
     server_cmd = [server_exe, "-H", "127.0.0.1", "-p", str(udp_port),
                   "-k", key, "-L", log_level]
     if allow_target:
         for target in ([allow_target] if isinstance(allow_target, str) else allow_target):
             server_cmd += ["--allow-target", target]
-    server = Proc(server_cmd, os.path.join(log_dir, tag + "-server.log"))
+    return Proc(server_cmd, os.path.join(log_dir, tag + "-server.log"))
+
+
+def start_pair(server_exe, client_exe, udp_port, socks_port, key, log_dir, tag,
+               allow_target=None, log_level="INFO"):
+    """Server + client on loopback. ``allow_target`` is one "HOST:PORT" string
+    (repeatable by calling with a list) for the phases that need a local
+    target despite the SSRF guard."""
+    server = start_server(server_exe, udp_port, key, log_dir, tag, allow_target,
+                          log_level)
     client_cmd = [client_exe, "-s", "127.0.0.1", "-p", str(udp_port),
                   "-H", "127.0.0.1", "-l", str(socks_port), "-k", key,
                   "-L", log_level]
@@ -479,14 +496,19 @@ def phase_protocol_abuse(server_exe, client_exe, log_dir, echo_port):
             bytes([(echo_port >> 8) & 0xFF, echo_port & 0xFF])
         s.sendall(req)
         rep = read_request_reply(s)
-        assert rep == 0x04, \
-            "IPv6 loopback must be SSRF-blocked with 0x04, got 0x%02x" % rep
+        # 0x02 NOT_ALLOWED, not 0x04 HOST_UNREACHABLE: this is a policy refusal,
+        # and 0x04 sent operators hunting for a nonexistent host instead of the
+        # SSRF rule that actually refused the request (RFC 1928 section 6).
+        assert rep == 0x02, \
+            "IPv6 loopback must be SSRF-blocked with 0x02 (NOT_ALLOWED), got 0x%02x" % rep
         expect_eof(s, what="IPv6-loopback connection")
         s.close()
-        print("  [ok] IPv6 loopback CONNECT -> SSRF guard blocks (0x04)")
+        print("  [ok] IPv6 loopback CONNECT -> SSRF guard blocks (0x02 NOT_ALLOWED)")
 
         # 10. Maximum-length (255) bogus domain: must fail as host-unreachable,
-        #     not crash the resolver or the client.
+        #     not crash the resolver or the client. 0x04 is correct HERE: the
+        #     domain genuinely does not resolve, so "host unreachable" is the
+        #     truthful answer, unlike the policy refusals above.
         s = open_client(socks_port)
         greeting_ok(s)
         domain = (b"a" * 247) + b".invalid"  # RFC 6761: never resolvable
@@ -942,22 +964,29 @@ def phase_stalled_target(server_exe, client_exe, log_dir, echo_port):
             # first (~7.8s, ETIMEDOUT -> 0x04). Both are the clean outcome
             # this phase exists to prove; each branch carries its own timing
             # sanity check.
-            assert rep in (0x04, 0x05), \
+            assert rep in (0x04, 0x05, 0x06), \
                 "stalled connect must fail with a clean SOCKS5 error, got 0x%02x" % rep
             if wait_for_log(server.log_path,
                             "close_connection from connect_timeout", 5):
                 # Deadline-driven path (Linux): the reply must come from the
-                # server's timer, not from an early kernel decision.
-                assert rep == 0x04, \
-                    "connect timeout must reply HOST_UNREACHABLE (0x04), got 0x%02x" % rep
+                # server's timer, not from an early kernel decision. 0x06
+                # TTL_EXPIRED is the RFC 1928 code for "the deadline fired";
+                # 0x04 HOST_UNREACHABLE said "no such host" about a target that
+                # exists and merely never answered.
+                assert rep == 0x06, \
+                    "connect timeout must reply TTL_EXPIRED (0x06), got 0x%02x" % rep
                 assert elapsed >= CONNECT_TIMEOUT_SEC - 2, \
                     "deadline-driven reply arrived after only %.1fs" % elapsed
-                print("  [ok] connect timeout replied 0x04 after %.1fs" % elapsed)
+                print("  [ok] connect timeout replied 0x06 after %.1fs" % elapsed)
                 reap_reason = "connect_timeout"
             elif wait_for_log(server.log_path,
                               "close_connection from tcp_connect_failed", 5):
                 # Kernel-gave-up path (macOS/BSD): the connect error beat the
-                # deadline, so the reply may legitimately arrive early.
+                # deadline, so the reply may legitimately arrive early. The
+                # kernel here reports ETIMEDOUT, which maps to TTL_EXPIRED;
+                # some stacks report EHOSTUNREACH instead, which stays 0x04.
+                assert rep in (0x04, 0x06), \
+                    "kernel-gave-up connect must reply 0x04 or 0x06, got 0x%02x" % rep
                 assert elapsed < CONNECT_TIMEOUT_SEC, \
                     "kernel error arrived at %.1fs, past the %ds deadline" % (
                         elapsed, CONNECT_TIMEOUT_SEC)
@@ -1025,9 +1054,8 @@ def phase_restart_and_key_rotation(server_exe, client_exe, log_dir, echo_port):
         if not client.alive():
             raise AssertionError("client died when the server was killed")
         print("  [ok] client survived the server being killed")
-        server = start_pair(server_exe, client_exe, udp_port, socks_port,
-                            KEY, log_dir, "restart",
-                            allow_target="127.0.0.1:%d" % echo_port)[0]
+        server = start_server(server_exe, udp_port, KEY, log_dir, "restart",
+                              allow_target="127.0.0.1:%d" % echo_port)
         time.sleep(1.0)
         if not server.alive():
             raise AssertionError("restarted server exited early")
@@ -1084,9 +1112,8 @@ def phase_restart_and_key_rotation(server_exe, client_exe, log_dir, echo_port):
         # And the client is still fully functional once a matching server
         # comes back -- a key rotation must not wedge the proxy itself.
         server.stop()
-        server = start_pair(server_exe, client_exe, udp_port, socks_port,
-                            KEY, log_dir, "restart",
-                            allow_target="127.0.0.1:%d" % echo_port)[0]
+        server = start_server(server_exe, udp_port, KEY, log_dir, "restart",
+                              allow_target="127.0.0.1:%d" % echo_port)
         time.sleep(1.0)
         if not server.alive():
             raise AssertionError("final server restart exited early")

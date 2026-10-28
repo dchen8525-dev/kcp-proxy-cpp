@@ -80,6 +80,13 @@ public:
     std::shared_ptr<KCPSession> route_datagram(const asio::ip::udp::endpoint& addr,
                                                byte_view data);
 
+    // Map an OS-level connect error onto the RFC 1928 reply the client sees.
+    // Pure (no state, no I/O), so it is public: the mapping is wire-visible
+    // diagnostics, and Pinning it in the unit suite is the only way to stop a
+    // "helpful" future edit from collapsing a timeout into host-unreachable
+    // again (which made a firewalled target look nonexistent).
+    static uint8_t get_error_reply_code(const std::error_code& ec);
+
 private:
     // route_datagram's body. Split out so route_datagram can wrap it in the
     // exception containment described there without re-indenting the logic.
@@ -296,6 +303,11 @@ private:
     // ~4 syscalls per event instead of 16. Not used on other platforms.
     void arm_receive_drain();
     void handle_receive_drain(const std::error_code& ec);
+    // Park the drain after a failed readiness wait or a recvmmsg() error and
+    // re-arm it through the shared 10ms backoff. Without it a persistently
+    // failing socket would spin: the readiness wait is level-triggered, so it
+    // completes immediately and the drain fails again in the same loop.
+    void park_receive_drain();
     // Scratch storage for one drain event: endpoint + length + buffer per
     // datagram, sized UDP_DRAIN_BATCH_MAX in start(). Only touched on the
     // socket's strand.
@@ -387,8 +399,6 @@ private:
                           std::shared_ptr<std::vector<uint8_t>> buf);
     void forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
                             std::shared_ptr<std::vector<uint8_t>> buf = {});
-
-    static uint8_t get_error_reply_code(const std::error_code& ec);
 };
 
 } // namespace kcp_proxy

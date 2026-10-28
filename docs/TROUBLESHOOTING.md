@@ -105,7 +105,13 @@ This is the complete list of stages the binaries emit (grep `FAIL_STAGE=` in `sr
 - `SOCKS5_PARSE_FAILED`: SOCKS5 request was invalid or too large.
 - `SOCKS5_UNSUPPORTED_COMMAND`: command was `BIND`, `UDP ASSOCIATE`, or unknown.
 - `SSRF_BLOCKED`: the requested target is a restricted address (loopback, private, link-local, …)
-  and the server refuses to connect to it. Use `--allow-target` only in a lab.
+  and the server refuses to connect to it. Use `--allow-target` only in a lab. The line carries
+  `TARGET=host:port` and, when the target was a domain, `RESOLVED=<address>` — that is the address
+  the guard actually judged, which is the one that matters for DNS-based bypasses.
+- `SSRF_ALLOWLISTED` (a WARNING, not a failure stage): the target WAS restricted and an
+  `--allow-target` entry let it through, so the tunnel proceeded. Both forms emit it — a literal IP
+  and a domain that resolved into a restricted range — because the allowlist is the only bypass of
+  the guard and every use of it has to be visible in the log.
 - `DNS_RESOLVE_FAILED`: domain resolution failed.
 - `TCP_CONNECT_FAILED`: all outbound TCP connect attempts failed, or the connect timeout fired.
 - `TCP_READ_FAILED` / `TCP_WRITE_FAILED`: remote TCP stream failed during forwarding.
@@ -118,3 +124,40 @@ This is the complete list of stages the binaries emit (grep `FAIL_STAGE=` in `sr
 A failure to reach `CPP_REMOTE_REACHABLE` on the Android side (server stopped, wrong key, UDP blocked)
 does not surface as a stage on the server at all — there is no session to log one from, because the
 server never authenticates a packet. Look for the absence of `new session:` instead.
+
+## SOCKS5 Reply Codes
+
+Every CONNECT ends in exactly one RFC 1928 reply code. When an application only says
+"SOCKS5_CONNECT_FAILED", the code is what distinguishes the causes — they have different fixes:
+
+- `0x00` `SOCKS5_REPLY_SUCCEEDED` — the TCP connect to the target completed.
+- `0x01` `SOCKS5_REPLY_GENERAL_FAILURE` — the fallback code, emitted by both ends: the server when
+  the OS connect error is not one it recognises (`get_error_reply_code`'s default) or when the SOCKS5
+  request could not be parsed at all; the local client for its own handshake failures and its
+  `MAX_CLIENT_SESSIONS` cap.
+- `0x02` `SOCKS5_REPLY_NOT_ALLOWED` — **policy** refusal: the target matched `is_restricted_target()`
+  or fell outside `--allow-target`. Nothing is wrong with the network; the rule is doing its job.
+- `0x03` `SOCKS5_REPLY_NETWORK_UNREACHABLE` — the OS reported `network_unreachable` (no route).
+- `0x04` `SOCKS5_REPLY_HOST_UNREACHABLE` — the domain did not resolve (see `DNS_RESOLVE_FAILED`), or
+  the OS reported `host_unreachable`.
+- `0x05` `SOCKS5_REPLY_CONNECTION_REFUSED` — the target answered with a RST: something is listening on
+  that IP but not on that port, or a local firewall rejected it.
+- `0x06` `SOCKS5_REPLY_TTL_EXPIRED` — the `CONNECT_TIMEOUT_SEC` deadline fired, or the kernel's own
+  connect gave up with `ETIMEDOUT`. The target silently dropped the SYNs — typically an upstream
+  firewall, or a host that is down. **Not** a DNS problem.
+- `0x07` `SOCKS5_REPLY_COMMAND_NOT_SUPPORTED` — `cmd` was `BIND`, `UDP ASSOCIATE`, or unknown.
+- `0x08` `SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED` — `ATYP` was not IPv4 / domain / IPv6.
+
+`0x02` and `0x06` are the two that matter most in practice, because both were previously reported as
+`0x04`: an allowlist refusal and a firewalled target both looked exactly like a typo in the hostname.
+If you are looking at an older log and see `0x04` where you expected one of these, that is the old
+behaviour, not a new bug.
+
+Quick triage from the code alone:
+
+```text
+0x02 -> read the server log for SSRF_BLOCKED, then check --allow-target
+0x04 -> read the server log for DNS_RESOLVE_FAILED, then check the server's resolver
+0x05 -> the target is reachable and actively refusing; check the target's listener
+0x06 -> the target is silent; check the server-side firewall and the target's uptime
+```

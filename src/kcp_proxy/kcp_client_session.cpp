@@ -267,6 +267,9 @@ void KCPClientSession::on_close() {
     complete_pending_read(asio::error::operation_aborted);
 
     LOG_INFO("kcp_client", "closed");
+    // INFO for the same reason as KCPSession::stop(): the closing stats line is
+    // where the adaptive controllers publish their final state, and the e2e
+    // suites run at default INFO level and parse the last "stats ..." line.
     LOG_INFO("kcp_client", stats_summary());
 }
 
@@ -394,8 +397,15 @@ void KCPClientSession::on_receive(byte_view packet) {
     if (ec) {
         metrics_.decrypt_errors.fetch_add(1, std::memory_order_relaxed);
         // Same packet-level noise class as KCPSession::on_receive: keep at
-        // DEBUG, the decrypt_errors metric stays the INFO-visible signal.
-        LOG_DEBUG("kcp_client", "UDP decrypt failed: " + ec.message());
+        // DEBUG, the decrypt_errors metric stays the INFO-visible signal. The
+        // FAIL_STAGE token is part of the documented stage set (see
+        // docs/PROTOCOL.md) and is what an operator greps for when the two ends
+        // disagree about the key, so it must appear here too -- it was missing
+        // on the client, which made "DECRYPT_FAILED also appears on the client
+        // side" untrue.
+        LOG_DEBUG("kcp_client",
+                  fmt::format("FAIL_STAGE=DECRYPT_FAILED ERROR={} SERVER={}:{}", ec.message(),
+                              server_addr_.address().to_string(), server_addr_.port()));
         return;
     }
     touch_activity();

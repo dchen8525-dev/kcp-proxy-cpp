@@ -74,6 +74,13 @@ void KCPSession::stop() {
         complete_pending_read(asio::error::operation_aborted);
 
         LOG_INFO("kcp_session", session_id_ + ": stopped");
+        // INFO, deliberately, and it must stay that way: the session's closing
+        // totals are the ONLY place the adaptive controllers publish their final
+        // state, and tests/e2e/rto_adaptive_e2e.py + fec_adaptive_e2e.py run the
+        // binaries at default INFO level and regex the last "stats ..." line for
+        // `nodelay=` / `fec_parity=`. Demoting this to DEBUG made those suites
+        // read None and fail. It is bounded to one line per closed session, which
+        // is a lifecycle event, not packet spam.
         LOG_INFO("kcp_session", stats_summary());
     });
 }

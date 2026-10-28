@@ -1032,6 +1032,13 @@ function probeKcpHandshake(clientPath, host, port, timeoutMs = 10000, key = gene
 
     proc.on('error', (err) => finish({ ok: false, message: `无法启动测试进程: ${err.message}` }));
     proc.on('close', (code) => finish({ ok: false, message: `测试进程退出 (代码 ${code})` }));
+  })).catch((err) => ({
+    // getFreePort() rejects when the temporary listener cannot bind. Without
+    // this catch the rejection made runConnectivityTest's await never settle,
+    // which left connectivityTestInFlight stuck true: every later 测试连接
+    // answered "测试进行中，请稍候" until the app was restarted.
+    ok: false,
+    message: `无法分配本地测试端口: ${err.message}`
   }));
 }
 

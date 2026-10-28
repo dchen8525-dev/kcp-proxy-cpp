@@ -7,6 +7,9 @@
 #include <asio/error.hpp>
 #include <asio/read.hpp>
 #include <asio/write.hpp>
+// OPENSSL_cleanse for wipe_key() (see its comment): a memset followed at once by
+// clear()/release is a dead store an optimising compiler is free to delete.
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -130,7 +133,14 @@ void KCPProxyClient::stop() {
 }
 
 void KCPProxyClient::wipe_key() {
-    std::memset(key_.data(), 0, key_.size());
+    // OPENSSL_cleanse, not std::memset -- same reasoning as
+    // KCPServer::wipe_key: a memset immediately followed by clear() is a dead
+    // store that /GL may remove entirely, leaving the PSK readable in freed
+    // heap. Keep the two wipe_key() helpers on the same primitive as
+    // crypto.cpp.
+    if (!key_.empty()) {
+        OPENSSL_cleanse(key_.data(), key_.size());
+    }
     key_.clear();
     key_.shrink_to_fit();
 }
@@ -430,7 +440,28 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         [self, client, session, handshake_cancelled](const std::error_code& ec) {
             if (ec == asio::error::operation_aborted) return;
             if (handshake_cancelled->exchange(true)) return;
-            LOG_WARNING("client", "SOCKS5 handshake timeout");
+            // Name the stage. A bare "SOCKS5 handshake timeout" read identically
+            // whether the KCP handshake never completed (wrong key / firewall /
+            // server down) or the tunnel came up and the local SOCKS5 handshake
+            // stalled -- two different fixes. AGENTS.md §4: a failure line must
+            // say which half failed, and never imply the remote is reachable.
+            //
+            // Exactly two states are observable when this 30s deadline fires:
+            // connected_ is set by the handler that receives
+            // KCP_PROXY_HELLO_ACK (see on_connect), so there is no third
+            // "ACK pending" state -- an earlier revision printed one
+            // (KCP_HANDSHAKE_ACK_PENDING), which was unreachable and mislabelled
+            // this case as an ACK problem. Note also that a dead server or a
+            // wrong key is normally caught by the 3s KCP handshake timer, which
+            // aborts the connection (and cancels this deadline) long before it
+            // fires; REMOTE_REACHABLE=false here is therefore the exception, not
+            // the common case.
+            const bool tunnel_up = session->is_connected();
+            const char* stage = tunnel_up ? "SOCKS5_HANDSHAKE" : "KCP_HANDSHAKE";
+            LOG_WARNING("client", fmt::format(
+                "FAIL_STAGE=SOCKS5_HANDSHAKE_TIMEOUT DETAIL={} REMOTE_REACHABLE={}"
+                " timeout={}s",
+                stage, tunnel_up ? "true" : "false", SOCKS5_HANDSHAKE_TIMEOUT_SEC));
             // Same RST reasoning as abort_handshake: if an error reply is in
             // flight when the deadline fires, a plain close() would discard
             // it. self is captured (not this) because the timer can outlive

@@ -8,7 +8,15 @@
 
 namespace kcp_proxy {
 
-// KCP configuration (matches Python implementation exactly)
+// KCP configuration. These are the values the wire actually uses; the Android
+// CPP_REMOTE peer (app/src/main/java/.../core/kcp/KcpConfig.java) mirrors them,
+// and both ends log them via kcp_config_line() so a drift is visible in the
+// logs rather than showing up as a dead handshake.
+//
+// Only KCP_CONV and KCP_MTU must match across the two ends: nodelay/interval/
+// resend/nc are local send behaviour, and each side advertises its own receive
+// window. The remaining fields are kept equal by default purely so the two
+// logs can be diffed without noise.
 // Conversation id. Every session on the wire carries it, so both peers must
 // use the same value or ikcp silently discards the peer's packets.
 constexpr uint32_t KCP_CONV = 1;
@@ -133,8 +141,75 @@ constexpr int SALT_TOMBSTONE_TTL_SEC = 600;
 // Eviction only reopens replay for a salt that was about to expire anyway.
 constexpr size_t MAX_SALT_TOMBSTONES = 4 * MAX_CONCURRENT_SESSIONS;
 
+// ---------------------------- Framing overheads -----------------------------
+// Declared ahead of the buffer sizes below because the largest legal datagram
+// -- and therefore every receive buffer -- is derived from them.
+
+// Crypto configuration
+constexpr size_t NONCE_SIZE = 12;
+constexpr size_t TAG_SIZE = 16;
+// Per-session random salt carried in cleartext at the front of every encrypted
+// datagram. Both peers derive the per-session AEAD key from PSK + this salt
+// via HKDF-SHA256, so every session gets an independent key and counter/nonce
+// values can never collide across sessions (AES-GCM nonce reuse would otherwise
+// be catastrophic). 16 bytes keeps the chance of an honest cross-session salt
+// collision negligible and makes it infeasible to collide with a target by
+// guessing. The server additionally rejects any session whose salt is already
+// claimed by a live session (see KCPServer::get_or_create_session).
+constexpr size_t SESSION_SALT_SIZE = 16;
+constexpr size_t AES_KEY_SIZE = 16;
+// Bytes of cleartext framing in front of the AEAD plaintext: the salt and the
+// nonce. Also the FEC encoder's header_offset, i.e. the region a framed packet
+// leaves free at the front of its buffer (see FecEncoder::New).
+constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE;  // 28
+// Hard ceiling: refuse to encrypt past this counter so the session must rekey.
+// AES-GCM IND-CPA security degrades well before 2^64; pick 2^48 as a safe wall.
+constexpr uint64_t MAX_COUNTER = (1ull << 48);
+// Replay window size for the receiver-side sliding bitmap.
+// Increased from 64 to 2048 to accommodate UDP packet reordering in high-throughput
+// scenarios (e.g., large file downloads). UDP packets may arrive out of order,
+// and a larger window prevents false replay rejections.
+// Memory overhead: 2048 bits = 256 bytes per session.
+constexpr size_t REPLAY_WINDOW_BITS = 2048;
+
+// Nonce direction indicators
+constexpr uint8_t NONCE_DIR_CLIENT = 0x01;
+constexpr uint8_t NONCE_DIR_SERVER = 0x02;
+
+// Bounds. Window minimum keeps the hysteresis band positive at the smallest
+// legal MTU (MSS 552 -> 30 segments per message -> 4*30 + 30 + 8 = 158 needed;
+// 256 leaves margin). Window maximum bounds worst-case per-session memory
+// (4096 segments x ~1.4 KB x both ends of the band). MTU spans Ethernet
+// minimum (576) to jumbo frames (9000).
+constexpr int KCP_SNDWND_MIN = 256;
+constexpr int KCP_SNDWND_MAX = 4096;
+constexpr int KCP_RCVWND_MIN = 256;
+constexpr int KCP_RCVWND_MAX = 4096;
+constexpr int KCP_MTU_MIN = 576;
+constexpr int KCP_MTU_MAX = 9000;
+
+// Largest UDP payload either end can ever be asked to receive: one KCP datagram
+// at the largest legal --mtu, FEC-framed (6-byte FEC header + 2-byte length
+// field inside the AEAD), plus the cleartext salt/nonce and the AEAD tag.
+// Parity datagrams never exceed the largest data shard of their set, and a
+// bare (FEC-off) datagram is smaller still, so this bounds every packet.
+constexpr size_t UDP_WIRE_DATAGRAM_MAX = FEC_CRYPTO_RESERVE + 8 +
+                                        static_cast<size_t>(KCP_MTU_MAX) + TAG_SIZE;
+
 // Buffer sizes
-constexpr size_t UDP_RECV_BUF_SIZE = 4096;
+//
+// UDP_RECV_BUF_SIZE must hold one WHOLE datagram: neither recvfrom() nor
+// recvmmsg() refuses a datagram that does not fit -- the kernel truncates it
+// and discards the tail without an error, after which the AEAD tag cannot
+// verify and the tunnel dies with nothing but decrypt failures in the log. It
+// was 4096, which silently broke every --mtu above ~4 KB (the CLI accepts up to
+// 9000), so it is now derived from the largest legal datagram instead of being
+// a guess about the default one.
+constexpr size_t UDP_RECV_BUF_SIZE = UDP_WIRE_DATAGRAM_MAX;
+static_assert(UDP_RECV_BUF_SIZE >= UDP_WIRE_DATAGRAM_MAX,
+              "a legal --mtu must fit the receive buffer, or the kernel truncates the datagram");
+static_assert(UDP_RECV_BUF_SIZE >= FEC_CRYPTO_RESERVE + 8 + KCP_MTU + TAG_SIZE,
+              "the default MTU must fit the receive buffers");
 constexpr size_t FWD_BUF_SIZE = 16384;
 constexpr size_t SOCKS5_REPLY_BUF_SIZE = 512;
 
@@ -146,8 +221,9 @@ constexpr size_t SOCKS5_REPLY_BUF_SIZE = 512;
 // sessions can outrun the drain and overflow the socket buffer. With N
 // outstanding, the reactor performs up to N recvmsg calls per readiness event
 // and only then runs the handlers, decoupling the drain from handler cost.
-// Costs UDP_RECV_SLOTS * UDP_RECV_BUF_SIZE bytes of resident buffers (64 KB at
-// the default), which is negligible next to the buffers it protects.
+// Costs UDP_RECV_SLOTS * UDP_RECV_BUF_SIZE bytes of resident buffers (~145 KB
+// at the largest legal MTU), which is negligible next to the buffers it
+// protects.
 constexpr size_t UDP_RECV_SLOTS = 16;
 
 // Max datagrams per batched Linux syscall: one ::sendmmsg call on the send
@@ -238,6 +314,29 @@ struct KcpTuning {
     int backpressure_resume() const {
         return backpressure_threshold() - KCP_BACKPRESSURE_BURST_MSGS * max_segments_per_msg();
     }
+    // The constant pair KCP_BACKPRESSURE_THRESHOLD/RESUME_THRESHOLD is checked
+    // by static_assert against the DEFAULT KCP_SNDWND/KCP_MTU only; at runtime
+    // the same two watermarks are derived from the CLI-overridable sndwnd/mtu,
+    // where no static_assert can see them. The tightest legal combination is
+    // the SMALLEST mtu with the SMALLEST window -- mss 552 means one
+    // FWD_BUF_SIZE message needs 30 segments, which puts the threshold at 218
+    // and the resume watermark at 98 -- and raising the mtu only lowers the
+    // per-message segment count, so every legal pair keeps both watermarks
+    // positive.
+    //
+    // This predicate exists so that property is CHECKED rather than assumed
+    // (see test_kcp_tuning_backpressure_invariant). If a future change to
+    // FWD_BUF_SIZE, the burst constant or a bound ever collapses the band, the
+    // test fails instead of the writer busy-spinning: a non-positive resume
+    // watermark means "always below the watermark", so a parked writer would be
+    // re-armed on every tick while the window is still full -- exactly what the
+    // hysteresis band exists to prevent.
+    bool backpressure_invariant_holds() const {
+        const int segs = max_segments_per_msg();
+        const int thr = backpressure_threshold();
+        return segs > 0 && thr > 0 && backpressure_resume() > 0 &&
+               thr + segs <= sndwnd;
+    }
 };
 
 inline KcpTuning& kcp_tuning() {
@@ -245,18 +344,8 @@ inline KcpTuning& kcp_tuning() {
     return tuning;
 }
 
-// Bounds. Window minimum keeps the hysteresis band positive at the smallest
-// legal MTU (MSS 552 -> 30 segments per message -> 4*30 + 30 + 8 = 158 needed;
-// 256 leaves margin). Window maximum bounds worst-case per-session memory
-// (4096 segments x ~1.4 KB x both ends of the band). MTU spans Ethernet
-// minimum (576) to jumbo frames (9000); larger values would also exceed the
-// 8 KiB datagram-pool recycling bound and inflate FEC_DATAGRAM_MAX buffers.
-constexpr int KCP_SNDWND_MIN = 256;
-constexpr int KCP_SNDWND_MAX = 4096;
-constexpr int KCP_RCVWND_MIN = 256;
-constexpr int KCP_RCVWND_MAX = 4096;
-constexpr int KCP_MTU_MIN = 576;
-constexpr int KCP_MTU_MAX = 9000;
+// Bounds above (KCP_SNDWND_MIN ... KCP_MTU_MAX) are declared with the framing
+// overheads, because the receive buffers are sized from the largest legal MTU.
 
 inline int clamp_kcp_value(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -268,33 +357,6 @@ inline void set_kcp_tuning(int sndwnd, int rcvwnd, int mtu) {
     t.rcvwnd = clamp_kcp_value(rcvwnd, KCP_RCVWND_MIN, KCP_RCVWND_MAX);
     t.mtu = clamp_kcp_value(mtu, KCP_MTU_MIN, KCP_MTU_MAX);
 }
-
-// Crypto configuration
-constexpr size_t NONCE_SIZE = 12;
-constexpr size_t TAG_SIZE = 16;
-// Per-session random salt carried in cleartext at the front of every encrypted
-// datagram. Both peers derive the per-session AEAD key from PSK + this salt
-// via HKDF-SHA256, so every session gets an independent key and counter/nonce
-// values can never collide across sessions (AES-GCM nonce reuse would otherwise
-// be catastrophic). 16 bytes keeps the chance of an honest cross-session salt
-// collision negligible and makes it infeasible to collide with a target by
-// guessing. The server additionally rejects any session whose salt is already
-// claimed by a live session (see KCPServer::get_or_create_session).
-constexpr size_t SESSION_SALT_SIZE = 16;
-constexpr size_t AES_KEY_SIZE = 16;
-// Hard ceiling: refuse to encrypt past this counter so the session must rekey.
-// AES-GCM IND-CPA security degrades well before 2^64; pick 2^48 as a safe wall.
-constexpr uint64_t MAX_COUNTER = (1ull << 48);
-// Replay window size for the receiver-side sliding bitmap.
-// Increased from 64 to 2048 to accommodate UDP packet reordering in high-throughput
-// scenarios (e.g., large file downloads). UDP packets may arrive out of order,
-// and a larger window prevents false replay rejections.
-// Memory overhead: 2048 bits = 256 bytes per session.
-constexpr size_t REPLAY_WINDOW_BITS = 2048;
-
-// Nonce direction indicators
-constexpr uint8_t NONCE_DIR_CLIENT = 0x01;
-constexpr uint8_t NONCE_DIR_SERVER = 0x02;
 
 // ------------------------- Forward error correction -------------------------
 // Reed-Solomon FEC, kcp-go style: the sender groups `data_shards` consecutive
@@ -317,7 +379,10 @@ constexpr uint8_t NONCE_DIR_SERVER = 0x02;
 // when it is unset the ADAPTIVE_FEC_DEFAULT below applies. Data shards flow
 // between mismatched shard parameters (each data packet is independently
 // valid); only parity REPAIR requires both ends to agree on data:parity.
-constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE;  // 28
+//
+// FEC_CRYPTO_RESERVE (the salt+nonce prefix, i.e. the encoder's header_offset)
+// is declared with the framing overheads at the top of this file, because the
+// receive buffers are sized from it.
 
 // Wire-size budget: the largest KCP datagram (KCP_MTU) FEC-framed becomes
 // FEC_CRYPTO_RESERVE + 8 (FEC header + length field) + KCP_MTU = 1436 bytes
@@ -325,6 +390,9 @@ constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE;  // 28
 // of UDP payload including salt+nonce — inside the 1472-byte payload budget
 // of a 1500 MTU path once IP(20)+UDP(8) headers are added. Parity datagrams
 // never exceed the largest data shard in their set, so this bounds both.
+// (A larger --mtu trades that guarantee for fewer, bigger datagrams; the
+// receive buffers are sized for the whole legal range, see
+// UDP_WIRE_DATAGRAM_MAX.)
 constexpr size_t FEC_DATAGRAM_MAX = FEC_CRYPTO_RESERVE + 8 + KCP_MTU;
 constexpr size_t FEC_WIRE_DATAGRAM_MAX = FEC_DATAGRAM_MAX + TAG_SIZE;
 static_assert(FEC_WIRE_DATAGRAM_MAX + 28 /* IP + UDP headers */ <= 1500,
@@ -477,9 +545,20 @@ constexpr uint8_t SOCKS5_ATYP_IPV6 = 0x04;
 
 constexpr uint8_t SOCKS5_REPLY_SUCCEEDED = 0x00;
 constexpr uint8_t SOCKS5_REPLY_GENERAL_FAILURE = 0x01;
+// 0x02 (connection not allowed by ruleset) is RFC 1928's code for a policy
+// refusal. The SSRF guard is exactly that, but it used to answer HOST_UNREACHABLE,
+// which told the client "the target does not exist" when the truth was "this
+// server refuses to route there" -- a misleading diagnostic for an operator
+// debugging why one specific host is blocked.
+constexpr uint8_t SOCKS5_REPLY_NOT_ALLOWED = 0x02;
 constexpr uint8_t SOCKS5_REPLY_NETWORK_UNREACHABLE = 0x03;
 constexpr uint8_t SOCKS5_REPLY_HOST_UNREACHABLE = 0x04;
 constexpr uint8_t SOCKS5_REPLY_CONNECTION_REFUSED = 0x05;
+// 0x06 (TTL expired) is the closest RFC 1928 code for "the server gave up
+// waiting on the target". It was missing, so a connect timeout had to report
+// HOST_UNREACHABLE (0x04) -- the same code as "no such host", which left the
+// client unable to tell a firewalled target from a nonexistent one.
+constexpr uint8_t SOCKS5_REPLY_TTL_EXPIRED = 0x06;
 constexpr uint8_t SOCKS5_REPLY_COMMAND_NOT_SUPPORTED = 0x07;
 constexpr uint8_t SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED = 0x08;
 

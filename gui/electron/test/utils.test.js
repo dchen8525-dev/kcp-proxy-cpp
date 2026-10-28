@@ -61,6 +61,17 @@ test('formatBytes humanizes byte counts', () => {
   assert.strictEqual(formatBytes(undefined), '0 B');
 });
 
+test('formatBytes never renders a unit below B for a fractional count', () => {
+  // The live rate is a float: one byte inside a 2s TRAFFIC window is 0.5 B/s.
+  // log(0.5)/log(1024) floors to -1, and units[-1] is undefined -- the overview
+  // label rendered "512.00 undefined/s".
+  assert.strictEqual(formatBytes(0.5), '1 B');
+  assert.strictEqual(formatBytes(0.0167), '0 B');
+  assert.strictEqual(formatBytesPerSec(0.5), '1 B/s');
+  assert.strictEqual(formatBytesPerSec(0.0167), '0 B/s');
+  assert.ok(!formatBytes(0.5).includes('undefined'));
+});
+
 test('formatBytesPerSec humanizes rates and never goes negative', () => {
   assert.strictEqual(formatBytesPerSec(0), '0 B/s');
   assert.strictEqual(formatBytesPerSec(undefined), '0 B/s');

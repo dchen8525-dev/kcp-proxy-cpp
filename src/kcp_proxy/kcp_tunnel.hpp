@@ -16,11 +16,13 @@
 #include <string>
 #include <vector>
 
-// Vendored kcp-cpp FEC codec (see third_party/kcp-cpp/VENDORED.md). Kept as
-// forward declarations: the members are unique_ptrs and KcpTunnel's destructor
-// is out-of-line, so the full fec.h is only needed in kcp_tunnel.cpp. (The
-// parity-packet member is declared as vector<vector<uint8_t>> — FecPacket is
-// an ALIAS for that type upstream, and aliases cannot be forward-declared.)
+// kcp-cpp's FEC codec (consumed as the `kcp::kcp` vcpkg package; the overlay
+// port lives in ports/kcp-cpp and the pinned revision is in CMakeLists.txt).
+// Kept as forward declarations: the members are unique_ptrs and KcpTunnel's
+// destructor is out-of-line, so the full fec.h is only needed in
+// kcp_tunnel.cpp. (The parity-packet member is declared as
+// vector<vector<uint8_t>> -- FecPacket is an ALIAS for that type upstream, and
+// aliases cannot be forward-declared.)
 namespace kcp::internal {
 class FecEncoder;
 class FecDecoder;

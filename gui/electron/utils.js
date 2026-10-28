@@ -31,7 +31,10 @@ const FIXED_KEY_RE = /^[\x21-\x7e]{16,256}$/;
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B'; // 0, negative, NaN -> '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  // Clamp BOTH ends: a rate below 1 B/s (one byte inside a multi-second TRAFFIC
+  // window) makes the log negative, i.e. i == -1, and units[-1] is undefined --
+  // the live-rate label rendered "512.00 undefined/s".
+  const i = Math.max(0, Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1));
   const value = bytes / Math.pow(1024, i);
   return value.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
 }

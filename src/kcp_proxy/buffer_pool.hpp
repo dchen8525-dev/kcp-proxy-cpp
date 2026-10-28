@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "kcp_proxy/config.hpp"
+
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -55,10 +57,11 @@ private:
 };
 
 // The process-wide datagram pool. Sized for the worst realistic burst:
-// 256 buffers of up to 8 KiB (max KCP datagram + crypto framing + FEC
-// header, with headroom) is at most 2 MiB, typically far less.
+// 256 buffers of up to UDP_WIRE_DATAGRAM_MAX bytes (the largest datagram either
+// end can send or receive at any legal --mtu; 8192 was below it, so a wide MTU
+// silently lost the recycling) is at most ~2.3 MiB, typically far less.
 inline BufferPool& datagram_pool() {
-    static BufferPool pool(256, 8192);
+    static BufferPool pool(256, UDP_WIRE_DATAGRAM_MAX);
     return pool;
 }
 

@@ -212,7 +212,7 @@ If a request fails, match the symptom to a stage:
 
 | Symptom | Stage | Where to look |
 | --- | --- | --- |
-| Client never reaches `CPP_REMOTE_REACHABLE` | no stage — nothing logged | Wrong key or blocked UDP: the server never logs `new session:`/`FAIL_STAGE=DECRYPT_FAILED` for the packet |
+| Client never reaches `CPP_REMOTE_REACHABLE` | no stage — nothing logged | Wrong key or blocked UDP: no `new session:` and no `FAIL_STAGE=DECRYPT_FAILED` for the packet |
 | Android logs `SOCKS5 reply failed: <code>` | none (client side) | Server could not reach the target; the C++ log carries the real stage |
 | `rep != 0x00` in the SOCKS5 response | `TCP_CONNECT_FAILED` / `DNS_RESOLVE_FAILED` / `SSRF_BLOCKED` | Server cannot reach the target, or it is a restricted address |
 | `rep=0x04` for every IPv6 target | `TCP_CONNECT_FAILED` `ERROR=Network is unreachable` | The **server** has no IPv6 egress. See the IPv6 note below |
@@ -220,6 +220,56 @@ If a request fails, match the symptom to a stage:
 | Session dies before SOCKS5 starts | `KCP_HANDSHAKE_FAILED` / `KCP_INPUT_FAILED` | Handshake read failed or `ikcp_input()` rejected a segment |
 | Garbage bytes in tunnel | KCP param mismatch | Confirm both ends print the same `KCP config` line |
 | `UDP ASSOCIATE` rejected | `SOCKS5_UNSUPPORTED_COMMAND` | Expected — only CONNECT is supported |
+
+### Reply-code reference
+
+The server answers every CONNECT with one RFC 1928 reply code. These codes are
+the *only* thing the Android side sees when a CONNECT is refused, so they are
+kept distinct on purpose — telling a blocked target apart from a timeout is the
+difference between "check the allowlist" and "check the firewall":
+
+| Code | Constant | Emitted when |
+| --- | --- | --- |
+| `0x00` | `SOCKS5_REPLY_SUCCEEDED` | TCP connect to the target completed |
+| `0x01` | `SOCKS5_REPLY_GENERAL_FAILURE` | Fallback: unrecognised OS error, or a request that could not be parsed |
+| `0x02` | `SOCKS5_REPLY_NOT_ALLOWED` | Target refused by `is_restricted_target()` / `--allow-target` |
+| `0x03` | `SOCKS5_REPLY_NETWORK_UNREACHABLE` | `network_unreachable` from the OS |
+| `0x04` | `SOCKS5_REPLY_HOST_UNREACHABLE` | DNS resolution failed, or `host_unreachable` from the OS |
+| `0x05` | `SOCKS5_REPLY_CONNECTION_REFUSED` | Target actively refused (RST) |
+| `0x06` | `SOCKS5_REPLY_TTL_EXPIRED` | The connect deadline fired (target silently dropped SYNs) |
+| `0x07` | `SOCKS5_REPLY_COMMAND_NOT_SUPPORTED` | `cmd` is not CONNECT |
+| `0x08` | `SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED` | `ATYP` is not IPv4 / domain / IPv6 |
+
+Two of these (`0x02`, `0x06`) used to be reported as `0x04`, which made an
+allowlist refusal and a firewalled target both look like "no such host". Both
+now have their own code, pinned by `test_socks5_reply_codes_are_rfc1928` and
+`test_error_reply_code_distinguishes_timeout`.
+
+### Reading a client-side handshake timeout
+
+When the local app's SOCKS5 handshake never completes, the client emits one
+line that names which half failed:
+
+```text
+FAIL_STAGE=SOCKS5_HANDSHAKE_TIMEOUT DETAIL=<stage> REMOTE_REACHABLE=<bool> timeout=<n>s
+```
+
+| `DETAIL` | `REMOTE_REACHABLE` | Meaning |
+| --- | --- | --- |
+| `KCP_HANDSHAKE` | `false` | The tunnel never came up. Rare on THIS line: a wrong key, blocked UDP or a dead server is normally caught by the 3s KCP handshake timer first, which aborts the connection and cancels this deadline. |
+| `SOCKS5_HANDSHAKE` | `true` | The HELLO/ACK exchange completed; the local SOCKS5 handshake (the app's greeting and/or the CONNECT reply) did not finish within the deadline. |
+
+Those are the only two states the client can be in when that deadline fires:
+`connected_` is set by the handler that receives `KCP_PROXY_HELLO_ACK`, so a
+"tunnel up but ACK pending" state does not exist. (An earlier revision printed a
+third value, `KCP_HANDSHAKE_ACK_PENDING`, which was therefore unreachable and
+mislabelled the "tunnel up, CONNECT unanswered" case.) The line deliberately
+does not claim *which* SOCKS5 half stalled: the client does not record whether
+the app's greeting arrived, and guessing would be worse than saying less.
+
+`REMOTE_REACHABLE=false` is the one line that justifies "server unreachable".
+`REMOTE_REACHABLE=true` means the tunnel worked and the problem is on the local
+side or in the CONNECT exchange.
 
 Full stage list: see `TROUBLESHOOTING.md` → "Common Failure Stages".
 

@@ -1,6 +1,7 @@
 #include "kcp/internal/constants.h"
 #include "kcp/internal/fec.h"
 #include "kcp_proxy/address.hpp"
+#include "kcp_proxy/buffer_pool.hpp"
 #include "kcp_proxy/client.hpp"
 #include "kcp_proxy/config.hpp"
 #include "kcp_proxy/crypto.hpp"
@@ -630,6 +631,41 @@ TEST_CASE("test_kcp_config_line") {
     has("sndWnd=" + std::to_string(KCP_SNDWND));
     has("rcvWnd=" + std::to_string(KCP_RCVWND));
     has("timeout=" + std::to_string(KCP_TIMEOUT_SEC) + "s");
+}
+
+TEST_CASE("test_receive_buffers_cover_the_largest_legal_datagram") {
+    // A datagram larger than the receive buffer is not refused by the kernel:
+    // recvfrom()/recvmmsg() truncate it and discard the tail WITHOUT an error
+    // (Linux) or with WSAEMSGSIZE after the payload is already lost (Windows).
+    // The AEAD tag can then never verify, so the tunnel stops working with
+    // nothing but decrypt failures in the log. UDP_RECV_BUF_SIZE was a 4096
+    // literal, which silently broke every --mtu above ~4 KB although the CLI
+    // accepts up to KCP_MTU_MAX (9000).
+    CHECK(UDP_RECV_BUF_SIZE >= UDP_WIRE_DATAGRAM_MAX);
+
+    // Wire size of the worst packet at the largest legal --mtu: salt+nonce,
+    // FEC header+length, one full KCP datagram, AEAD tag.
+    const size_t worst_case = FEC_CRYPTO_RESERVE + 8 + static_cast<size_t>(KCP_MTU_MAX) + TAG_SIZE;
+    CHECK(worst_case <= UDP_RECV_BUF_SIZE);
+
+    // The default MTU fits with room to spare (the shipped path).
+    CHECK(FEC_CRYPTO_RESERVE + 8 + static_cast<size_t>(KCP_MTU) + TAG_SIZE <= UDP_RECV_BUF_SIZE);
+
+    // --mtu is clamped, so no accepted value can ever exceed what the receive
+    // path holds.
+    CHECK(clamp_kcp_value(KCP_MTU_MAX + 1000, KCP_MTU_MIN, KCP_MTU_MAX) == KCP_MTU_MAX);
+    CHECK(clamp_kcp_value(0, KCP_MTU_MIN, KCP_MTU_MAX) == KCP_MTU_MIN);
+
+    // The per-datagram pool must still recycle a datagram of that size: an
+    // 8 KiB cap sat below the 9 KB one, so a wide --mtu paid a malloc/free per
+    // packet on the hot path instead of reusing the buffer.
+    {
+        std::vector<uint8_t> big(UDP_WIRE_DATAGRAM_MAX, 0);
+        const size_t big_capacity = big.capacity();
+        datagram_pool().release(std::move(big));
+        auto recycled = datagram_pool().acquire();
+        CHECK(recycled.capacity() >= big_capacity);
+    }
 }
 
 TEST_CASE("test_socket_buffer_clamp_detection") {
@@ -3267,6 +3303,114 @@ TEST_CASE("test_session_target_close_drops_parked_write_hook") {
     session->stop();
     io.restart();
     io.poll();
+}
+
+// Pins the SOCKS5 reply codes this server actually emits. They are wire-visible
+// diagnostics: a client (and the Android CPP_REMOTE peer, which logs
+// "SOCKS5 response rep=0x%02X") has nothing else to go on when a CONNECT is
+// refused, so a code that says the wrong thing sends an operator hunting for a
+// nonexistent host instead of a firewall rule.
+TEST_CASE("test_socks5_reply_codes_are_rfc1928") {
+    using namespace kcp_proxy;
+
+    // RFC 1928 section 6 assignments.
+    CHECK(SOCKS5_REPLY_SUCCEEDED == 0x00);
+    CHECK(SOCKS5_REPLY_GENERAL_FAILURE == 0x01);
+    CHECK(SOCKS5_REPLY_NOT_ALLOWED == 0x02);
+    CHECK(SOCKS5_REPLY_NETWORK_UNREACHABLE == 0x03);
+    CHECK(SOCKS5_REPLY_HOST_UNREACHABLE == 0x04);
+    CHECK(SOCKS5_REPLY_CONNECTION_REFUSED == 0x05);
+    CHECK(SOCKS5_REPLY_TTL_EXPIRED == 0x06);
+    CHECK(SOCKS5_REPLY_COMMAND_NOT_SUPPORTED == 0x07);
+    CHECK(SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED == 0x08);
+
+    // 0x02 and 0x06 must stay distinct from their neighbours. Both were absent
+    // once, so an SSRF refusal reported HOST_UNREACHABLE (0x04) and a connect
+    // timeout reported HOST_UNREACHABLE too -- "no such host" for a rule
+    // refusal and for a silent target respectively.
+    CHECK(SOCKS5_REPLY_NOT_ALLOWED != SOCKS5_REPLY_HOST_UNREACHABLE);
+    CHECK(SOCKS5_REPLY_TTL_EXPIRED != SOCKS5_REPLY_HOST_UNREACHABLE);
+    CHECK(SOCKS5_REPLY_TTL_EXPIRED != SOCKS5_REPLY_CONNECTION_REFUSED);
+}
+
+// A connect timeout and an explicitly-not-allowed target must not collapse into
+// the same error code, since get_error_reply_code() is what turns the client's
+// OS-level error into the reply the app sees.
+TEST_CASE("test_error_reply_code_distinguishes_timeout") {
+    using namespace kcp_proxy;
+
+    const uint8_t timeout = KCPServer::get_error_reply_code(asio::error::timed_out);
+    CHECK_MESSAGE(timeout == SOCKS5_REPLY_TTL_EXPIRED,
+                "a connect timeout must report TTL expired, not host unreachable");
+    CHECK(timeout != SOCKS5_REPLY_HOST_UNREACHABLE);
+
+    // The mappings that were already correct must stay that way.
+    CHECK(KCPServer::get_error_reply_code(asio::error::connection_refused) ==
+          SOCKS5_REPLY_CONNECTION_REFUSED);
+    CHECK(KCPServer::get_error_reply_code(asio::error::network_unreachable) ==
+          SOCKS5_REPLY_NETWORK_UNREACHABLE);
+    CHECK(KCPServer::get_error_reply_code(asio::error::host_unreachable) ==
+          SOCKS5_REPLY_HOST_UNREACHABLE);
+    // Anything unrecognised stays a general failure rather than inventing a code.
+    CHECK(KCPServer::get_error_reply_code(asio::error::invalid_argument) ==
+          SOCKS5_REPLY_GENERAL_FAILURE);
+}
+
+// The runtime KcpTuning the CLI (--sndwnd/--rcvwnd/--mtu) produces must keep the
+// same backpressure invariant the compile-time constants are static_asserted on.
+// Each individual CLI bound is legal; it is the COMBINATION that can break it
+// (a big mtu shrinks mss, so one FWD_BUF_SIZE message needs more of the window).
+TEST_CASE("test_kcp_tuning_backpressure_invariant") {
+    using namespace kcp_proxy;
+
+    // Defaults must hold.
+    CHECK(KcpTuning{}.backpressure_invariant_holds());
+
+    // The extremes on their own must still hold -- these are the values the CLI
+    // ranges actually permit.
+    KcpTuning smallest;
+    smallest.sndwnd = KCP_SNDWND_MIN;
+    smallest.rcvwnd = KCP_RCVWND_MIN;
+    smallest.mtu = KCP_MTU_MIN;
+    CHECK_MESSAGE(smallest.backpressure_invariant_holds(),
+                  "min sndwnd with min mtu must keep the watermarks ordered");
+    KcpTuning widest;
+    widest.sndwnd = KCP_SNDWND_MAX;
+    widest.rcvwnd = KCP_RCVWND_MAX;
+    widest.mtu = KCP_MTU_MAX;
+    CHECK_MESSAGE(widest.backpressure_invariant_holds(),
+                  "max sndwnd with max mtu must keep the watermarks ordered");
+
+    // Every legal mtu with the smallest legal sndwnd: no combination may yield a
+    // non-positive resume watermark, because a non-positive one makes the park
+    // predicate permanently true and busy-spins the writer.
+    for (int mtu = KCP_MTU_MIN; mtu <= KCP_MTU_MAX; mtu += 128) {
+        KcpTuning t;
+        t.sndwnd = KCP_SNDWND_MIN;
+        t.rcvwnd = KCP_RCVWND_MIN;
+        t.mtu = mtu;
+        const std::string at = "at mtu=" + std::to_string(mtu);
+        INFO(at);
+        CHECK_MESSAGE(t.backpressure_resume() > 0,
+                      "resume watermark went non-positive");
+        CHECK_MESSAGE(t.backpressure_threshold() + t.max_segments_per_msg() <= t.sndwnd,
+                      "threshold must leave room for a whole message");
+        CHECK_MESSAGE(t.backpressure_invariant_holds(), "invariant must hold");
+    }
+
+    // set_kcp_tuning clamps each field into its declared range.
+    set_kcp_tuning(1, 1, 1);
+    CHECK(kcp_tuning().sndwnd == KCP_SNDWND_MIN);
+    CHECK(kcp_tuning().rcvwnd == KCP_RCVWND_MIN);
+    CHECK(kcp_tuning().mtu == KCP_MTU_MIN);
+    set_kcp_tuning(99999, 99999, 99999);
+    CHECK(kcp_tuning().sndwnd == KCP_SNDWND_MAX);
+    CHECK(kcp_tuning().rcvwnd == KCP_RCVWND_MAX);
+    CHECK(kcp_tuning().mtu == KCP_MTU_MAX);
+    // Restore the defaults so later test cases see the baseline.
+    set_kcp_tuning(KCP_SNDWND, KCP_RCVWND, KCP_MTU);
+    CHECK(kcp_tuning().sndwnd == KCP_SNDWND);
+    CHECK(kcp_tuning().backpressure_invariant_holds());
 }
 
 } // namespace

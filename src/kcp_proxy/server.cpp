@@ -11,6 +11,9 @@
 #include <asio/write.hpp>
 #include <asio/connect.hpp>
 #include <fmt/format.h>
+// OPENSSL_cleanse for wipe_key(): the optimiser may discard a plain memset that
+// is immediately followed by the buffer's release (see wipe_key's comment).
+#include <openssl/crypto.h>
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <mswsock.h>
@@ -94,7 +97,15 @@ bool KCPServer::is_target_allowed(const std::string& host, uint16_t port) const 
 }
 
 void KCPServer::wipe_key() {
-    std::memset(key_.data(), 0, key_.size());
+    // OPENSSL_cleanse, not std::memset: memset followed by a release/clear is a
+    // dead store, so an optimising compiler may delete it outright -- and with
+    // /GL (whole-program optimisation is on for this target) the PSK would then
+    // survive in freed heap memory and in any core dump. crypto.cpp already
+    // used OPENSSL_cleanse for exactly this reason; the two wipe_key() helpers
+    // were the ones still calling memset.
+    if (!key_.empty()) {
+        OPENSSL_cleanse(key_.data(), key_.size());
+    }
     key_.clear();
     key_.shrink_to_fit();
 }
@@ -289,19 +300,7 @@ void KCPServer::handle_receive_drain(const std::error_code& wait_ec) {
             LOG_ERROR("server", fmt::format("UDP readiness wait error: {}{}", wait_ec.message(),
                                             throttle_suffix(suppressed)));
         }
-        // Reuse the slot backoff timer: it re-arms via arm_receive_slot in the
-        // slot model, so it is only meaningful here if we re-arm the drain
-        // with it. Keep it simple: a bounded retry through the same timer.
-        if (!recv_backoff_armed_) {
-            recv_backoff_armed_ = true;
-            auto self = shared_from_this();
-            receive_backoff_timer_.expires_after(std::chrono::milliseconds(10));
-            receive_backoff_timer_.async_wait(asio::bind_executor(
-                udp_socket_.get_executor(), [this, self](const std::error_code& timer_ec) {
-                    recv_backoff_armed_ = false;
-                    if (!timer_ec && running_) arm_receive_drain();
-                }));
-        }
+        park_receive_drain();
         return;
     }
 
@@ -312,7 +311,11 @@ void KCPServer::handle_receive_drain(const std::error_code& wait_ec) {
     // with one recvmmsg per 64 datagrams instead of one recvmsg per datagram.
     int fd = udp_socket_.native_handle();
     size_t drained = 0;
-    bool transient_error = false;
+    // errno of the recvmmsg call that ended the drain with a real failure, 0
+    // when the drain ended because the kernel buffer was empty. Captured HERE:
+    // the routing loop below makes syscalls and would overwrite errno before a
+    // later read of it (which reported an unrelated, misleading error).
+    int recv_errno = 0;
     while (running_ && drained < UDP_DRAIN_BATCH_MAX) {
         const size_t want = std::min(UDP_DRAIN_BATCH_MAX - drained, UDP_BATCH_MAX);
         struct mmsghdr msgs[UDP_BATCH_MAX];
@@ -330,7 +333,7 @@ void KCPServer::handle_receive_drain(const std::error_code& wait_ec) {
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
         if (n < 0 && errno == EINTR) continue;
         if (n < 0) {
-            transient_error = true;
+            recv_errno = errno;
             break;
         }
         for (int i = 0; i < n; ++i) {
@@ -369,15 +372,32 @@ void KCPServer::handle_receive_drain(const std::error_code& wait_ec) {
         route_datagram(endpoint, byte_view(drain_bufs_[i].data(), len));
     }
 
-    if (transient_error) {
+    if (recv_errno != 0) {
         uint32_t suppressed = 0;
-        int err = errno; // recvmmsg failed outside EAGAIN/EINTR
         if (recv_error_log_.should_log(suppressed)) {
-            LOG_ERROR("server", fmt::format("UDP receive error: {}{}", std::strerror(err),
+            LOG_ERROR("server", fmt::format("UDP receive error: {}{}", std::strerror(recv_errno),
                                             throttle_suffix(suppressed)));
         }
+        // Back off instead of re-arming at once: a readiness wait on a socket
+        // that keeps failing returns immediately, so an immediate re-arm is a
+        // busy spin plus (throttled) log work, exactly what park_receive_slot
+        // exists to bound on the slot path. ~100 retries/s.
+        park_receive_drain();
+        return;
     }
     arm_receive_drain();
+}
+
+void KCPServer::park_receive_drain() {
+    if (recv_backoff_armed_) return;
+    recv_backoff_armed_ = true;
+    auto self = shared_from_this();
+    receive_backoff_timer_.expires_after(std::chrono::milliseconds(10));
+    receive_backoff_timer_.async_wait(asio::bind_executor(
+        udp_socket_.get_executor(), [this, self](const std::error_code& timer_ec) {
+            recv_backoff_armed_ = false;
+            if (!timer_ec && running_) arm_receive_drain();
+        }));
 }
 #endif // __linux__
 
@@ -881,6 +901,12 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                 drop_replaced_target_locked(sid);
             }
         }
+        // The incumbent this packet is replacing (an authenticated reconnect on a
+        // reused source port) was already erased above, so `sessions_.size()` no
+        // longer counts it -- the subtraction the pre-auth check performs is not
+        // needed here. It also must not be needed: this branch runs after the
+        // erase, so a genuine reconnect at exactly MAX_CONCURRENT_SESSIONS
+        // correctly makes room for itself instead of being refused.
         if (sessions_.size() >= MAX_CONCURRENT_SESSIONS) {
             rejection = RejectReason::SessionCap;
         } else {
@@ -1286,7 +1312,9 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                           " CLIENT_ENDPOINT={} TARGET={}:{}",
                                           CONNECT_TIMEOUT_SEC, session->session_id(), request.host,
                                           request.port));
-        send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
+        // TTL_EXPIRED matches get_error_reply_code()'s timed_out mapping, so a
+        // connect timeout reports the same code whichever path detects it.
+        send_socks5_reply(session, SOCKS5_REPLY_TTL_EXPIRED);
         close_connection(session->session_id(), "connect_timeout", session);
     });
 
@@ -1306,7 +1334,11 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
             LOG_WARNING("server", fmt::format("FAIL_STAGE=SSRF_BLOCKED ERROR=restricted_target"
                                               " CLIENT_ENDPOINT={} TARGET={}:{}",
                                               session->session_id(), request.host, request.port));
-            send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
+            // NOT_ALLOWED (0x02, "connection not allowed by ruleset") is the
+            // accurate RFC 1928 code for a policy refusal. HOST_UNREACHABLE said
+            // "the target does not exist", which is actively misleading when an
+            // operator is working out why one host is blocked.
+            send_socks5_reply(session, SOCKS5_REPLY_NOT_ALLOWED);
             close_connection(session->session_id(), "ssrf_blocked", session);
             return;
         }
@@ -1361,9 +1393,22 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                                                   " CLIENT_ENDPOINT={} TARGET={}:{} RESOLVED={}",
                                                   session->session_id(), request.host, request.port,
                                                   restricted_addr));
-                send_socks5_reply(session, SOCKS5_REPLY_HOST_UNREACHABLE);
+                send_socks5_reply(session, SOCKS5_REPLY_NOT_ALLOWED);
                 close_connection(session->session_id(), "ssrf_blocked_postresolve", session);
                 return;
+            }
+            if (restricted) {
+                // The allowlist is the ONLY bypass of the SSRF guard, so every
+                // use of it must leave a record. The literal-IP branch above
+                // logs this line; without the same line here, a --allow-target
+                // entry naming a DOMAIN that resolves into a private range was
+                // silently honoured -- the one case an operator most needs to
+                // see, because the entry looked harmless when it was written.
+                LOG_WARNING("server",
+                            fmt::format("SSRF_ALLOWLISTED CLIENT_ENDPOINT={} TARGET={}:{}"
+                                        " RESOLVED={}",
+                                        session->session_id(), request.host, request.port,
+                                        restricted_addr));
             }
 
             LOG_INFO("server", fmt::format("{}: resolved {} to {} endpoints, connecting...",
@@ -2219,7 +2264,10 @@ uint8_t KCPServer::get_error_reply_code(const std::error_code& ec) {
     if (ec == asio::error::connection_refused) return SOCKS5_REPLY_CONNECTION_REFUSED;
     if (ec == asio::error::network_unreachable) return SOCKS5_REPLY_NETWORK_UNREACHABLE;
     if (ec == asio::error::host_unreachable) return SOCKS5_REPLY_HOST_UNREACHABLE;
-    if (ec == asio::error::timed_out) return SOCKS5_REPLY_HOST_UNREACHABLE;
+    // TTL_EXPIRED, not HOST_UNREACHABLE: this path is reached when the connect
+    // itself timed out, and reporting 0x04 made a silent/firewalled target
+    // indistinguishable from a nonexistent host in the client's log.
+    if (ec == asio::error::timed_out) return SOCKS5_REPLY_TTL_EXPIRED;
     return SOCKS5_REPLY_GENERAL_FAILURE;
 }
 
