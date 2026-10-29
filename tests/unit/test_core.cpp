@@ -644,8 +644,8 @@ TEST_CASE("test_try_fulfill_read_drains_past_a_queued_keepalive") {
     const auto salt = Crypto::generate_session_salt();
     auto crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, salt);
     auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
-    auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, crypto,
-                                                "unit-keepalive-order");
+    auto session =
+        std::make_shared<KCPSession>(io, KCP_CONV, endpoint, crypto, "unit-keepalive-order");
     session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
     session->start();
     io.poll();
@@ -668,9 +668,9 @@ TEST_CASE("test_try_fulfill_read_drains_past_a_queued_keepalive") {
     peer.update(10);
     peer.flush();
     const std::string payload = "data-behind-keepalive";
-    CHECK_MESSAGE(peer.send(byte_view(reinterpret_cast<const uint8_t*>(payload.data()),
-                                      payload.size())) >= 0,
-                  "peer payload send");
+    CHECK_MESSAGE(
+        peer.send(byte_view(reinterpret_cast<const uint8_t*>(payload.data()), payload.size())) >= 0,
+        "peer payload send");
     peer.update(20);
     peer.flush();
     REQUIRE(peer_dgrams.size() == 2);

@@ -546,8 +546,9 @@ void KcpTunnel::try_fulfill_read() {
             // byte stream, and leaving the handler pending would hang the caller.
             std::vector<uint8_t> oversized;
             int oversized_bytes = kcp_.recv(oversized);
-            LOG_ERROR(log_module_, log_msg(fmt::format(
-                "dropped oversized KCP message ({} bytes > FWD_BUF_SIZE)", oversized_bytes)));
+            LOG_ERROR(log_module_,
+                      log_msg(fmt::format("dropped oversized KCP message ({} bytes > FWD_BUF_SIZE)",
+                                          oversized_bytes)));
             complete_pending_read(asio::error::message_size);
             return;
         }
@@ -587,16 +588,17 @@ void KcpTunnel::try_fulfill_read() {
         // silently truncating the stream (which would corrupt the tunnel); the
         // caller closes the connection on message_size.
         if (static_cast<size_t>(size) > pending_read_buffer_.size()) {
-            LOG_ERROR(log_module_, log_msg(fmt::format(
-                "KCP message too big for read buffer ({} > {}), aborting read",
-                size, pending_read_buffer_.size())));
+            LOG_ERROR(
+                log_module_,
+                log_msg(fmt::format("KCP message too big for read buffer ({} > {}), aborting read",
+                                    size, pending_read_buffer_.size())));
             complete_pending_read(asio::error::message_size);
             return;
         }
 
         LOG_DEBUG(log_module_, log_msg(fmt::format(
-            "try_fulfill_read - got {} bytes from KCP, buffer_capacity={}",
-            size, pending_read_buffer_.size())));
+                                   "try_fulfill_read - got {} bytes from KCP, buffer_capacity={}",
+                                   size, pending_read_buffer_.size())));
 
         const size_t to_copy = static_cast<size_t>(size);
         std::memcpy(pending_read_buffer_.data(), kcp_recv_buf_.data(), to_copy);
