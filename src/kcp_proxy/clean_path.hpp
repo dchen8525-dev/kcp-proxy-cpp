@@ -65,14 +65,24 @@ public:
     // only establishes the baseline and never transitions.
     Transition on_sample(uint64_t out_segs_total, uint64_t fast_retrans_total, int64_t now_us) {
         const bool first = !initialized_;
-        const uint64_t d_out = out_segs_total - last_out_segs_;
-        const uint64_t d_fast = fast_retrans_total - last_fast_retrans_;
+        // The counters are documented cumulative, so unsigned subtraction is
+        // the intended diff. If one ever moves backwards anyway (a reset, a
+        // future per-process test hook), the difference would underflow into a
+        // ~1.8e19 "segments sent" delta: seg_rate becomes astronomically large,
+        // one sample looks like sustained traffic, and a clean countdown can
+        // complete from a single interval. Treat it like the first sample --
+        // rebase the baseline and never transition -- rather than trusting an
+        // impossible counter.
+        const bool rebased = !first && (out_segs_total < last_out_segs_ ||
+                                        fast_retrans_total < last_fast_retrans_);
+        const uint64_t d_out = rebased ? 0 : out_segs_total - last_out_segs_;
+        const uint64_t d_fast = rebased ? 0 : fast_retrans_total - last_fast_retrans_;
         const int64_t dt_us = now_us - last_sample_us_;
         last_out_segs_ = out_segs_total;
         last_fast_retrans_ = fast_retrans_total;
         last_sample_us_ = now_us;
         initialized_ = true;
-        if (first || dt_us <= 0) return Transition::kNone;
+        if (first || rebased || dt_us <= 0) return Transition::kNone;
 
         if (d_fast > 0) {
             // The peer reported an ACK gap: a datagram of OURS was lost. This

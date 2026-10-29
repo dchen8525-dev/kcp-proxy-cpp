@@ -481,6 +481,9 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
 }
 
 std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>& out) noexcept {
+    // Declared outside the try so the exception path below can roll back an
+    // unproven salt commitment exactly like the explicit failure paths do.
+    bool learning_salt = false;
     try {
         if (ciphertext.size() < SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE) {
             // Per-packet attacker-controlled input: callers log throttled
@@ -502,7 +505,7 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         // a salt of the attacker's choosing, and every subsequent honest
         // datagram would be rejected by the mismatch check below -- a
         // one-shot, free denial of the whole tunnel. Roll back on failure.
-        const bool learning_salt = !salt_set_;
+        learning_salt = !salt_set_;
         if (learning_salt) {
             // Server side: this is the first packet of a brand-new session. Derive
             // the per-session key from the salt received on the wire.
@@ -629,6 +632,14 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
     } catch (const std::exception& e) {
         LOG_ERROR("crypto", fmt::format("decrypt exception: {}", e.what()));
         out.clear();
+        // Same contract as every explicit failure above: a salt is only
+        // committed by a packet that authenticates. The exception here is
+        // allocation/codec noise (this runs on attacker-controlled datagrams),
+        // not proof of a matching key, so an instance that learned a salt on
+        // this call must not keep it. In the server's auth path the candidate
+        // Crypto is discarded anyway; this keeps that invariant local instead of
+        // relying on the caller.
+        if (learning_salt) forget_learned_salt();
         return std::make_error_code(std::errc::io_error);
     }
 }

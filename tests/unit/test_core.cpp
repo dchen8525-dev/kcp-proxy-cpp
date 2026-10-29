@@ -3299,6 +3299,63 @@ TEST_CASE("test_allowlist_matching") {
                   "valid entry after a malformed one still matches");
     CHECK_MESSAGE(!target_matches_allowlist({}, "127.0.0.1", 9000),
                   "empty allowlist matches nothing");
+
+    // Host names are case-insensitive (RFC 4343), so an allowlist entry and the
+    // CONNECT host must match regardless of case. The comparison used to be
+    // byte-exact: an operator entry written "Example.COM:443" never matched an
+    // application asking for "example.com", and the explicitly allowed target
+    // was still refused as SSRF_BLOCKED -- a policy-looking failure caused by
+    // spelling. Folding cannot widen the rule: only strings that DNS itself
+    // treats as the same name become equal.
+    CHECK_MESSAGE(target_matches_allowlist({"Example.COM:443"}, "example.com", 443),
+                  "mixed-case entry must match a lower-case CONNECT host");
+    CHECK_MESSAGE(target_matches_allowlist({"example.com:443"}, "Example.Com", 443),
+                  "lower-case entry must match a mixed-case CONNECT host");
+    CHECK_MESSAGE(target_matches_allowlist({"EXAMPLE.COM"}, "example.com", 8080),
+                  "host-only entry matches case-insensitively on any port");
+    CHECK_MESSAGE(!target_matches_allowlist({"Example.COM:443"}, "example.com", 444),
+                  "case folding must not ignore the port");
+    CHECK_MESSAGE(!target_matches_allowlist({"example.com:443"}, "example.org", 443),
+                  "case folding must not widen the host");
+    CHECK_MESSAGE(target_matches_allowlist({"2001:DB8::1"}, "2001:db8::1", 80),
+                  "hex IPv6 literals fold case too");
+}
+
+TEST_CASE("test_clean_path_tracker_handles_counter_reset") {
+    // The tracker diffs CUMULATIVE process-wide SNMP totals with unsigned
+    // arithmetic. If a counter ever moves backwards the diff underflows into a
+    // ~1.8e19 delta: the sample then looks like an enormous traffic rate and
+    // one interval can complete a clean countdown (or, for fast_retrans, fake
+    // a loss). A rebased sample must be treated like the first one.
+    using T = CleanPathTracker::Transition;
+    CleanPathTracker tracker(
+        CleanPathTuning{/*clean_sec=*/4, /*hold_sec=*/10, /*min_seg_rate=*/50.0});
+    int64_t now = 1'000'000;
+    CHECK(tracker.on_sample(1000, 0, now) == T::kNone); // baseline only
+
+    now += 2'000'000;
+    CHECK(tracker.on_sample(2000, 0, now) == T::kNone); // +1000 segs / 2s = clean
+    CHECK(tracker.clean_us() == 2'000'000);
+
+    // Both counters restart from zero: this must not count as clean traffic.
+    now += 2'000'000;
+    CHECK(tracker.on_sample(10, 0, now) == T::kNone);
+    CHECK_MESSAGE(tracker.clean_us() == 2'000'000,
+                  "a rebased sample must not add clean time");
+
+    // Normal sampling resumes from the rebased baseline.
+    now += 2'000'000;
+    CHECK(tracker.on_sample(410, 0, now) == T::kToClean);
+
+    // A backwards fast-retransmit counter must not fabricate a loss event
+    // (the underflowed delta would be > 0 and looked like a peer-reported gap).
+    CleanPathTracker lossy(CleanPathTuning{4, 10, 50.0});
+    now = 1'000'000;
+    CHECK(lossy.on_sample(1000, 100, now) == T::kNone);
+    now += 2'000'000;
+    CHECK_MESSAGE(lossy.on_sample(2000, 5, now) == T::kNone,
+                  "a reset fast-retransmit counter must not be read as loss");
+    CHECK(lossy.clean_us() == 0);
 }
 
 // --------------------------------------------------------------------------- //

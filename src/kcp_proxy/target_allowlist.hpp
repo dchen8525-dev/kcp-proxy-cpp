@@ -43,6 +43,28 @@ inline bool parse_port_digits(const std::string& digits, uint16_t& port) {
     return true;
 }
 
+// ASCII-only, locale-independent case folding. DNS names are case-insensitive
+// (RFC 4343), so a CONNECT for "Example.COM" is the same destination as
+// "example.com" and must match an --allow-target entry for either spelling.
+// Comparing the raw strings byte-for-byte silently failed to match a
+// mixed-case entry: the target then stayed subject to the SSRF guard and was
+// refused as SSRF_BLOCKED, which reads like a security policy decision rather
+// than the typo it is. Folding ASCII only (never std::tolower, which depends on
+// the process locale) keeps this deterministic for the ASCII hostnames and
+// textual IP literals an allowlist is written with; non-ASCII names would not
+// match case-insensitively in any event, and still fail closed.
+inline bool ascii_iequals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i];
+        char cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
 } // namespace detail
 
 // Parse one allowlist entry into (host, has_port, port).
@@ -109,7 +131,7 @@ inline bool target_matches_allowlist(const std::vector<std::string>& entries,
         if (!parse_allow_target_entry(entry, entry_host, has_port, entry_port)) {
             continue;
         }
-        if (entry_host == host && (!has_port || entry_port == port)) {
+        if (detail::ascii_iequals(entry_host, host) && (!has_port || entry_port == port)) {
             return true;
         }
     }
