@@ -526,82 +526,95 @@ void KcpTunnel::try_fulfill_read() {
         return;
     }
 
-    // Use the fixed-size buffer to avoid heap allocation on the hot path.
-    int size = kcp_.recv(kcp_recv_buf_.data(), kcp_recv_buf_.size());
-    if (size == KcpWrapper::KCP_RECV_MSG_TOO_BIG) {
-        // A message larger than FWD_BUF_SIZE is a protocol violation (senders
-        // are capped at FWD_BUF_SIZE per message). Consume it so KCP stays
-        // consistent, then fail the read: we must never forward a truncated
-        // byte stream, and leaving the handler pending would hang the caller.
-        std::vector<uint8_t> oversized;
-        int oversized_bytes = kcp_.recv(oversized);
-        LOG_ERROR(log_module_, log_msg(fmt::format(
-            "dropped oversized KCP message ({} bytes > FWD_BUF_SIZE)", oversized_bytes)));
-        complete_pending_read(asio::error::message_size);
-        return;
-    }
-    if (size <= 0) {
-        return;
-    }
+    // Each iteration consumes one KCP message. The loop exists for the
+    // keepalive: a heartbeat queued ahead of stream data (the sender queues it
+    // whenever its own receive queue is empty, regardless of what it has still
+    // in flight) used to be consumed and dropped with a bare `return`, leaving
+    // the pending read unsatisfied until the next trigger re-armed
+    // try_fulfill_read -- on the server side that is the next inbound datagram
+    // or the shared 10ms tick, i.e. one stall of up to a tick (or a full RTT on
+    // a path quiet enough that no datagram arrives) per interleaved heartbeat.
+    // Draining past it keeps delivery latency independent of the heartbeat
+    // cadence.
+    for (;;) {
+        // Use the fixed-size buffer to avoid heap allocation on the hot path.
+        int size = kcp_.recv(kcp_recv_buf_.data(), kcp_recv_buf_.size());
+        if (size == KcpWrapper::KCP_RECV_MSG_TOO_BIG) {
+            // A message larger than FWD_BUF_SIZE is a protocol violation (senders
+            // are capped at FWD_BUF_SIZE per message). Consume it so KCP stays
+            // consistent, then fail the read: we must never forward a truncated
+            // byte stream, and leaving the handler pending would hang the caller.
+            std::vector<uint8_t> oversized;
+            int oversized_bytes = kcp_.recv(oversized);
+            LOG_ERROR(log_module_, log_msg(fmt::format(
+                "dropped oversized KCP message ({} bytes > FWD_BUF_SIZE)", oversized_bytes)));
+            complete_pending_read(asio::error::message_size);
+            return;
+        }
+        if (size <= 0) {
+            return;
+        }
 
-    // Drop application-layer keepalive heartbeats: they are not real stream
-    // data and must never be forwarded to the downstream TCP socket.
-    //
-    // The sentinel is the magic string scoped by this session's salt, so a
-    // genuine payload can never be mistaken for it: the full keepalive is
-    // "KCP_PROXY_KEEPALIVE_V1" || session_salt (16 random bytes), and matching
-    // requires the salt exactly. A real segment carrying the bare 22-byte magic
-    // (previously ambiguous) is forwarded normally.
-    if (is_keepalive(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
-        LOG_DEBUG(log_module_, log_msg("keepalive received, dropping"));
-        return;
-    }
+        // Drop application-layer keepalive heartbeats: they are not real stream
+        // data and must never be forwarded to the downstream TCP socket.
+        //
+        // The sentinel is the magic string scoped by this session's salt, so a
+        // genuine payload can never be mistaken for it: the full keepalive is
+        // "KCP_PROXY_KEEPALIVE_V1" || session_salt (16 random bytes), and matching
+        // requires the salt exactly. A real segment carrying the bare 22-byte magic
+        // (previously ambiguous) is forwarded normally.
+        if (is_keepalive(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
+            LOG_DEBUG(log_module_, log_msg("keepalive received, dropping"));
+            continue;
+        }
 
-    // The peer half-closed. Like the keepalive this is a control message and not
-    // stream data, but unlike it the pending read must complete: the caller's
-    // forwarding loop is the only thing that can act on "no more data will
-    // come", and complete-with-eof is the signal it already understands. KCP is
-    // ordered, so everything the peer queued before the FIN has been handed to
-    // the caller already -- nothing is lost by stopping there.
-    if (is_peer_fin(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
-        LOG_INFO(log_module_, log_msg("peer FIN received (half-close)"));
-        peer_fin_received_.store(true);
-        complete_pending_read(asio::error::eof);
-        return;
-    }
+        // The peer half-closed. Like the keepalive this is a control message and not
+        // stream data, but unlike it the pending read must complete: the caller's
+        // forwarding loop is the only thing that can act on "no more data will
+        // come", and complete-with-eof is the signal it already understands. KCP is
+        // ordered, so everything the peer queued before the FIN has been handed to
+        // the caller already -- nothing is lost by stopping there.
+        if (is_peer_fin(kcp_recv_buf_.data(), static_cast<size_t>(size))) {
+            LOG_INFO(log_module_, log_msg("peer FIN received (half-close)"));
+            peer_fin_received_.store(true);
+            complete_pending_read(asio::error::eof);
+            return;
+        }
 
-    // async_read_some delivers one whole KCP message. The message was already
-    // consumed into kcp_recv_buf_ above, so if it does not fit the caller's
-    // buffer there is no way to hand back the tail. Report the error instead of
-    // silently truncating the stream (which would corrupt the tunnel); the
-    // caller closes the connection on message_size.
-    if (static_cast<size_t>(size) > pending_read_buffer_.size()) {
-        LOG_ERROR(log_module_, log_msg(fmt::format(
-            "KCP message too big for read buffer ({} > {}), aborting read",
+        // async_read_some delivers one whole KCP message. The message was already
+        // consumed into kcp_recv_buf_ above, so if it does not fit the caller's
+        // buffer there is no way to hand back the tail. Report the error instead of
+        // silently truncating the stream (which would corrupt the tunnel); the
+        // caller closes the connection on message_size.
+        if (static_cast<size_t>(size) > pending_read_buffer_.size()) {
+            LOG_ERROR(log_module_, log_msg(fmt::format(
+                "KCP message too big for read buffer ({} > {}), aborting read",
+                size, pending_read_buffer_.size())));
+            complete_pending_read(asio::error::message_size);
+            return;
+        }
+
+        LOG_DEBUG(log_module_, log_msg(fmt::format(
+            "try_fulfill_read - got {} bytes from KCP, buffer_capacity={}",
             size, pending_read_buffer_.size())));
-        complete_pending_read(asio::error::message_size);
+
+        const size_t to_copy = static_cast<size_t>(size);
+        std::memcpy(pending_read_buffer_.data(), kcp_recv_buf_.data(), to_copy);
+
+        auto handler = std::move(pending_read_handler_);
+        pending_read_buffer_ = asio::mutable_buffer{nullptr, 0};
+        pending_read_handler_ = nullptr;
+
+        // Dispatch the completion via post() so the caller cannot synchronously
+        // re-enter async_read_some -> try_fulfill_read on the same stack frame.
+        // Post to the session strand (not the raw io_context) so the completion
+        // keeps session affinity and avoids a cross-thread hop.
+        auto self = shared_from_this();
+        asio::post(strand_, [self, handler = std::move(handler), to_copy]() mutable {
+            handler(std::error_code{}, to_copy);
+        });
         return;
     }
-
-    LOG_DEBUG(log_module_, log_msg(fmt::format(
-        "try_fulfill_read - got {} bytes from KCP, buffer_capacity={}",
-        size, pending_read_buffer_.size())));
-
-    const size_t to_copy = static_cast<size_t>(size);
-    std::memcpy(pending_read_buffer_.data(), kcp_recv_buf_.data(), to_copy);
-
-    auto handler = std::move(pending_read_handler_);
-    pending_read_buffer_ = asio::mutable_buffer{nullptr, 0};
-    pending_read_handler_ = nullptr;
-
-    // Dispatch the completion via post() so the caller cannot synchronously
-    // re-enter async_read_some -> try_fulfill_read on the same stack frame.
-    // Post to the session strand (not the raw io_context) so the completion
-    // keeps session affinity and avoids a cross-thread hop.
-    auto self = shared_from_this();
-    asio::post(strand_, [self, handler = std::move(handler), to_copy]() mutable {
-        handler(std::error_code{}, to_copy);
-    });
 }
 
 void KcpTunnel::maybe_log_stats() {

@@ -629,6 +629,86 @@ TEST_CASE("test_async_read_some_rejects_stacked_reads") {
     CHECK_MESSAGE(first_called, "first read should be aborted during stop");
 }
 
+TEST_CASE("test_try_fulfill_read_drains_past_a_queued_keepalive") {
+    // A keepalive consumed while a read is pending used to end
+    // try_fulfill_read with a bare return, leaving stream data that KCP had
+    // ALREADY queued behind the heartbeat unserved until the next trigger
+    // re-armed try_fulfill_read -- on the server side the next inbound
+    // datagram or the shared 10ms tick, i.e. up to a full RTT of added
+    // delivery latency per interleaved heartbeat on a quiet path. This
+    // harness runs no tick, so with the old code the read below would never
+    // complete at all: the loop must drain past the heartbeat and deliver
+    // the data message behind it in the same call.
+    asio::io_context io;
+    const std::string key = "remote_test_key_123456";
+    const auto salt = Crypto::generate_session_salt();
+    auto crypto = std::make_shared<Crypto>(key, NONCE_DIR_SERVER, salt);
+    auto endpoint = asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), 8388);
+    auto session = std::make_shared<KCPSession>(io, KCP_CONV, endpoint, crypto,
+                                                "unit-keepalive-order");
+    session->set_send_callback([](std::vector<std::vector<uint8_t>>) {});
+    session->start();
+    io.poll();
+    io.restart();
+
+    // Produce two real KCP push datagrams with a peer wrapper: the heartbeat
+    // (magic || this session's salt) first, then stream data behind it.
+    KcpWrapper peer(KCP_CONV);
+    const std::string keepalive =
+        std::string(KCP_CONTROL_KEEPALIVE) +
+        std::string(reinterpret_cast<const char*>(crypto->session_salt().data()),
+                    crypto->session_salt().size());
+    std::vector<std::vector<uint8_t>> peer_dgrams;
+    peer.set_output_callback([&peer_dgrams](byte_view d) {
+        peer_dgrams.emplace_back(d.begin(), d.end());
+    });
+    CHECK_MESSAGE(peer.send(byte_view(reinterpret_cast<const uint8_t*>(keepalive.data()),
+                                      keepalive.size())) >= 0,
+                  "peer keepalive send");
+    peer.update(10);
+    peer.flush();
+    const std::string payload = "data-behind-keepalive";
+    CHECK_MESSAGE(peer.send(byte_view(reinterpret_cast<const uint8_t*>(payload.data()),
+                                      payload.size())) >= 0,
+                  "peer payload send");
+    peer.update(20);
+    peer.flush();
+    REQUIRE(peer_dgrams.size() == 2);
+
+    // Queue both on the session BEFORE any read is pending: each injection's
+    // try_fulfill_read is a no-op without a handler, so both messages sit in
+    // KCP's receive queue, heartbeat first.
+    session->inject_decrypted(peer_dgrams[0]);
+    io.poll();
+    io.restart();
+    session->inject_decrypted(peer_dgrams[1]);
+    io.poll();
+    io.restart();
+
+    // Now register the read. try_fulfill_read must consume the heartbeat,
+    // keep draining, and complete with the data message in the same call.
+    std::array<uint8_t, 64> buf{};
+    bool completed = false;
+    size_t got = 0;
+    std::error_code read_ec;
+    session->async_read_some(asio::buffer(buf), [&](std::error_code ec, size_t bytes) {
+        completed = true;
+        read_ec = ec;
+        got = bytes;
+    });
+    io.poll();
+
+    CHECK_MESSAGE(completed, "the read must complete despite the queued heartbeat");
+    CHECK_MESSAGE(!read_ec, "the data message behind the heartbeat must not error");
+    CHECK_MESSAGE(got == payload.size(), "the data message must be delivered whole");
+    CHECK_MESSAGE(std::memcmp(buf.data(), payload.data(), payload.size()) == 0,
+                  "the delivered bytes must be the payload, not the heartbeat");
+
+    session->stop();
+    io.restart();
+    io.poll();
+}
+
 TEST_CASE("test_kcp_config_line") {
     // The startup log line is the contract between the two ends of a tunnel:
     // both peers must print the same KCP settings or ikcp silently discards
