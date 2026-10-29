@@ -10,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -76,6 +77,15 @@ private:
     asio::io_context& io_;
     std::string server_host_;
     uint16_t server_port_;
+    // PSK. Read on the io thread (handle_client_connection builds each new
+    // session's Crypto from it) and wiped by stop() (the signal handler or the
+    // destructor). Both are serialized by the io_context in the shipped
+    // single-threaded configuration, but stop() is a public API and the wipe is
+    // a key_.clear()+shrink_to_fit -- a concurrent reader would see a torn
+    // string. The mutex makes stop() safe to call from any thread by
+    // construction, the same guarantee KCPServer gets from deferring wipe_key()
+    // onto the socket strand.
+    std::mutex key_mutex_;
     std::string key_;
     std::string listen_host_;
     uint16_t listen_port_;

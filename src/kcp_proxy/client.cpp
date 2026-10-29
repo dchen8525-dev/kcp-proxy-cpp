@@ -138,6 +138,11 @@ void KCPProxyClient::wipe_key() {
     // store that /GL may remove entirely, leaving the PSK readable in freed
     // heap. Keep the two wipe_key() helpers on the same primitive as
     // crypto.cpp.
+    //
+    // Under key_mutex_: stop() can be invoked from a different thread than the
+    // io handlers that read key_ (see the member comment), and a wipe racing a
+    // Crypto construction would hand the new session a torn key.
+    std::lock_guard<std::mutex> lock(key_mutex_);
     if (!key_.empty()) {
         OPENSSL_cleanse(key_.data(), key_.size());
     }
@@ -412,7 +417,14 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     std::shared_ptr<Crypto> crypto;
     std::shared_ptr<KCPClientSession> session;
     try {
-        crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT, Crypto::generate_session_salt());
+        // Salt generation needs no lock (it reads no shared state); the Crypto
+        // construction is the key_ read that wipe_key() must not race (see the
+        // key_mutex_ comment). Hold it only across the construction, not the
+        // session setup, so concurrent connections pay an uncontended mutex
+        // and never hold it across an ikcp_create.
+        const auto salt = Crypto::generate_session_salt();
+        std::lock_guard<std::mutex> key_lock(key_mutex_);
+        crypto = std::make_shared<Crypto>(key_, NONCE_DIR_CLIENT, salt);
         session = std::make_shared<KCPClientSession>(io_, server_endpoint_, crypto, KCP_CONV, fec_,
                                                      adaptive_hooks());
     } catch (const std::exception& e) {
