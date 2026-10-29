@@ -33,8 +33,7 @@ struct ClientConnection {
 
 class KCPServer : public std::enable_shared_from_this<KCPServer> {
 public:
-    KCPServer(asio::io_context& io, uint16_t port, std::string key,
-              std::string host = "0.0.0.0",
+    KCPServer(asio::io_context& io, uint16_t port, std::string key, std::string host = "0.0.0.0",
               const FecConfig& fec = FecConfig{},
               // Opt-in adaptive policies. The defaults keep the pre-adaptive
               // wire (always emit parity) and the 30ms RTO floor.
@@ -58,8 +57,7 @@ public:
     // 测试专用：替换认证限流窗口的时钟（见 auth_clock_ 注释）。必须在
     // start() 之前调用；注入后窗口推进由测试完全控制，速率断言与宿主机
     // 速度解耦。
-    void set_auth_clock_for_test(
-        std::function<std::chrono::steady_clock::time_point()> clock) {
+    void set_auth_clock_for_test(std::function<std::chrono::steady_clock::time_point()> clock) {
         auth_clock_ = std::move(clock);
     }
 
@@ -77,8 +75,7 @@ public:
     // failure, auth rate limit, duplicate session salt, session cap).
     // handle_receive() is a thin socket wrapper around this; it is public so
     // tests can drive the create/auth/reject logic without a bound socket.
-    std::shared_ptr<KCPSession> route_datagram(const asio::ip::udp::endpoint& addr,
-                                               byte_view data);
+    std::shared_ptr<KCPSession> route_datagram(const asio::ip::udp::endpoint& addr, byte_view data);
 
     // Map an OS-level connect error onto the RFC 1928 reply the client sees.
     // Pure (no state, no I/O), so it is public: the mapping is wire-visible
@@ -186,8 +183,9 @@ private:
     // 耗尽与重置不再依赖宿主机速度——ASAN/慢机下 5000 次循环可能跑超 1 秒真
     // 实时间，窗口中途重置会让"预算耗尽"的断言随构建速度而翻转。仅在测试中
     // 调用 setter；时钟本身只在接收 strand 上读取，无需同步。
-    std::function<std::chrono::steady_clock::time_point()> auth_clock_ =
-        [] { return std::chrono::steady_clock::now(); };
+    std::function<std::chrono::steady_clock::time_point()> auth_clock_ = [] {
+        return std::chrono::steady_clock::now();
+    };
     // Per-source-address count of FAILED auth decrypts in the current window.
     // Checked BEFORE paying for a decrypt: an address that keeps failing is a
     // bad actor, so once it crosses MAX_AUTH_FAILURES_PER_ADDR_PER_SEC its
@@ -205,8 +203,7 @@ private:
     // (atomically with session creation); expired entries are swept by
     // do_cleanup. See SALT_TOMBSTONE_TTL_SEC in config.hpp for why a dead
     // session's salt must stay rejected.
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
-        salt_tombstones_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> salt_tombstones_;
     // Insertion order of salt_tombstones_, so the table can be bounded by
     // evicting its OLDEST entry. One entry per accepted session, and a session
     // that dies right away (an invalid SOCKS5 request closes it immediately)
@@ -289,8 +286,7 @@ private:
     // Arm (or re-arm) the receive on one slot. Runs on the socket's strand.
     void arm_receive_slot(size_t index);
     // Completion for the receive armed on `index`.
-    void handle_receive(size_t index, const std::error_code& ec,
-                        size_t bytes_transferred);
+    void handle_receive(size_t index, const std::error_code& ec, size_t bytes_transferred);
     // Park `index` after an unknown receive error and start the shared backoff
     // timer if it is not already running. The timer re-arms every parked slot.
     void park_receive_slot(size_t index);
@@ -315,9 +311,9 @@ private:
     std::vector<size_t> drain_lens_;
     std::vector<std::vector<uint8_t>> drain_bufs_;
 
-    std::shared_ptr<KCPSession> get_or_create_session(
-        const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,
-        bool& already_consumed);
+    std::shared_ptr<KCPSession> get_or_create_session(const asio::ip::udp::endpoint& addr,
+                                                      byte_view encrypted_packet,
+                                                      bool& already_consumed);
     // Close and forget the upstream TCP socket registered under `sid`, as part
     // of replacing the session that owned it. Caller must hold sessions_mutex_
     // exclusively. Erasing the connections_ entry alone would orphan the
@@ -336,8 +332,7 @@ private:
     void prune_salt_tombstones_locked();
     // Record a salt as seen until `expiry`, evicting the oldest tombstones to
     // stay under MAX_SALT_TOMBSTONES.
-    void remember_salt_locked(std::string salt_key,
-                              std::chrono::steady_clock::time_point expiry);
+    void remember_salt_locked(std::string salt_key, std::chrono::steady_clock::time_point expiry);
     void handle_kcp_data(std::shared_ptr<KCPSession> session,
                          const asio::ip::udp::endpoint& sender);
     void handle_socks5_request(std::shared_ptr<KCPSession> session);
@@ -350,22 +345,17 @@ private:
     void read_more_socks5(std::shared_ptr<KCPSession> session,
                           std::shared_ptr<std::vector<uint8_t>> accum,
                           std::shared_ptr<KCPServer> self);
-    bool parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
-                                  std::vector<uint8_t>& accum,
+    bool parse_accumulated_socks5(std::shared_ptr<KCPSession> session, std::vector<uint8_t>& accum,
                                   bool log_details);
     void handle_protocol_handshake(std::shared_ptr<KCPSession> session);
-    void handle_connect_command(std::shared_ptr<KCPSession> session,
-                                const SOCKS5Request& request);
-    void handle_connect_command(std::shared_ptr<KCPSession> session,
-                                const SOCKS5Request& request,
+    void handle_connect_command(std::shared_ptr<KCPSession> session, const SOCKS5Request& request);
+    void handle_connect_command(std::shared_ptr<KCPSession> session, const SOCKS5Request& request,
                                 std::vector<uint8_t> initial_payload);
-    void handle_udp_associate(std::shared_ptr<KCPSession> session,
-                              const SOCKS5Request& request);
+    void handle_udp_associate(std::shared_ptr<KCPSession> session, const SOCKS5Request& request);
     void send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t reply);
     void send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t reply,
                            std::string_view host, uint16_t port);
-    void forward_tcp_to_kcp(std::string session_id,
-                            std::shared_ptr<KCPSession> session,
+    void forward_tcp_to_kcp(std::string session_id, std::shared_ptr<KCPSession> session,
                             std::shared_ptr<asio::ip::tcp::socket> tcp_socket,
                             std::shared_ptr<std::vector<uint8_t>> buf = {});
     // Tears down the session + target connection registered under session_id.

@@ -87,8 +87,7 @@ void KCPServer::set_allowed_targets(std::vector<std::string> targets) {
     // missing value can never create an entry that matches the empty host.
     // main_server.cpp already rejects that at the CLI, this keeps the library
     // safe for embedders that bypass the CLI.
-    targets.erase(std::remove(targets.begin(), targets.end(), std::string()),
-                  targets.end());
+    targets.erase(std::remove(targets.begin(), targets.end(), std::string()), targets.end());
     allowed_targets_ = std::move(targets);
 }
 
@@ -441,8 +440,7 @@ void KCPServer::park_receive_slot(size_t index) {
     auto self = shared_from_this();
     receive_backoff_timer_.expires_after(std::chrono::milliseconds(10));
     receive_backoff_timer_.async_wait(asio::bind_executor(
-        udp_socket_.get_executor(),
-        [this, self](const std::error_code& timer_ec) {
+        udp_socket_.get_executor(), [this, self](const std::error_code& timer_ec) {
             recv_backoff_armed_ = false;
             if (timer_ec || !running_) return;
             for (size_t i = 0; i < UDP_RECV_SLOTS; ++i) {
@@ -451,8 +449,7 @@ void KCPServer::park_receive_slot(size_t index) {
         }));
 }
 
-void KCPServer::handle_receive(size_t index, const std::error_code& ec,
-                               size_t bytes_transferred) {
+void KCPServer::handle_receive(size_t index, const std::error_code& ec, size_t bytes_transferred) {
     if (ec) {
         if (running_ && ec != asio::error::operation_aborted) {
             // UDP sockets surface ICMP Port Unreachable as an error on the next
@@ -462,8 +459,7 @@ void KCPServer::handle_receive(size_t index, const std::error_code& ec,
             // reporting is disabled at the source (SIO_UDP_CONNRESET in
             // start()), and on Linux it only fires for connected sockets
             // anyway. Just log and continue.
-            if (ec == asio::error::connection_refused ||
-                ec == asio::error::connection_reset) {
+            if (ec == asio::error::connection_refused || ec == asio::error::connection_reset) {
                 LOG_DEBUG("server", "UDP ICMP port unreachable received (ignored)");
                 arm_receive_slot(index);
             } else {
@@ -503,8 +499,8 @@ void KCPServer::handle_receive(size_t index, const std::error_code& ec,
     arm_receive_slot(index);
 }
 
-std::shared_ptr<KCPSession> KCPServer::route_datagram(
-    const asio::ip::udp::endpoint& endpoint, byte_view data) {
+std::shared_ptr<KCPSession> KCPServer::route_datagram(const asio::ip::udp::endpoint& endpoint,
+                                                      byte_view data) {
     // Containment: this path performs every large allocation the server can be
     // talked into (the auth Crypto's EVP contexts, the ~20KB session object,
     // the per-datagram receive copy, the strand-dispatch closures). Any of
@@ -531,8 +527,8 @@ std::shared_ptr<KCPSession> KCPServer::route_datagram(
     }
 }
 
-std::shared_ptr<KCPSession> KCPServer::route_datagram_impl(
-    const asio::ip::udp::endpoint& endpoint, byte_view data) {
+std::shared_ptr<KCPSession> KCPServer::route_datagram_impl(const asio::ip::udp::endpoint& endpoint,
+                                                           byte_view data) {
     bool already_consumed = false;
     auto session = get_or_create_session(endpoint, data, already_consumed);
     if (!session) {
@@ -589,8 +585,8 @@ void KCPServer::prune_salt_tombstones_locked() {
     }
 }
 
-void KCPServer::remember_salt_locked(
-    std::string salt_key, std::chrono::steady_clock::time_point expiry) {
+void KCPServer::remember_salt_locked(std::string salt_key,
+                                     std::chrono::steady_clock::time_point expiry) {
     prune_salt_tombstones_locked();
     // Bound the table by discarding the OLDEST tombstones. The alternative
     // (refusing the new session at the cap) let any authenticated peer -- or
@@ -612,8 +608,8 @@ void KCPServer::remember_salt_locked(
 
 void KCPServer::fill_salt_tombstones_for_test(size_t n) {
     std::unique_lock<std::shared_mutex> lock(sessions_mutex_);
-    const auto expiry = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC);
+    const auto expiry =
+        std::chrono::steady_clock::now() + std::chrono::seconds(SALT_TOMBSTONE_TTL_SEC);
     for (size_t i = 0; i < n; ++i) {
         // Distinct 16-byte keys, the same width as a real session salt.
         std::string key(SESSION_SALT_SIZE, '\0');
@@ -650,9 +646,9 @@ void KCPServer::drop_replaced_target_locked(const std::string& sid) {
     }
 }
 
-std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
-    const asio::ip::udp::endpoint& addr, byte_view encrypted_packet,
-    bool& already_consumed) {
+std::shared_ptr<KCPSession> KCPServer::get_or_create_session(const asio::ip::udp::endpoint& addr,
+                                                             byte_view encrypted_packet,
+                                                             bool& already_consumed) {
     already_consumed = false;
     std::string sid = fmt::format("{}:{}", addr.address().to_string(), addr.port());
 
@@ -664,9 +660,8 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     {
         std::shared_lock<std::shared_mutex> lock(sessions_mutex_);
         auto it = sessions_.find(sid);
-        if (it != sessions_.end() &&
-            it->second && it->second->is_alive() && it->second->is_running() &&
-            it->second->salt_matches(encrypted_packet)) {
+        if (it != sessions_.end() && it->second && it->second->is_alive() &&
+            it->second->is_running() && it->second->salt_matches(encrypted_packet)) {
             return it->second;
         }
     }
@@ -708,8 +703,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         }
         // The replacement below drops the incumbent, so it does not count
         // against the cap.
-        const size_t effective =
-            sessions_.size() - (live_salt_mismatch ? size_t{1} : size_t{0});
+        const size_t effective = sessions_.size() - (live_salt_mismatch ? size_t{1} : size_t{0});
         cap_reached = effective >= MAX_CONCURRENT_SESSIONS;
     }
     // Logging happens OUTSIDE the write lock: every LOG_* takes the logger's
@@ -829,8 +823,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
     // when adapting, so the two ends no longer have to agree on -fec for the
     // tunnel to work at all (the GUI defaults to FEC on, the service installer
     // to off — the exact mismatch that used to kill every handshake).
-    const bool client_fec_framed =
-        looks_like_fec_frame(decrypted.data(), decrypted.size());
+    const bool client_fec_framed = looks_like_fec_frame(decrypted.data(), decrypted.size());
 
     std::shared_ptr<KCPSession> session;
     size_t total_sessions = 0;
@@ -1010,8 +1003,8 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
         LOG_DEBUG("server", sid + ": authenticated reconnect, replacing session");
     }
     if (log_client_fec_framed) {
-        LOG_DEBUG("server", sid + ": client speaks FEC, session framed " +
-                  log_client_fec_value.to_string());
+        LOG_DEBUG("server",
+                  sid + ": client speaks FEC, session framed " + log_client_fec_value.to_string());
     }
     if (rejection != RejectReason::None) {
         // Auth-key holders can drive these (up to the auth budget, 5000/s);
@@ -1027,8 +1020,8 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
                     break;
                 case RejectReason::DuplicateSalt:
                     rejection_line = fmt::format(
-                        "duplicate session salt rejected: {} collides with live session {}",
-                        sid, duplicate_salt_with);
+                        "duplicate session salt rejected: {} collides with live session {}", sid,
+                        duplicate_salt_with);
                     break;
                 case RejectReason::ReplayedSalt:
                     rejection_line = "replayed session salt rejected from " + sid;
@@ -1052,7 +1045,7 @@ std::shared_ptr<KCPSession> KCPServer::get_or_create_session(
 }
 
 void KCPServer::handle_kcp_data(std::shared_ptr<KCPSession> session,
-                                 const asio::ip::udp::endpoint& /*sender*/) {
+                                const asio::ip::udp::endpoint& /*sender*/) {
     // SAFETY: This function reads KCP state (peek_size, wait_send) which must be
     // serialized with the strand handlers that mutate KCP. All callers must ensure
     // we are on the session's strand. If not, dispatch to it and return.
@@ -1080,7 +1073,8 @@ void KCPServer::handle_kcp_data(std::shared_ptr<KCPSession> session,
     }
     if (!session->is_protocol_handshake_done()) {
         if (session->is_socks5_read_pending()) {
-            LOG_DEBUG("server", session->session_id() + ": protocol handshake read already pending");
+            LOG_DEBUG("server",
+                      session->session_id() + ": protocol handshake read already pending");
             return;
         }
         handle_protocol_handshake(session);
@@ -1095,7 +1089,7 @@ void KCPServer::handle_kcp_data(std::shared_ptr<KCPSession> session,
     }
     if (session->is_socks5_read_pending() || session->is_connect_pending()) {
         LOG_DEBUG("server", session->session_id() +
-                  ": SOCKS5 read or upstream connect already pending, skipping");
+                                ": SOCKS5 read or upstream connect already pending, skipping");
         return;
     }
     LOG_DEBUG("server", session->session_id() + ": starting SOCKS5 request read");
@@ -1106,12 +1100,12 @@ void KCPServer::handle_protocol_handshake(std::shared_ptr<KCPSession> session) {
     auto buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
     auto self = shared_from_this();
     session->set_socks5_read_pending(true);
-    session->async_read_some(asio::buffer(*buf),
-        [this, session, buf, self](const std::error_code& ec, size_t bytes) {
+    session->async_read_some(
+        asio::buffer(*buf), [this, session, buf, self](const std::error_code& ec, size_t bytes) {
             session->set_socks5_read_pending(false);
             if (ec || bytes == 0) {
                 LOG_WARNING("server", session->session_id() +
-                            ": KCP_HANDSHAKE_FAILED read error: " + ec.message());
+                                          ": KCP_HANDSHAKE_FAILED read error: " + ec.message());
                 close_connection(session->session_id(), "protocol_handshake_read", session);
                 return;
             }
@@ -1123,19 +1117,20 @@ void KCPServer::handle_protocol_handshake(std::shared_ptr<KCPSession> session) {
             const bool hello_v2 = (msg == KCP_CONTROL_HELLO_V2);
             if (msg != KCP_CONTROL_HELLO && !hello_v2) {
                 session->mark_protocol_handshake_done();
-                std::vector<uint8_t> initial(buf->begin(), buf->begin() + static_cast<std::ptrdiff_t>(bytes));
+                std::vector<uint8_t> initial(buf->begin(),
+                                             buf->begin() + static_cast<std::ptrdiff_t>(bytes));
                 LOG_INFO("server", session->session_id() +
-                         ": no HELLO control frame; treating first KCP payload as SOCKS5 compatibility handshake");
+                                       ": no HELLO control frame; treating first KCP payload as "
+                                       "SOCKS5 compatibility handshake");
                 handle_socks5_request(session, std::move(initial));
                 return;
             }
             session->mark_protocol_handshake_done();
             if (hello_v2) session->enable_fin();
             const char* ack = hello_v2 ? KCP_CONTROL_HELLO_ACK_V2 : KCP_CONTROL_HELLO_ACK;
-            session->send_data(byte_view(reinterpret_cast<const uint8_t*>(ack),
-                                         std::strlen(ack)));
+            session->send_data(byte_view(reinterpret_cast<const uint8_t*>(ack), std::strlen(ack)));
             LOG_INFO("server", session->session_id() + ": KCP handshake confirmed" +
-                     (hello_v2 ? " (V2, half-close enabled)" : ""));
+                                   (hello_v2 ? " (V2, half-close enabled)" : ""));
             // A pipelining peer may have queued its SOCKS5 request in the same
             // KCP batch as the HELLO (it did not wait for the ACK). Such a
             // message has no other trigger: handle_kcp_data is driven only by
@@ -1156,8 +1151,7 @@ void KCPServer::handle_socks5_request(std::shared_ptr<KCPSession> session) {
 // Returns: true if parsing is complete (success or error), false if more data needed.
 // Side effects: on success, initiates connection; on error, sends failure reply.
 bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
-                                         std::vector<uint8_t>& accum,
-                                         bool log_details) {
+                                         std::vector<uint8_t>& accum, bool log_details) {
     auto parsed = parse_socks5_request(accum);
 
     // NeedMore: incomplete request, caller should read more data
@@ -1167,7 +1161,7 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
         // here, after the append, one full FWD_BUF_SIZE read still fit and
         // only the second read tripped the test, so the accumulator actually
         // grew to ~2x FWD_BUF_SIZE.
-        return false;  // need more data
+        return false; // need more data
     }
 
     // Invalid or complete: parsing is done, clear pending flag
@@ -1175,16 +1169,15 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
 
     if (parsed.status == SOCKS5ParseStatus::Invalid) {
         LOG_ERROR("server", "FAIL_STAGE=SOCKS5_PARSE_FAILED ERROR=" + parsed.error +
-                  " CLIENT_ENDPOINT=" + session->session_id() + " TARGET=-");
+                                " CLIENT_ENDPOINT=" + session->session_id() + " TARGET=-");
         // Only an unsupported ATYP deserves ADDRESS_TYPE_NOT_SUPPORTED; every
         // other malformed request is a general failure.
-        send_socks5_reply(session, parsed.bad_atyp
-            ? SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
-            : SOCKS5_REPLY_GENERAL_FAILURE);
+        send_socks5_reply(session, parsed.bad_atyp ? SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED
+                                                   : SOCKS5_REPLY_GENERAL_FAILURE);
         // The client sees the failure reply and disconnects; close_connection
         // evicts the dead session from the table immediately (no 30s sweep wait).
         close_connection(session->session_id(), "socks5_invalid", session);
-        return true;  // complete with error
+        return true; // complete with error
     }
 
     // Success: parsed.request contains valid SOCKS5 request
@@ -1217,7 +1210,7 @@ bool KCPServer::parse_accumulated_socks5(std::shared_ptr<KCPSession> session,
         // the KCP session down; close_connection evicts it from the table at once.
         close_connection(session->session_id(), "socks5_unsupported_cmd", session);
     }
-    return true;  // complete (success or handled error)
+    return true; // complete (success or handled error)
 }
 
 void KCPServer::handle_socks5_request(std::shared_ptr<KCPSession> session,
@@ -1245,12 +1238,12 @@ void KCPServer::read_more_socks5(std::shared_ptr<KCPSession> session,
     auto buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
     LOG_DEBUG("server", session->session_id() + ": reading SOCKS5 request fragment");
     session->set_socks5_read_pending(true);
-    session->async_read_some(asio::buffer(*buf),
-    [this, session, accum, buf, self](const std::error_code& ec, size_t bytes) {
+    session->async_read_some(asio::buffer(*buf), [this, session, accum, buf, self](
+                                                     const std::error_code& ec, size_t bytes) {
         if (ec) {
             session->set_socks5_read_pending(false);
-            LOG_ERROR("server", session->session_id() +
-                      ": SOCKS5_PARSE_FAILED read error: " + ec.message());
+            LOG_ERROR("server",
+                      session->session_id() + ": SOCKS5_PARSE_FAILED read error: " + ec.message());
             send_socks5_reply(session, SOCKS5_REPLY_GENERAL_FAILURE);
             close_connection(session->session_id(), "socks5_read_error", session);
             return;
@@ -1261,13 +1254,15 @@ void KCPServer::read_more_socks5(std::shared_ptr<KCPSession> session,
         // headroom; the point is that the buffer can never exceed it.
         if (accum->size() + bytes > FWD_BUF_SIZE) {
             session->set_socks5_read_pending(false);
-            LOG_ERROR("server", "FAIL_STAGE=SOCKS5_PARSE_FAILED ERROR=request_too_large CLIENT_ENDPOINT=" +
-                      session->session_id() + " TARGET=-");
+            LOG_ERROR("server",
+                      "FAIL_STAGE=SOCKS5_PARSE_FAILED ERROR=request_too_large CLIENT_ENDPOINT=" +
+                          session->session_id() + " TARGET=-");
             send_socks5_reply(session, SOCKS5_REPLY_GENERAL_FAILURE);
             close_connection(session->session_id(), "socks5_too_large", session);
             return;
         }
-        accum->insert(accum->end(), buf->begin(), buf->begin() + static_cast<std::ptrdiff_t>(bytes));
+        accum->insert(accum->end(), buf->begin(),
+                      buf->begin() + static_cast<std::ptrdiff_t>(bytes));
         if (parse_accumulated_socks5(session, *accum, true)) {
             return;
         }
@@ -1276,13 +1271,13 @@ void KCPServer::read_more_socks5(std::shared_ptr<KCPSession> session,
 }
 
 void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
-                                        const SOCKS5Request& request) {
+                                       const SOCKS5Request& request) {
     handle_connect_command(session, request, {});
 }
 
 void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
-                                        const SOCKS5Request& request,
-                                        std::vector<uint8_t> initial_payload) {
+                                       const SOCKS5Request& request,
+                                       std::vector<uint8_t> initial_payload) {
     LOG_INFO("server", fmt::format("{}: connecting to {}:{}", session->session_id(), request.host,
                                    request.port));
 
@@ -1301,8 +1296,8 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
 
     deadline->expires_after(std::chrono::seconds(CONNECT_TIMEOUT_SEC));
     auto self = shared_from_this();
-    deadline->async_wait([this, self, session, request, tcp_socket, resolver, fired]
-                        (const std::error_code& ec) {
+    deadline->async_wait([this, self, session, request, tcp_socket, resolver,
+                          fired](const std::error_code& ec) {
         if (ec == asio::error::operation_aborted) return;
         if (fired->exchange(true)) return;
         std::error_code ignored;
@@ -1404,20 +1399,19 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                 // entry naming a DOMAIN that resolves into a private range was
                 // silently honoured -- the one case an operator most needs to
                 // see, because the entry looked harmless when it was written.
-                LOG_WARNING("server",
-                            fmt::format("SSRF_ALLOWLISTED CLIENT_ENDPOINT={} TARGET={}:{}"
-                                        " RESOLVED={}",
-                                        session->session_id(), request.host, request.port,
-                                        restricted_addr));
+                LOG_WARNING("server", fmt::format("SSRF_ALLOWLISTED CLIENT_ENDPOINT={} TARGET={}:{}"
+                                                  " RESOLVED={}",
+                                                  session->session_id(), request.host, request.port,
+                                                  restricted_addr));
             }
 
             LOG_INFO("server", fmt::format("{}: resolved {} to {} endpoints, connecting...",
                                            session->session_id(), request.host,
                                            std::distance(results.begin(), results.end())));
-            asio::async_connect(*tcp_socket, results,
-                [this, session, request, initial_payload_buf,
-                 tcp_socket, resolver, deadline, fired, self]
-                (const std::error_code& ec2, const asio::ip::tcp::endpoint&) mutable {
+            asio::async_connect(
+                *tcp_socket, results,
+                [this, session, request, initial_payload_buf, tcp_socket, resolver, deadline, fired,
+                 self](const std::error_code& ec2, const asio::ip::tcp::endpoint&) mutable {
                     if (fired->exchange(true)) return;
                     std::error_code ignored;
                     deadline->cancel(ignored);
@@ -1443,12 +1437,11 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                     // already batches, so coalescing here buys nothing.
                     {
                         std::error_code nodelay_ec;
-                        tcp_socket->set_option(
-                            asio::ip::tcp::no_delay(true), nodelay_ec);
+                        tcp_socket->set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
                         if (nodelay_ec) {
-                            LOG_DEBUG("server", session->session_id() +
-                                      ": failed to set TCP_NODELAY: " +
-                                      nodelay_ec.message());
+                            LOG_DEBUG("server",
+                                      session->session_id() +
+                                          ": failed to set TCP_NODELAY: " + nodelay_ec.message());
                         }
                     }
 
@@ -1461,8 +1454,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                         bind_port = local.port();
                     }
 
-                    send_socks5_reply(session, SOCKS5_REPLY_SUCCEEDED,
-                                      bind_host, bind_port);
+                    send_socks5_reply(session, SOCKS5_REPLY_SUCCEEDED, bind_host, bind_port);
                     session->mark_handshake_done();
 
                     std::string sid = session->session_id();
@@ -1487,7 +1479,9 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                             // here closes the stale socket.
                             auto sit = sessions_.find(sid);
                             if (sit == sessions_.end() || sit->second != session) {
-                                LOG_DEBUG("server", sid + ": connect completed for a replaced session, discarding");
+                                LOG_DEBUG(
+                                    "server",
+                                    sid + ": connect completed for a replaced session, discarding");
                                 return;
                             }
                             connections_[sid] = ClientConnection{tcp_socket};
@@ -1533,13 +1527,15 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
                     };
 
                     if (!initial_payload_buf->empty()) {
-                        asio::async_write(*tcp_socket, asio::buffer(*initial_payload_buf),
-                            [this, sid, session, tcp_socket, initial_payload_buf, start_forwarding, self]
-                            (const std::error_code& write_ec, size_t) mutable {
+                        asio::async_write(
+                            *tcp_socket, asio::buffer(*initial_payload_buf),
+                            [this, sid, session, tcp_socket, initial_payload_buf, start_forwarding,
+                             self](const std::error_code& write_ec, size_t) mutable {
                                 if (write_ec) {
-                                    LOG_ERROR("server", "FAIL_STAGE=TCP_WRITE_FAILED ERROR=initial_payload_" +
-                                              write_ec.message() + " CLIENT_ENDPOINT=" + sid +
-                                              " TARGET=-");
+                                    LOG_ERROR("server",
+                                              "FAIL_STAGE=TCP_WRITE_FAILED ERROR=initial_payload_" +
+                                                  write_ec.message() + " CLIENT_ENDPOINT=" + sid +
+                                                  " TARGET=-");
                                     close_connection(sid, "initial_payload_write", session);
                                     return;
                                 }
@@ -1553,7 +1549,7 @@ void KCPServer::handle_connect_command(std::shared_ptr<KCPSession> session,
 }
 
 void KCPServer::handle_udp_associate(std::shared_ptr<KCPSession> session,
-                                      const SOCKS5Request& request) {
+                                     const SOCKS5Request& request) {
     LOG_WARNING("server",
                 fmt::format("FAIL_STAGE=SOCKS5_UNSUPPORTED_COMMAND"
                             " ERROR=udp_associate_unsupported CLIENT_ENDPOINT={} TARGET={}:{}",
@@ -1567,7 +1563,7 @@ void KCPServer::send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t r
 }
 
 void KCPServer::send_socks5_reply(std::shared_ptr<KCPSession> session, uint8_t reply,
-                                   std::string_view host, uint16_t port) {
+                                  std::string_view host, uint16_t port) {
     LOG_DEBUG("server", fmt::format("{}: sending SOCKS5 reply={} host={} port={}",
                                     session->session_id(), reply, host, port));
     SOCKS5Response resp;
@@ -1759,7 +1755,8 @@ void KCPServer::forward_kcp_to_tcp(std::shared_ptr<KCPSession> session,
         // sessions_[sid] is that session, and both are erased together.
         auto sit = sessions_.find(sid);
         if (sit == sessions_.end() || sit->second != session) {
-            LOG_DEBUG("server", sid + ": forward_kcp_to_tcp - session no longer owns this endpoint");
+            LOG_DEBUG("server",
+                      sid + ": forward_kcp_to_tcp - session no longer owns this endpoint");
             session->set_forward_read_pending(false);
             return;
         }
@@ -1929,7 +1926,7 @@ void KCPServer::close_connection(const std::string& session_id, const char* call
     // reasoning as get_or_create_session).
     if (skipped_replaced) {
         LOG_DEBUG("server", session_id + ": close_connection from " + std::string(caller) +
-                  " skipped - session already replaced");
+                                " skipped - session already replaced");
         return;
     }
     LOG_INFO("server", session_id + ": close_connection from " + std::string(caller));
@@ -2104,12 +2101,12 @@ void KCPServer::do_cleanup(const std::error_code& ec) {
     // get_or_create_session): one console-bound INFO line per reaped session
     // must not extend the sweep's critical section.
     for (const auto& sid : dead_session_ids) {
-        LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=idle_timeout CLIENT_ENDPOINT=" +
-                 sid + " TARGET=-");
+        LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=idle_timeout CLIENT_ENDPOINT=" + sid +
+                               " TARGET=-");
     }
     for (const auto& sid : stalled_session_ids) {
         LOG_INFO("server", "FAIL_STAGE=SESSION_TIMEOUT ERROR=handshake_timeout CLIENT_ENDPOINT=" +
-                 sid + " TARGET=-");
+                               sid + " TARGET=-");
     }
 
     // Stop sessions and close sockets outside the lock

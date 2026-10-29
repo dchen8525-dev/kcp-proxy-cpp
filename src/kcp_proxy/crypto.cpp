@@ -16,12 +16,17 @@ namespace crypto_errors {
 
 class category_type : public std::error_category {
 public:
-    const char* name() const noexcept override { return "kcp_proxy.crypto"; }
+    const char* name() const noexcept override {
+        return "kcp_proxy.crypto";
+    }
     std::string message(int ev) const override {
         switch (static_cast<errc>(ev)) {
-            case errc::ok: return "no error";
-            case errc::replay: return "replay/stale counter rejected";
-            case errc::auth_failed: return "AEAD authentication failed";
+            case errc::ok:
+                return "no error";
+            case errc::replay:
+                return "replay/stale counter rejected";
+            case errc::auth_failed:
+                return "AEAD authentication failed";
         }
         return "unknown crypto error";
     }
@@ -33,7 +38,7 @@ const std::error_category& category() {
 }
 
 std::error_code make_error_code(errc e) {
-    return { static_cast<int>(e), category() };
+    return {static_cast<int>(e), category()};
 }
 
 } // namespace crypto_errors
@@ -106,10 +111,8 @@ void log_reject_throttled(LogThrottle& throttle, MakeMessage make_message) {
 // Fixed application-level salt prevents cross-application precomputation attacks.
 static constexpr std::string_view APP_SALT = "kcp-proxy-hkdf-salt-v1";
 
-void Crypto::hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
-                         const uint8_t* salt, size_t salt_len,
-                         std::string_view info,
-                         uint8_t* okm, size_t okm_len) {
+void Crypto::hkdf_sha256(const uint8_t* ikm, size_t ikm_len, const uint8_t* salt, size_t salt_len,
+                         std::string_view info, uint8_t* okm, size_t okm_len) {
     EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
     if (!ctx) {
         throw std::runtime_error("EVP_PKEY_CTX_new_id failed");
@@ -124,15 +127,13 @@ void Crypto::hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
 
     size_t derived_len = okm_len;
     const bool failed =
-        EVP_PKEY_derive_init(ctx) <= 0 ||
-        EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_derive_init(ctx) <= 0 || EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) <= 0 ||
         EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, static_cast<int>(salt_len)) <= 0 ||
         EVP_PKEY_CTX_set1_hkdf_key(ctx, ikm, static_cast<int>(ikm_len)) <= 0 ||
         (!info.empty() &&
          EVP_PKEY_CTX_add1_hkdf_info(ctx, reinterpret_cast<const uint8_t*>(info.data()),
                                      static_cast<int>(info.size())) <= 0) ||
-        EVP_PKEY_derive(ctx, okm, &derived_len) <= 0 ||
-        derived_len != okm_len;
+        EVP_PKEY_derive(ctx, okm, &derived_len) <= 0 || derived_len != okm_len;
 
     EVP_PKEY_CTX_free(ctx);
     if (failed) {
@@ -140,17 +141,15 @@ void Crypto::hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
     }
 }
 
-Crypto::Crypto(std::string_view key, uint8_t direction, byte_view session_salt,
-               bool server_mode)
+Crypto::Crypto(std::string_view key, uint8_t direction, byte_view session_salt, bool server_mode)
     : local_direction_(direction),
       peer_direction_(direction == NONCE_DIR_CLIENT ? NONCE_DIR_SERVER : NONCE_DIR_CLIENT),
       server_mode_(server_mode),
       key_(key),
       encrypt_ctx_(std::make_unique<EVPContext>()),
       decrypt_ctx_(std::make_unique<EVPContext>()) {
-
-    LOG_DEBUG("crypto", fmt::format("direction={} server={} key_len={} salt_len={}",
-              direction, server_mode, key.size(), session_salt.size()));
+    LOG_DEBUG("crypto", fmt::format("direction={} server={} key_len={} salt_len={}", direction,
+                                    server_mode, key.size(), session_salt.size()));
 
     if (!session_salt.empty()) {
         // Client side: we generated the salt up front, so derive now.
@@ -191,11 +190,11 @@ void Crypto::derive_session_keys(byte_view session_salt) {
     std::string_view dec_info = info_for_direction(peer_direction_);
 
     hkdf_sha256(reinterpret_cast<const uint8_t*>(key_.data()), key_.size(),
-                reinterpret_cast<const uint8_t*>(hkdf_salt.data()), hkdf_salt.size(),
-                enc_info, encrypt_key_.data(), encrypt_key_.size());
+                reinterpret_cast<const uint8_t*>(hkdf_salt.data()), hkdf_salt.size(), enc_info,
+                encrypt_key_.data(), encrypt_key_.size());
     hkdf_sha256(reinterpret_cast<const uint8_t*>(key_.data()), key_.size(),
-                reinterpret_cast<const uint8_t*>(hkdf_salt.data()), hkdf_salt.size(),
-                dec_info, decrypt_key_.data(), decrypt_key_.size());
+                reinterpret_cast<const uint8_t*>(hkdf_salt.data()), hkdf_salt.size(), dec_info,
+                decrypt_key_.data(), decrypt_key_.size());
 
     // Per-session starting counter, derived from the salt (first 6 bytes,
     // big-endian, so it stays below MAX_COUNTER = 2^48).
@@ -219,9 +218,11 @@ void Crypto::derive_session_keys(byte_view session_salt) {
 
     // Initialize the GCM contexts with the derived key schedules. Per-packet
     // calls below only reset the IV (nonce), avoiding AES key-expansion rework.
-    if (EVP_EncryptInit_ex(*encrypt_ctx_, EVP_aes_128_gcm(), nullptr, encrypt_key_.data(), nullptr) != 1 ||
+    if (EVP_EncryptInit_ex(*encrypt_ctx_, EVP_aes_128_gcm(), nullptr, encrypt_key_.data(),
+                           nullptr) != 1 ||
         EVP_CIPHER_CTX_ctrl(*encrypt_ctx_, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, nullptr) != 1 ||
-        EVP_DecryptInit_ex(*decrypt_ctx_, EVP_aes_128_gcm(), nullptr, decrypt_key_.data(), nullptr) != 1 ||
+        EVP_DecryptInit_ex(*decrypt_ctx_, EVP_aes_128_gcm(), nullptr, decrypt_key_.data(),
+                           nullptr) != 1 ||
         EVP_CIPHER_CTX_ctrl(*decrypt_ctx_, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, nullptr) != 1) {
         LOG_ERROR("crypto", "derive_session_keys: EVP cipher ctx init failed");
         throw std::runtime_error("EVP cipher ctx init failed");
@@ -418,11 +419,13 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
         // has exhausted its safe nonce space and must be re-keyed, not resumed.
         uint64_t counter = encrypt_counter_.fetch_add(1, std::memory_order_relaxed);
         if (counter >= MAX_COUNTER) {
-            LOG_ERROR("crypto", fmt::format("encrypt counter overflow: {} >= {}", counter, MAX_COUNTER));
+            LOG_ERROR("crypto",
+                      fmt::format("encrypt counter overflow: {} >= {}", counter, MAX_COUNTER));
             return std::make_error_code(std::errc::value_too_large);
         }
         auto nonce = generate_nonce(counter, local_direction_);
-        LOG_DEBUG("crypto", fmt::format("encrypt: counter={} plaintext={} bytes", counter, plaintext.size()));
+        LOG_DEBUG("crypto",
+                  fmt::format("encrypt: counter={} plaintext={} bytes", counter, plaintext.size()));
 
         // Full re-init per packet (key and IV length unchanged, but reset ensures clean GCM state).
         if (EVP_EncryptInit_ex(*encrypt_ctx_, nullptr, nullptr, nullptr, nullptr) != 1) {
@@ -442,13 +445,16 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
         int out_len = 0;
         if (EVP_EncryptUpdate(*encrypt_ctx_, out.data() + SESSION_SALT_SIZE + NONCE_SIZE, &out_len,
                               plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
-            LOG_ERROR("crypto", fmt::format("encrypt: EVP_EncryptUpdate failed, size={}", plaintext.size()));
+            LOG_ERROR("crypto",
+                      fmt::format("encrypt: EVP_EncryptUpdate failed, size={}", plaintext.size()));
             out.clear();
             return std::make_error_code(std::errc::io_error);
         }
 
         int final_len = 0;
-        if (EVP_EncryptFinal_ex(*encrypt_ctx_, out.data() + SESSION_SALT_SIZE + NONCE_SIZE + out_len, &final_len) != 1) {
+        if (EVP_EncryptFinal_ex(*encrypt_ctx_,
+                                out.data() + SESSION_SALT_SIZE + NONCE_SIZE + out_len,
+                                &final_len) != 1) {
             LOG_ERROR("crypto", "encrypt: EVP_EncryptFinal_ex failed");
             out.clear();
             return std::make_error_code(std::errc::io_error);
@@ -456,7 +462,8 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
 
         int total_cipher_len = out_len + final_len;
         if (EVP_CIPHER_CTX_ctrl(*encrypt_ctx_, EVP_CTRL_GCM_GET_TAG, TAG_SIZE,
-                                out.data() + SESSION_SALT_SIZE + NONCE_SIZE + total_cipher_len) != 1) {
+                                out.data() + SESSION_SALT_SIZE + NONCE_SIZE + total_cipher_len) !=
+            1) {
             LOG_ERROR("crypto", "encrypt: EVP_CTRL_GCM_GET_TAG failed");
             out.clear();
             return std::make_error_code(std::errc::io_error);
@@ -464,7 +471,7 @@ std::error_code Crypto::encrypt_impl(byte_view plaintext, std::vector<uint8_t>& 
 
         out.resize(SESSION_SALT_SIZE + NONCE_SIZE + total_cipher_len + TAG_SIZE);
         LOG_DEBUG("crypto", fmt::format("encrypt done: {} -> {} bytes (counter={})",
-                  plaintext.size(), out.size(), counter));
+                                        plaintext.size(), out.size(), counter));
         return {};
     } catch (const std::exception& e) {
         LOG_ERROR("crypto", fmt::format("encrypt exception: {}", e.what()));
@@ -479,8 +486,9 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
             // Per-packet attacker-controlled input: callers log throttled
             // rejections (server auth path, session data path), so keep this
             // at DEBUG to avoid an unthrottled per-datagram log flood.
-            LOG_DEBUG("crypto", fmt::format("decrypt: ciphertext too short ({} < {})",
-                      ciphertext.size(), SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE));
+            LOG_DEBUG("crypto",
+                      fmt::format("decrypt: ciphertext too short ({} < {})", ciphertext.size(),
+                                  SESSION_SALT_SIZE + NONCE_SIZE + TAG_SIZE));
             return std::make_error_code(std::errc::invalid_argument);
         }
 
@@ -503,8 +511,7 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
             // A session that already has a key must never receive a different
             // salt: that would indicate a cross-session injection attempt.
             log_reject_throttled(salt_mismatch_log(), [] {
-                return std::string(
-                    "decrypt: session salt mismatch (possible injection)");
+                return std::string("decrypt: session salt mismatch (possible injection)");
             });
             return std::make_error_code(std::errc::permission_denied);
         }
@@ -518,8 +525,8 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
 
         if (nonce[8] != peer_direction_) {
             log_reject_throttled(direction_log(), [&] {
-                return fmt::format("decrypt: wrong direction byte {} (expected {})",
-                                   nonce[8], peer_direction_);
+                return fmt::format("decrypt: wrong direction byte {} (expected {})", nonce[8],
+                                   peer_direction_);
             });
             if (learning_salt) forget_learned_salt();
             return std::make_error_code(std::errc::permission_denied);
@@ -530,7 +537,8 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
             counter = (counter << 8) | nonce[i];
         }
 
-        LOG_DEBUG("crypto", fmt::format("decrypt: counter={} ciphertext={} bytes", counter, ciphertext.size()));
+        LOG_DEBUG("crypto", fmt::format("decrypt: counter={} ciphertext={} bytes", counter,
+                                        ciphertext.size()));
 
         // Mirror the sender's invariant (see encrypt_impl): a counter at or
         // above MAX_COUNTER can never be produced by either peer, so accepting
@@ -546,8 +554,7 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         // a party holding the session key can produce an authenticated jump.
         if (counter >= MAX_COUNTER) {
             log_reject_throttled(nonce_space_log(), [&] {
-                return fmt::format("decrypt: counter {} outside the nonce space",
-                                   counter);
+                return fmt::format("decrypt: counter {} outside the nonce space", counter);
             });
             if (learning_salt) forget_learned_salt();
             return std::make_error_code(std::errc::permission_denied);
@@ -563,9 +570,8 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         const bool first_packet = server_mode_ && !any_received_;
         if (!first_packet && !check_replay_window(counter)) {
             log_reject_throttled(replay_log(), [&] {
-                return fmt::format(
-                    "decrypt: replay/stale rejected counter={} highest={}",
-                    counter, highest_received_);
+                return fmt::format("decrypt: replay/stale rejected counter={} highest={}", counter,
+                                   highest_received_);
             });
             return make_error_code(crypto_errors::errc::replay);
         }
@@ -590,10 +596,10 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
 
         out.resize(cipher_data_len);
         int out_len = 0;
-        if (EVP_DecryptUpdate(*decrypt_ctx_, out.data(), &out_len,
-                              body.data() + NONCE_SIZE,
+        if (EVP_DecryptUpdate(*decrypt_ctx_, out.data(), &out_len, body.data() + NONCE_SIZE,
                               static_cast<int>(cipher_data_len)) != 1) {
-            LOG_ERROR("crypto", fmt::format("decrypt: EVP_DecryptUpdate failed, data_len={}", cipher_data_len));
+            LOG_ERROR("crypto", fmt::format("decrypt: EVP_DecryptUpdate failed, data_len={}",
+                                            cipher_data_len));
             out.clear();
             return std::make_error_code(std::errc::io_error);
         }
@@ -602,7 +608,10 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         if (EVP_DecryptFinal_ex(*decrypt_ctx_, out.data() + out_len, &final_len) <= 0) {
             // Tag failure on attacker-controlled datagrams is routine noise;
             // callers emit throttled rejections, so keep this at DEBUG.
-            LOG_DEBUG("crypto", fmt::format("decrypt: AEAD tag verification failed (corrupted/wrong key), counter={}", counter));
+            LOG_DEBUG("crypto",
+                      fmt::format(
+                          "decrypt: AEAD tag verification failed (corrupted/wrong key), counter={}",
+                          counter));
             out.clear();
             // The salt learned at the top of this call was never proven: it
             // came off an unauthenticated datagram. Invalidate it so the next
@@ -615,7 +624,7 @@ std::error_code Crypto::decrypt_impl(byte_view ciphertext, std::vector<uint8_t>&
         // Authentication succeeded — only now may the counter enter the window.
         commit_replay_window(counter);
         LOG_DEBUG("crypto", fmt::format("decrypt done: {} -> {} bytes (counter={})",
-                  ciphertext.size(), out.size(), counter));
+                                        ciphertext.size(), out.size(), counter));
         return {};
     } catch (const std::exception& e) {
         LOG_ERROR("crypto", fmt::format("decrypt exception: {}", e.what()));

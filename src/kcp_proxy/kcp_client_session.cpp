@@ -122,7 +122,8 @@ void KCPClientSession::on_connect(std::function<void(bool)> handler) {
 
         auto ack_buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
         auto self = shared_from_this();
-        async_read_some(asio::buffer(*ack_buf),
+        async_read_some(
+            asio::buffer(*ack_buf),
             [this, self, ack_buf, completion](const std::error_code& ec, size_t bytes) mutable {
                 // Timer may have already cancelled the pending read. If the
                 // connect already timed out (connect_pending_ == false but
@@ -218,7 +219,9 @@ void KCPClientSession::send_connect_hello() {
 
 void KCPClientSession::close() {
     auto self = shared_from_this();
-    asio::dispatch(strand(), [this, self]() { on_close(); });
+    asio::dispatch(strand(), [this, self]() {
+        on_close();
+    });
 }
 
 void KCPClientSession::shut_down() {
@@ -241,7 +244,8 @@ void KCPClientSession::on_close() {
     // segments that flush synchronously into async sends actually leave.
     try {
         flush_cycle(now_kcp_ms());
-    } catch (...) {}
+    } catch (...) {
+    }
 
     running_.store(false);
     connected_.store(false);
@@ -429,8 +433,7 @@ void KCPClientSession::on_receive(byte_view packet) {
         // shards of the set and queued them into KCP even when the native
         // shard was refused, and the drain/resume below is what makes them
         // visible.
-        log_kcp_input_rejected("kcp_client", std::string_view(), input_ret,
-                               decrypt_buf_.size());
+        log_kcp_input_rejected("kcp_client", std::string_view(), input_ret, decrypt_buf_.size());
     } else {
         LOG_DEBUG("kcp_client", fmt::format("kcp input ok, peek={}", kcp_.peek_size()));
     }
@@ -504,7 +507,8 @@ void KCPClientSession::handle_kcp_output_batch(const std::vector<std::vector<uin
             // Teardown is already posted by encrypt_for_wire. Recycle what this
             // batch already encrypted before giving up, instead of letting the
             // pooled buffers die with this frame.
-            for (auto& d : encrypted) datagram_pool().release(std::move(d));
+            for (auto& d : encrypted)
+                datagram_pool().release(std::move(d));
             return;
         }
         metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);
@@ -520,7 +524,8 @@ void KCPClientSession::send_batch_wire(std::vector<std::vector<uint8_t>> batch) 
         // the buffers are destroyed here without going back to the freelist,
         // which silently defeats the pool on exactly the teardown path that
         // produces the biggest bursts.
-        for (auto& d : batch) datagram_pool().release(std::move(d));
+        for (auto& d : batch)
+            datagram_pool().release(std::move(d));
         return;
     }
 #if defined(__linux__)

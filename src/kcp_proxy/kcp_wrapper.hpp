@@ -29,8 +29,8 @@ namespace kcp_proxy {
 // diagnostics and tests grep for is never lost.
 // `tag` is the server's session id (empty on the client), matching each side's
 // existing line prefix.
-void log_kcp_input_rejected(std::string_view log_module, std::string_view tag,
-                            int ret, size_t size);
+void log_kcp_input_rejected(std::string_view log_module, std::string_view tag, int ret,
+                            size_t size);
 
 // Adapter between the proxy and the vendored kcp-cpp port (kcp::Kcp, the C++
 // port of xtaci/kcp-go v5). Keeps the exact surface the sessions were written
@@ -86,13 +86,17 @@ public:
     // to inspect the live protocol state (e.g. verify configure() applied the
     // KCP_* constants). Returns a valid reference for the lifetime of the
     // object; construction throws instead of leaving it unbound.
-    const kcp::Kcp& kcp() const { return *kcp_; }
+    const kcp::Kcp& kcp() const {
+        return *kcp_;
+    }
 
     // Current retransmission timeout (ms), driven by the live RTT estimate.
     // The FEC layer borrows it as the burst-continuity window (see
     // FecEncoder::Encode): a shard set whose packets are spread wider than
     // this is not a burst, and parity is skipped for it.
-    std::uint32_t rto() const { return kcp_->rto(); }
+    std::uint32_t rto() const {
+        return kcp_->rto();
+    }
 
     // Re-apply ONLY the nodelay flag at runtime (interval/resend/nc stay as
     // configured; NoDelay treats negatives as "leave unchanged"). nodelay=1

@@ -26,7 +26,7 @@
 namespace kcp::internal {
 class FecEncoder;
 class FecDecoder;
-}
+} // namespace kcp::internal
 
 namespace kcp_proxy {
 
@@ -63,10 +63,8 @@ struct AdaptiveHooks {
 // frg, so a healthy segment cannot land on 0xf1..0xf3.
 inline bool looks_like_fec_frame(const uint8_t* data, size_t size) {
     if (data == nullptr || size < 8) return false;
-    const uint16_t type = static_cast<uint16_t>(data[4]) |
-                          static_cast<uint16_t>(data[5] << 8);
-    return type == kcp::kTypeData || type == kcp::kTypeParity ||
-           type == kcp::kTypeOob;
+    const uint16_t type = static_cast<uint16_t>(data[4]) | static_cast<uint16_t>(data[5] << 8);
+    return type == kcp::kTypeData || type == kcp::kTypeParity || type == kcp::kTypeOob;
 }
 
 // Performance metrics for monitoring
@@ -142,7 +140,9 @@ public:
     KcpTunnel& operator=(const KcpTunnel&) = delete;
 
     // Per-session strand. Every strand-bound helper below assumes it is on it.
-    asio::strand<asio::io_context::executor_type>& strand() { return strand_; }
+    asio::strand<asio::io_context::executor_type>& strand() {
+        return strand_;
+    }
 
     // Queue one application message into KCP and flush it.
     void send_data(byte_view data);
@@ -152,8 +152,12 @@ public:
     void async_read_some(asio::mutable_buffer buffer,
                          std::function<void(std::error_code, size_t)> handler);
 
-    int wait_send() const { return kcp_.wait_send(); }
-    int peek_size() const { return kcp_.peek_size(); }
+    int wait_send() const {
+        return kcp_.wait_send();
+    }
+    int peek_size() const {
+        return kcp_.peek_size();
+    }
 
     // ---------------------- write-path backpressure -------------------------
     // KCP's send queue is bounded, so the tcp->kcp forwarding loops must stop
@@ -176,17 +180,23 @@ public:
     // and a stale hook must never be able to restart a dead loop. The socket
     // itself is closed by the session's own teardown, not from here.
     void unpark_write();
-    bool write_parked() const { return static_cast<bool>(write_resume_cb_); }
+    bool write_parked() const {
+        return static_cast<bool>(write_resume_cb_);
+    }
 
     // Performance metrics
-    const SessionMetrics& metrics() const { return metrics_; }
+    const SessionMetrics& metrics() const {
+        return metrics_;
+    }
 
     // Single-line UDP/decrypt counters for loss localization.
     std::string stats_summary() const;
 
     // True once the peer-level handshake completed. Gates the application
     // keepalive: a tunnel that has not finished connecting must not send one.
-    bool is_handshake_done() const { return handshake_done_.load(); }
+    bool is_handshake_done() const {
+        return handshake_done_.load();
+    }
     virtual void mark_handshake_done();
     // True when `timeout_sec` has elapsed since this tunnel was created and the
     // SOCKS5 handshake still has not completed. Needed in addition to the
@@ -201,8 +211,12 @@ public:
     // Whether the peer negotiated FIN support (KCP_PROXY_HELLO_V2 / _ACK_V2).
     // Until it is set, send_fin() is a no-op: a peer that did not advertise
     // support would forward the control message into the tunnel as data.
-    bool fin_enabled() const { return fin_enabled_.load(); }
-    void enable_fin() { fin_enabled_.store(true); }
+    bool fin_enabled() const {
+        return fin_enabled_.load();
+    }
+    void enable_fin() {
+        fin_enabled_.store(true);
+    }
     // Tell the peer that this side will send no more stream data, and flush it.
     // Idempotent (at most one FIN per tunnel) and a no-op on a tunnel that has
     // not negotiated support or is no longer active. Must run on the strand.
@@ -211,7 +225,9 @@ public:
     // it (see retry_pending_fin) until the segment is actually queued.
     void send_fin();
     // True if the peer's FIN was consumed from KCP (see try_fulfill_read).
-    bool peer_fin_received() const { return peer_fin_received_.load(); }
+    bool peer_fin_received() const {
+        return peer_fin_received_.load();
+    }
 
     // Micros since the last packet that authenticated successfully.
     int64_t activity_age_us() const;
@@ -315,7 +331,9 @@ protected:
 
     // "tag: text" when a tag is set (server sessions), just "text" otherwise.
     std::string log_msg(const std::string& text) const;
-    const std::string& log_module() const { return log_module_; }
+    const std::string& log_module() const {
+        return log_module_;
+    }
 
     // FEC outbound gate: wraps one KCP output datagram. With FEC disabled this
     // forwards to handle_kcp_output unchanged (byte-identical wire to pre-FEC
@@ -390,7 +408,7 @@ protected:
     // entirely (see the tick guards in KCPSession/KCPClientSession).
     std::atomic<bool> needs_flush_{false};
 
-    std::atomic<int64_t> last_activity_us_{0};  // steady_clock micros
+    std::atomic<int64_t> last_activity_us_{0}; // steady_clock micros
     // Throttle for the periodic (DEBUG) UDP stats line, to avoid per-tick spam.
     std::atomic<int64_t> last_stats_us_{0};
     // Keepalive send throttle. Distinct from last_activity_us_: sending a

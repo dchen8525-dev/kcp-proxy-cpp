@@ -21,9 +21,8 @@ namespace kcp_proxy {
 
 class KCPProxyClient : public std::enable_shared_from_this<KCPProxyClient> {
 public:
-    KCPProxyClient(asio::io_context& io, std::string server_host,
-                   uint16_t server_port, std::string key,
-                   std::string listen_host = "127.0.0.1",
+    KCPProxyClient(asio::io_context& io, std::string server_host, uint16_t server_port,
+                   std::string key, std::string listen_host = "127.0.0.1",
                    uint16_t listen_port = 1080,
                    int half_close_grace_sec = CLIENT_HALF_CLOSE_GRACE_SEC,
                    const FecConfig& fec = FecConfig{},
@@ -39,7 +38,9 @@ public:
     // True unless startup failed (DNS resolve / bind / listen error). The main
     // loop checks this after io.run() returns so a failed startup exits with a
     // non-zero code instead of hanging forever on the work guard.
-    bool startup_ok() const { return !start_failed_.load(); }
+    bool startup_ok() const {
+        return !start_failed_.load();
+    }
 
     // Traffic statistics (shared with GUI via periodic log line)
     std::atomic<uint64_t> tx_bytes_{0};
@@ -53,8 +54,7 @@ private:
     // The timer runs on the session strand, so arm/re-arm happen on the same
     // executor as the forwarding completions that refresh last_progress_us.
     struct HalfCloseGuard {
-        explicit HalfCloseGuard(asio::steady_timer::executor_type ex)
-            : deadline(std::move(ex)) {}
+        explicit HalfCloseGuard(asio::steady_timer::executor_type ex) : deadline(std::move(ex)) {}
 
         asio::steady_timer deadline;
         // Set once the local app's read side reported EOF: the tunnel is in
@@ -209,8 +209,8 @@ private:
                              std::shared_ptr<std::atomic<bool>> handshake_cancelled);
 
     void handle_sync_request(std::shared_ptr<asio::ip::tcp::socket> client_socket,
-                             std::shared_ptr<KCPClientSession> session,
-                             uint8_t cmd, const std::string& host, uint16_t port,
+                             std::shared_ptr<KCPClientSession> session, uint8_t cmd,
+                             const std::string& host, uint16_t port,
                              std::shared_ptr<asio::steady_timer> handshake_deadline,
                              std::shared_ptr<std::atomic<bool>> handshake_cancelled);
 
@@ -236,8 +236,7 @@ private:
     void forward_kcp_to_client(std::shared_ptr<asio::ip::tcp::socket> client_socket,
                                std::shared_ptr<KCPClientSession> session,
                                std::shared_ptr<std::vector<uint8_t>> buf = {},
-                               std::shared_ptr<HalfCloseGuard> guard = {},
-                               bool fin_check = true);
+                               std::shared_ptr<HalfCloseGuard> guard = {}, bool fin_check = true);
 
     // Shared eof handling for "the server half-closed": both the read
     // completion (FIN consumed while a read was pending) and the re-arm entry
@@ -263,8 +262,7 @@ private:
                              std::shared_ptr<asio::ip::tcp::socket> client_socket,
                              std::shared_ptr<KCPClientSession> session);
 
-    void send_socks5_error(std::shared_ptr<asio::ip::tcp::socket> client_socket,
-                           uint8_t reply,
+    void send_socks5_error(std::shared_ptr<asio::ip::tcp::socket> client_socket, uint8_t reply,
                            std::function<void()> on_complete = {});
 };
 

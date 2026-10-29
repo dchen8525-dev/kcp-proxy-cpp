@@ -43,14 +43,11 @@ KcpTunnel::KcpTunnel(asio::io_context& io, uint32_t conv, std::shared_ptr<Crypto
         // every configuration it could reject — so a null would be a
         // programming error, and throwing fails the session loudly instead of
         // silently mismatching the peer's FEC framing.
-        fec_encoder_ = kcp::internal::FecEncoder::New(
-            fec.data_shards, fec.parity_shards,
-            static_cast<int>(FEC_CRYPTO_RESERVE));
-        fec_decoder_ = kcp::internal::FecDecoder::New(
-            fec.data_shards, fec.parity_shards);
+        fec_encoder_ = kcp::internal::FecEncoder::New(fec.data_shards, fec.parity_shards,
+                                                      static_cast<int>(FEC_CRYPTO_RESERVE));
+        fec_decoder_ = kcp::internal::FecDecoder::New(fec.data_shards, fec.parity_shards);
         if (!fec_encoder_ || !fec_decoder_) {
-            LOG_ERROR(log_module_, log_msg("FEC codec creation failed for " +
-                      fec.to_string()));
+            LOG_ERROR(log_module_, log_msg("FEC codec creation failed for " + fec.to_string()));
             throw std::runtime_error("FEC codec creation failed");
         }
         // Pre-size the reusable send frame for the largest possible KCP
@@ -205,16 +202,15 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         // semantics as a truncated KCP segment.
         return -2;
     }
-    const uint16_t flag = static_cast<uint16_t>(data[4]) |
-                          static_cast<uint16_t>(data[5] << 8);
+    const uint16_t flag = static_cast<uint16_t>(data[4]) | static_cast<uint16_t>(data[5] << 8);
     int ret = 0;
     if (flag == kcp::kTypeData) {
         // The length field counts itself (fec.go:406): the encoder writes
         // declared = size - payload_offset(6), so declared already covers the
         // 2-byte length field plus the payload and must span the packet minus
         // its 6-byte FEC header exactly.
-        const uint16_t declared = static_cast<uint16_t>(data[6]) |
-                                  static_cast<uint16_t>(data[7] << 8);
+        const uint16_t declared =
+            static_cast<uint16_t>(data[6]) | static_cast<uint16_t>(data[7] << 8);
         // declared == 2 means an empty payload; the encoder never emits one (a
         // KCP datagram always carries its 24-byte segment header), so treat it
         // as a framing error rather than handing KCP a zero-length input.
@@ -254,16 +250,15 @@ int KcpTunnel::feed_kcp_input(const uint8_t* data, size_t size) {
         // the set's maxlen before reconstruction, so the declared prefix is
         // what matters. The len field counts itself (declared = 2 + payload).
         if (rebuilt.size() < 2) continue;
-        const uint16_t declared = static_cast<uint16_t>(rebuilt[0]) |
-                                  static_cast<uint16_t>(rebuilt[1] << 8);
+        const uint16_t declared =
+            static_cast<uint16_t>(rebuilt[0]) | static_cast<uint16_t>(rebuilt[1] << 8);
         if (declared <= 2 || declared > rebuilt.size()) {
             LOG_DEBUG(log_module_,
                       log_msg(fmt::format("fec rebuilt framing mismatch: {} bytes, declared={}",
                                           rebuilt.size(), declared)));
             continue;
         }
-        const int r = kcp_.input(byte_view(rebuilt.data() + 2,
-                                           declared - 2));
+        const int r = kcp_.input(byte_view(rebuilt.data() + 2, declared - 2));
         if (r >= 0) {
             metrics_.fec_repaired.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -491,7 +486,7 @@ void KcpTunnel::on_async_read_some(asio::mutable_buffer buffer,
         // A second outstanding read would silently shadow the first and leak
         // its caller, so reject it loudly.
         LOG_WARNING(log_module_, log_msg("async_read_some stacked (already_started), "
-                    "old handler still pending - rejecting new one"));
+                                         "old handler still pending - rejecting new one"));
         auto h = std::move(handler);
         auto self = shared_from_this();
         asio::post(strand_, [self, h = std::move(h)]() mutable {
@@ -623,8 +618,7 @@ void KcpTunnel::maybe_log_stats() {
     static constexpr int64_t STATS_INTERVAL_US = 30 * 1000000;
     const int64_t now = now_us();
     int64_t last = last_stats_us_.load();
-    if ((now - last) >= STATS_INTERVAL_US &&
-        last_stats_us_.compare_exchange_strong(last, now)) {
+    if ((now - last) >= STATS_INTERVAL_US && last_stats_us_.compare_exchange_strong(last, now)) {
         LOG_DEBUG(log_module_, stats_summary());
     }
 }
@@ -632,8 +626,7 @@ void KcpTunnel::maybe_log_stats() {
 void KcpTunnel::maybe_send_keepalive() {
     if (!is_handshake_done()) return;
     const int64_t now = now_us();
-    if (now - last_keepalive_us_.load() <
-            static_cast<int64_t>(KCP_KEEPALIVE_SEC) * 1000000 ||
+    if (now - last_keepalive_us_.load() < static_cast<int64_t>(KCP_KEEPALIVE_SEC) * 1000000 ||
         kcp_.peek_size() > 0) {
         return;
     }
@@ -677,7 +670,8 @@ bool KcpTunnel::is_control(const uint8_t* data, size_t size, const char* magic) 
     const size_t magic_len = std::strlen(magic);
     if (size != magic_len + salt.size()) return false;
     if (std::memcmp(data, magic, magic_len) != 0) return false;
-    if (salt.size() > 0 && std::memcmp(data + magic_len, salt.data(), salt.size()) != 0) return false;
+    if (salt.size() > 0 && std::memcmp(data + magic_len, salt.data(), salt.size()) != 0)
+        return false;
     return true;
 }
 

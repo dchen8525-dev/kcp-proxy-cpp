@@ -29,8 +29,7 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         std::array<unsigned char, 4> bytes{};
         std::copy_n(data + offset + 1, bytes.size(), bytes.begin());
         std::string host = asio::ip::address_v4(bytes).to_string();
-        uint16_t port = (static_cast<uint16_t>(data[offset + 5]) << 8) |
-                        data[offset + 6];
+        uint16_t port = (static_cast<uint16_t>(data[offset + 5]) << 8) | data[offset + 6];
         return {host, port};
     }
 
@@ -42,11 +41,9 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         if (offset + 2 + domain_len + 2 > data_size) {
             throw std::invalid_argument("Insufficient data for domain address");
         }
-        std::string host(reinterpret_cast<const char*>(data + offset + 2),
-                         domain_len);
+        std::string host(reinterpret_cast<const char*>(data + offset + 2), domain_len);
         size_t port_offset = offset + 2 + domain_len;
-        uint16_t port = (static_cast<uint16_t>(data[port_offset]) << 8) |
-                        data[port_offset + 1];
+        uint16_t port = (static_cast<uint16_t>(data[port_offset]) << 8) | data[port_offset + 1];
         return {host, port};
     }
 
@@ -57,8 +54,7 @@ ParsedAddress parse_address(const uint8_t* data, size_t data_size, size_t offset
         std::array<unsigned char, 16> bytes{};
         std::copy_n(data + offset + 1, bytes.size(), bytes.begin());
         std::string host = asio::ip::address_v6(bytes).to_string();
-        uint16_t port = (static_cast<uint16_t>(data[offset + 17]) << 8) |
-                        data[offset + 18];
+        uint16_t port = (static_cast<uint16_t>(data[offset + 17]) << 8) | data[offset + 18];
         return {host, port};
     }
 
@@ -117,21 +113,22 @@ bool is_restricted_target(const asio::ip::address& addr) {
         if (v4.is_unspecified() || v4.is_loopback() || v4.is_multicast()) {
             return true;
         }
-        if (o0 == 0) return true;                              // 0.0.0.0/8
-        if (o0 == 10) return true;                             // 10.0.0.0/8
-        if (o0 == 100 && (o1 & 0xC0) == 64) return true;       // 100.64.0.0/10 CGN
-        if (o0 == 169 && o1 == 254) return true;               // 169.254.0.0/16
-        if (o0 == 172 && (o1 & 0xF0) == 16) return true;       // 172.16.0.0/12
-        if (o0 == 192 && o1 == 168) return true;               // 192.168.0.0/16
+        if (o0 == 0) return true;                        // 0.0.0.0/8
+        if (o0 == 10) return true;                       // 10.0.0.0/8
+        if (o0 == 100 && (o1 & 0xC0) == 64) return true; // 100.64.0.0/10 CGN
+        if (o0 == 169 && o1 == 254) return true;         // 169.254.0.0/16
+        if (o0 == 172 && (o1 & 0xF0) == 16) return true; // 172.16.0.0/12
+        if (o0 == 192 && o1 == 168) return true;         // 192.168.0.0/16
         // 192.0.0.0/24 (IETF protocol assignments) and 192.0.2.0/24
         // (TEST-NET-1). Note o2 must be exactly 0 or 2 — the previous
         // `o2 <= 2` also swallowed 192.0.1.0/24, which is globally routable.
         if (o0 == 192 && o1 == 0 && (o2 == 0 || o2 == 2)) return true;
-        if (o0 == 192 && o1 == 88 && o2 == 99) return true;    // 192.88.99.0/24 6to4 relay anycast (deprecated)
-        if (o0 == 198 && (o1 == 18 || o1 == 19)) return true;  // 198.18.0.0/15
-        if (o0 == 198 && o1 == 51 && o2 == 100) return true;   // 198.51.100.0/24
-        if (o0 == 203 && o1 == 0 && o2 == 113) return true;    // 203.0.113.0/24
-        if (o0 >= 240) return true;                            // 240.0.0.0/4 reserved (class E)
+        if (o0 == 192 && o1 == 88 && o2 == 99)
+            return true; // 192.88.99.0/24 6to4 relay anycast (deprecated)
+        if (o0 == 198 && (o1 == 18 || o1 == 19)) return true; // 198.18.0.0/15
+        if (o0 == 198 && o1 == 51 && o2 == 100) return true;  // 198.51.100.0/24
+        if (o0 == 203 && o1 == 0 && o2 == 113) return true;   // 203.0.113.0/24
+        if (o0 >= 240) return true;                           // 240.0.0.0/4 reserved (class E)
         return false;
     }
     if (addr.is_v6()) {
@@ -148,28 +145,24 @@ bool is_restricted_target(const asio::ip::address& addr) {
         // instead of trusting the IPv6 surface, otherwise these prefixes are
         // an SSRF bypass. (Recursion terminates: the embedded address is v4.)
         auto embedded_v4 = [&bytes](size_t i) {
-            const asio::ip::address_v4::bytes_type b{
-                bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]};
+            const asio::ip::address_v4::bytes_type b{bytes[i], bytes[i + 1], bytes[i + 2],
+                                                     bytes[i + 3]};
             return asio::ip::address(asio::ip::address_v4(b));
         };
         // 6to4 (2002::/16): the encapsulated IPv4 address lives in bytes 2-5.
-        if (bytes[0] == 0x20 && bytes[1] == 0x02 &&
-            is_restricted_target(embedded_v4(2))) {
+        if (bytes[0] == 0x20 && bytes[1] == 0x02 && is_restricted_target(embedded_v4(2))) {
             return true;
         }
         // Teredo (2001:0000::/32): the Teredo server's IPv4 is in bytes 4-7
         // and the client's IPv4 (bit-inverted) in bytes 12-15. Refuse the
         // address if EITHER embeds a restricted IPv4.
-        if (bytes[0] == 0x20 && bytes[1] == 0x01 &&
-            bytes[2] == 0x00 && bytes[3] == 0x00) {
+        if (bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x00 && bytes[3] == 0x00) {
             if (is_restricted_target(embedded_v4(4))) {
                 return true;
             }
             const asio::ip::address_v4::bytes_type client_b{
-                static_cast<unsigned char>(~bytes[12]),
-                static_cast<unsigned char>(~bytes[13]),
-                static_cast<unsigned char>(~bytes[14]),
-                static_cast<unsigned char>(~bytes[15])};
+                static_cast<unsigned char>(~bytes[12]), static_cast<unsigned char>(~bytes[13]),
+                static_cast<unsigned char>(~bytes[14]), static_cast<unsigned char>(~bytes[15])};
             if (is_restricted_target(asio::ip::address_v4(client_b))) {
                 return true;
             }
@@ -178,8 +171,7 @@ bool is_restricted_target(const asio::ip::address& addr) {
         // variant (64:ff9b:1::/48, RFC 8215): the translated IPv4 sits in
         // bytes 12-15. Without this, 64:ff9b::7f00:0001 (= 127.0.0.1) slips
         // past the IPv4 blocks wherever the host has NAT64 routing.
-        if (bytes[0] == 0x00 && bytes[1] == 0x64 &&
-            bytes[2] == 0xff && bytes[3] == 0x9b &&
+        if (bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xff && bytes[3] == 0x9b &&
             bytes[4] == 0x00 && (bytes[5] == 0x00 || bytes[5] == 0x01) &&
             is_restricted_target(embedded_v4(12))) {
             return true;
@@ -189,7 +181,10 @@ bool is_restricted_target(const asio::ip::address& addr) {
         {
             bool v4_compat = true;
             for (int i = 0; i < 12; ++i) {
-                if (bytes[i] != 0) { v4_compat = false; break; }
+                if (bytes[i] != 0) {
+                    v4_compat = false;
+                    break;
+                }
             }
             if (v4_compat && is_restricted_target(embedded_v4(12))) {
                 return true;
@@ -201,14 +196,12 @@ bool is_restricted_target(const asio::ip::address& addr) {
         // this it was the one private IPv6 range the guard let through: a host
         // with legacy site-local addressing would accept a CONNECT into its own
         // network, which is exactly what the rest of this function refuses.
-        if (v6.is_loopback() || v6.is_unspecified() || v6.is_link_local() ||
-            v6.is_site_local() || v6.is_multicast() ||
-            (bytes[0] & 0xFE) == 0xFC) {  // fc00::/7 unique-local
+        if (v6.is_loopback() || v6.is_unspecified() || v6.is_link_local() || v6.is_site_local() ||
+            v6.is_multicast() || (bytes[0] & 0xFE) == 0xFC) { // fc00::/7 unique-local
             return true;
         }
         // 2001:db8::/32 documentation range.
-        if (bytes[0] == 0x20 && bytes[1] == 0x01 &&
-            bytes[2] == 0x0d && bytes[3] == 0xb8) {
+        if (bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8) {
             return true;
         }
         return false;

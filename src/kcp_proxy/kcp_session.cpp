@@ -22,8 +22,8 @@ KCPSession::KCPSession(asio::io_context& io, uint32_t conv, asio::ip::udp::endpo
     // concurrent get_or_create_session and could be wrongly treated as stale and
     // erased. Setting it here keeps the live session unambiguous from creation.
     state_flags_.fetch_or(RUNNING);
-    LOG_DEBUG("kcp_session", fmt::format("{}: created conv={} remote={}:{}",
-              session_id_, conv, remote_addr_.address().to_string(), remote_addr_.port()));
+    LOG_DEBUG("kcp_session", fmt::format("{}: created conv={} remote={}:{}", session_id_, conv,
+                                         remote_addr_.address().to_string(), remote_addr_.port()));
 }
 
 KCPSession::~KCPSession() {
@@ -166,27 +166,26 @@ void KCPSession::on_receive(byte_view encrypted) {
 
 void KCPSession::inject_decrypted(std::vector<uint8_t> decrypted, std::function<void()> after) {
     auto self = shared_from_this();
-    asio::dispatch(strand(), [this, self, d = std::move(decrypted),
-                              after = std::move(after)]() mutable {
-        on_inject_decrypted(std::move(d));
-        if (after) after();
-    });
+    asio::dispatch(strand(),
+                   [this, self, d = std::move(decrypted), after = std::move(after)]() mutable {
+                       on_inject_decrypted(std::move(d));
+                       if (after) after();
+                   });
 }
 
 void KCPSession::on_inject_decrypted(std::vector<uint8_t> decrypted) {
     if (!is_running()) return;
     touch_activity();
     LOG_DEBUG("kcp_session", fmt::format("{}: inject {} decrypted bytes, peek_before={}",
-              session_id_, decrypted.size(), kcp_.peek_size()));
+                                         session_id_, decrypted.size(), kcp_.peek_size()));
     int input_ret = feed_kcp_input(decrypted.data(), decrypted.size());
     if (input_ret < 0) {
         // Same reasoning as on_receive: the native shard was refused, but the
         // decoder may have rebuilt siblings into KCP, so keep draining.
-        log_kcp_input_rejected("kcp_session", session_id_, input_ret,
-                               decrypted.size());
+        log_kcp_input_rejected("kcp_session", session_id_, input_ret, decrypted.size());
     } else {
-        LOG_DEBUG("kcp_session", fmt::format("{}: inject ok, peek_after={}",
-                  session_id_, kcp_.peek_size()));
+        LOG_DEBUG("kcp_session",
+                  fmt::format("{}: inject ok, peek_after={}", session_id_, kcp_.peek_size()));
     }
     try_fulfill_read();
     maybe_resume_write();
@@ -337,7 +336,8 @@ void KCPSession::handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>
             // encrypt_for_wire already shut the session down. Recycle the
             // buffers this batch has encrypted so far instead of letting them
             // die with this frame.
-            for (auto& d : encrypted) datagram_pool().release(std::move(d));
+            for (auto& d : encrypted)
+                datagram_pool().release(std::move(d));
             return;
         }
         metrics_.udp_tx_packets.fetch_add(1, std::memory_order_relaxed);

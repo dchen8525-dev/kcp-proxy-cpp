@@ -55,9 +55,7 @@ inline bool parse_port_digits(const std::string& digits, uint16_t& port) {
 // Rejected (returns false): empty entries, trailing garbage, non-numeric or
 // out-of-range ports ("host:", "host:-1", "host:99999", "host:80x",
 // "[::1]junk").
-inline bool parse_allow_target_entry(const std::string& entry,
-                                     std::string& host,
-                                     bool& has_port,
+inline bool parse_allow_target_entry(const std::string& entry, std::string& host, bool& has_port,
                                      uint16_t& port) {
     has_port = false;
     port = 0;
@@ -69,10 +67,10 @@ inline bool parse_allow_target_entry(const std::string& entry,
         if (close == std::string::npos) return false;
         host = entry.substr(1, close - 1);
         if (host.empty()) return false;
-        if (close + 1 == entry.size()) return true;           // "[v6]"
-        if (entry[close + 1] != ':') return false;            // "[v6]junk"
+        if (close + 1 == entry.size()) return true; // "[v6]"
+        if (entry[close + 1] != ':') return false;  // "[v6]junk"
         const std::string port_part = entry.substr(close + 2);
-        if (!detail::parse_port_digits(port_part, port)) {    // "[v6]:" / "[v6]:80x"
+        if (!detail::parse_port_digits(port_part, port)) { // "[v6]:" / "[v6]:80x"
             return false;
         }
         has_port = true;
@@ -87,9 +85,9 @@ inline bool parse_allow_target_entry(const std::string& entry,
     }
     if (colon != std::string::npos) {
         host = entry.substr(0, colon);
-        if (host.empty()) return false;                       // ":80"
+        if (host.empty()) return false; // ":80"
         const std::string port_part = entry.substr(colon + 1);
-        if (!detail::parse_port_digits(port_part, port)) {    // "host:" / "-1" / "80x" / "99999"
+        if (!detail::parse_port_digits(port_part, port)) { // "host:" / "-1" / "80x" / "99999"
             return false;
         }
         has_port = true;

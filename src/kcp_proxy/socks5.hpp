@@ -24,11 +24,7 @@ struct SOCKS5Response {
     std::vector<uint8_t> build() const;
 };
 
-enum class SOCKS5ParseStatus {
-    NeedMore,
-    Complete,
-    Invalid
-};
+enum class SOCKS5ParseStatus { NeedMore, Complete, Invalid };
 
 struct SOCKS5ParseResult {
     SOCKS5ParseStatus status = SOCKS5ParseStatus::NeedMore;
@@ -55,11 +51,7 @@ struct SOCKS5Reply {
     size_t length = 0;
 };
 
-enum class SOCKS5ReplyStatus {
-    NeedMore,
-    Complete,
-    Invalid
-};
+enum class SOCKS5ReplyStatus { NeedMore, Complete, Invalid };
 
 struct SOCKS5ReplyResult {
     SOCKS5ReplyStatus status = SOCKS5ReplyStatus::NeedMore;

@@ -20,12 +20,11 @@ LogThrottle& kcp_input_reject_log() {
 
 } // namespace
 
-void log_kcp_input_rejected(std::string_view log_module, std::string_view tag,
-                            int ret, size_t size) {
+void log_kcp_input_rejected(std::string_view log_module, std::string_view tag, int ret,
+                            size_t size) {
     uint32_t suppressed = 0;
     if (!kcp_input_reject_log().should_log(suppressed)) return;
-    const std::string prefix = tag.empty() ? std::string()
-                                           : std::string(tag) + ": ";
+    const std::string prefix = tag.empty() ? std::string() : std::string(tag) + ": ";
     std::string line =
         fmt::format("{}FAIL_STAGE=KCP_INPUT_FAILED ERROR=ret_{} size={}", prefix, ret, size);
     line += throttle_suffix(suppressed);
@@ -37,10 +36,14 @@ KcpWrapper::KcpWrapper(uint32_t conv)
           conv,
           // Output trampoline: kcp::Kcp hands us each datagram from
           // Flush/Input; route it to the caller's byte_view callback.
-          [this](const std::uint8_t* buf, std::size_t len) { c_output(buf, len); },
+          [this](const std::uint8_t* buf, std::size_t len) {
+              c_output(buf, len);
+          },
           // Clock: kcp::Kcp reads time only through this injection, so the
           // explicit update(ms) below remains the single time source.
-          [this]() -> std::uint32_t { return current_ms_; })) {
+          [this]() -> std::uint32_t {
+              return current_ms_;
+          })) {
     configure();
     LOG_DEBUG("kcp_wrapper", fmt::format("created conv={}", conv));
 }

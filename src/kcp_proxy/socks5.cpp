@@ -16,7 +16,8 @@ std::vector<uint8_t> SOCKS5Response::build() const {
     // SOCKS5 clients trip over an ATYP=DOMAIN with an empty name.
     if (host.empty()) {
         result.push_back(SOCKS5_ATYP_IPV4);
-        for (int i = 0; i < 4; ++i) result.push_back(0);
+        for (int i = 0; i < 4; ++i)
+            result.push_back(0);
         result.push_back(static_cast<uint8_t>((port >> 8) & 0xFF));
         result.push_back(static_cast<uint8_t>(port & 0xFF));
     } else {
@@ -99,7 +100,8 @@ SOCKS5ParseResult parse_socks5_request(const std::vector<uint8_t>& data) {
         result.error = e.what();
         // parse_address can also throw "Unsupported address type" as a safety
         // net; propagate the distinction so the caller picks the right reply.
-        result.bad_atyp = std::string(e.what()).find("Unsupported address type") != std::string::npos;
+        result.bad_atyp =
+            std::string(e.what()).find("Unsupported address type") != std::string::npos;
     }
     return result;
 }

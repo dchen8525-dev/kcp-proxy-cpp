@@ -161,7 +161,7 @@ constexpr size_t AES_KEY_SIZE = 16;
 // Bytes of cleartext framing in front of the AEAD plaintext: the salt and the
 // nonce. Also the FEC encoder's header_offset, i.e. the region a framed packet
 // leaves free at the front of its buffer (see FecEncoder::New).
-constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE;  // 28
+constexpr size_t FEC_CRYPTO_RESERVE = SESSION_SALT_SIZE + NONCE_SIZE; // 28
 // Hard ceiling: refuse to encrypt past this counter so the session must rekey.
 // AES-GCM IND-CPA security degrades well before 2^64; pick 2^48 as a safe wall.
 constexpr uint64_t MAX_COUNTER = (1ull << 48);
@@ -193,8 +193,8 @@ constexpr int KCP_MTU_MAX = 9000;
 // field inside the AEAD), plus the cleartext salt/nonce and the AEAD tag.
 // Parity datagrams never exceed the largest data shard of their set, and a
 // bare (FEC-off) datagram is smaller still, so this bounds every packet.
-constexpr size_t UDP_WIRE_DATAGRAM_MAX = FEC_CRYPTO_RESERVE + 8 +
-                                        static_cast<size_t>(KCP_MTU_MAX) + TAG_SIZE;
+constexpr size_t UDP_WIRE_DATAGRAM_MAX =
+    FEC_CRYPTO_RESERVE + 8 + static_cast<size_t>(KCP_MTU_MAX) + TAG_SIZE;
 
 // Buffer sizes
 //
@@ -334,8 +334,7 @@ struct KcpTuning {
     bool backpressure_invariant_holds() const {
         const int segs = max_segments_per_msg();
         const int thr = backpressure_threshold();
-        return segs > 0 && thr > 0 && backpressure_resume() > 0 &&
-               thr + segs <= sndwnd;
+        return segs > 0 && thr > 0 && backpressure_resume() > 0 && thr + segs <= sndwnd;
     }
 };
 
@@ -470,10 +469,12 @@ constexpr int KCP_RTO_RELAX_SEC = 15;
 constexpr int KCP_RTO_HOLD_SEC = 60;
 
 struct FecConfig {
-    int data_shards = 0;    // 0 = disabled
-    int parity_shards = 0;  // 0 = disabled
+    int data_shards = 0;   // 0 = disabled
+    int parity_shards = 0; // 0 = disabled
 
-    bool enabled() const { return data_shards > 0 && parity_shards > 0; }
+    bool enabled() const {
+        return data_shards > 0 && parity_shards > 0;
+    }
     // "10:3" when enabled, "off" otherwise — for logs and usage text.
     std::string to_string() const {
         return enabled() ? fmt::format("{}:{}", data_shards, parity_shards) : "off";
@@ -515,7 +516,7 @@ inline bool parse_fec_config(const std::string& text, FecConfig& out) {
     const long data = std::stol(data_part);
     const long parity = std::stol(parity_part);
     if (data == 0 && parity == 0) {
-        out = FecConfig{};  // disabled
+        out = FecConfig{}; // disabled
         return true;
     }
     if (data < 1 || parity < 1 || data + parity > 256 || parity > data) {

@@ -45,18 +45,24 @@ public:
     void inject_decrypted(std::vector<uint8_t> decrypted, std::function<void()> after = {});
 
     bool is_alive() const;
-    bool is_running() const { return (state_flags_.load() & RUNNING) != 0; }
+    bool is_running() const {
+        return (state_flags_.load() & RUNNING) != 0;
+    }
     void mark_handshake_done() override;
     bool is_protocol_handshake_done() const {
         return (state_flags_.load() & PROTOCOL_HS_DONE) != 0;
     }
-    void mark_protocol_handshake_done() { state_flags_.fetch_or(PROTOCOL_HS_DONE); }
+    void mark_protocol_handshake_done() {
+        state_flags_.fetch_or(PROTOCOL_HS_DONE);
+    }
     bool is_socks5_read_pending() const {
         return (state_flags_.load() & SOCKS5_READ_PENDING) != 0;
     }
     void set_socks5_read_pending(bool val) {
-        if (val) state_flags_.fetch_or(SOCKS5_READ_PENDING);
-        else state_flags_.fetch_and(static_cast<uint8_t>(~SOCKS5_READ_PENDING));
+        if (val)
+            state_flags_.fetch_or(SOCKS5_READ_PENDING);
+        else
+            state_flags_.fetch_and(static_cast<uint8_t>(~SOCKS5_READ_PENDING));
     }
     bool is_forward_read_pending() const {
         return (state_flags_.load() & FORWARD_READ_PENDING) != 0;
@@ -70,12 +76,16 @@ public:
         return (state_flags_.load() & CONNECT_PENDING) != 0;
     }
     void set_connect_pending(bool val) {
-        if (val) state_flags_.fetch_or(CONNECT_PENDING);
-        else state_flags_.fetch_and(static_cast<uint8_t>(~CONNECT_PENDING));
+        if (val)
+            state_flags_.fetch_or(CONNECT_PENDING);
+        else
+            state_flags_.fetch_and(static_cast<uint8_t>(~CONNECT_PENDING));
     }
     void set_forward_read_pending(bool val) {
-        if (val) state_flags_.fetch_or(FORWARD_READ_PENDING);
-        else state_flags_.fetch_and(static_cast<uint8_t>(~FORWARD_READ_PENDING));
+        if (val)
+            state_flags_.fetch_or(FORWARD_READ_PENDING);
+        else
+            state_flags_.fetch_and(static_cast<uint8_t>(~FORWARD_READ_PENDING));
     }
     // Atomically set forward_read_pending to true; returns the OLD value.
     // Used to avoid TOCTOU between checking and setting in handle_kcp_data.
@@ -89,7 +99,9 @@ public:
     // (wait_send() == 0); tearing down early would drop it and truncate the
     // stream. mark_target_closed() records the condition and the drained
     // callback (if set) is invoked once by on_update_tick when the buffer drains.
-    bool is_target_closed() const { return target_closed_.load(); }
+    bool is_target_closed() const {
+        return target_closed_.load();
+    }
     // Dropping the parked write hook here is part of the state change, not
     // cleanup after it: the hook belongs to the tcp->kcp loop, whose direction
     // is dead the moment the target closed. If it stayed registered, the next
@@ -107,15 +119,23 @@ public:
     // (asio::dispatch(session->strand(), ...)); calling from a raw io_context
     // executor -- e.g. an async_connect completion handler -- races with the
     // concurrent tick.
-    void set_drained_callback(std::function<void()> cb) { drained_cb_ = std::move(cb); }
+    void set_drained_callback(std::function<void()> cb) {
+        drained_cb_ = std::move(cb);
+    }
 
-    const std::string& session_id() const { return session_id_; }
-    const asio::ip::udp::endpoint& remote_addr() const { return remote_addr_; }
+    const std::string& session_id() const {
+        return session_id_;
+    }
+    const asio::ip::udp::endpoint& remote_addr() const {
+        return remote_addr_;
+    }
 
     // True if `packet`'s leading bytes carry this session's salt (i.e. the
     // packet belongs to this session, not to a NEW session that collided on the
     // same source endpoint after a client reconnect).
-    bool salt_matches(byte_view packet) const { return crypto_->matches_salt(packet); }
+    bool salt_matches(byte_view packet) const {
+        return crypto_->matches_salt(packet);
+    }
 
     // Takes ownership of the (already encrypted) datagrams of one flush cycle
     // so the server's UDP send can batch them onto the wire without a copy
@@ -146,8 +166,12 @@ private:
     std::function<void()> drained_cb_;
 
     // --- KcpTunnel hooks ---
-    bool can_accept_data() const override { return is_running(); }
-    bool is_active() const override { return is_running(); }
+    bool can_accept_data() const override {
+        return is_running();
+    }
+    bool is_active() const override {
+        return is_running();
+    }
     void shut_down() override;
     void handle_kcp_output(byte_view data) override;
     void handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,

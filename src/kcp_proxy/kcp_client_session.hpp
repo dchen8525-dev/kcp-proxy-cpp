@@ -35,16 +35,22 @@ public:
     // strand; nothing else should call it -- the tick owns the cadence.
     void on_update_tick();
 
-    bool is_connected() const { return connected_.load() && running_.load(); }
+    bool is_connected() const {
+        return connected_.load() && running_.load();
+    }
     // is_handshake_done() comes from KcpTunnel; this override adds the log line.
     void mark_handshake_done() override;
 
     // Opaque external keepalive: whatever is assigned here is released
     // together with the session, so owners can attach RAII resources (e.g. a
     // session-cap ticket) without having to track every teardown path.
-    void set_keepalive(std::shared_ptr<void> keep) { keepalive_ = std::move(keep); }
+    void set_keepalive(std::shared_ptr<void> keep) {
+        keepalive_ = std::move(keep);
+    }
 
-    const asio::ip::udp::endpoint& server_addr() const { return server_addr_; }
+    const asio::ip::udp::endpoint& server_addr() const {
+        return server_addr_;
+    }
 
 private:
     asio::ip::udp::endpoint server_addr_;
@@ -84,8 +90,12 @@ private:
     std::vector<uint8_t> udp_recv_buf_ = std::vector<uint8_t>(UDP_RECV_BUF_SIZE);
 
     // --- KcpTunnel hooks ---
-    bool can_accept_data() const override { return running_.load() && connected_.load(); }
-    bool is_active() const override { return running_.load(); }
+    bool can_accept_data() const override {
+        return running_.load() && connected_.load();
+    }
+    bool is_active() const override {
+        return running_.load();
+    }
     void shut_down() override;
     void handle_kcp_output(byte_view data) override;
     void handle_kcp_output_batch(const std::vector<std::vector<uint8_t>>& datagrams,

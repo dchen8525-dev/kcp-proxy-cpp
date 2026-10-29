@@ -4,7 +4,11 @@
 #include <string>
 #include <vector>
 
-namespace asio { namespace ip { class address; } }
+namespace asio {
+namespace ip {
+class address;
+}
+} // namespace asio
 
 namespace kcp_proxy {
 

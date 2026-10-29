@@ -189,20 +189,23 @@ void KCPProxyClient::do_resolve() {
                 }
             }
             server_endpoint_ = selected->endpoint();
-            LOG_INFO("client", "resolved " + server_host_ + " -> " +
-                     server_endpoint_.address().to_string());
+            LOG_INFO("client",
+                     "resolved " + server_host_ + " -> " + server_endpoint_.address().to_string());
 
             std::error_code listen_ec;
             const auto listen_addr = asio::ip::make_address(listen_host_, listen_ec);
             if (listen_ec) {
-                fail_startup("invalid listen host '" + listen_host_ +
-                             "': " + listen_ec.message());
+                fail_startup("invalid listen host '" + listen_host_ + "': " + listen_ec.message());
                 return;
             }
             if (!listen_addr.is_loopback()) {
-                LOG_WARNING("client", "SOCKS5 listener has no authentication and is bound to a "
-                            "non-loopback address (" + listen_host_ + ") - this is an unauthenticated "
-                            "open proxy. Keep it on 127.0.0.1 unless you explicitly intend to expose it.");
+                LOG_WARNING("client",
+                            "SOCKS5 listener has no authentication and is bound to a "
+                            "non-loopback address (" +
+                                listen_host_ +
+                                ") - this is an unauthenticated "
+                                "open proxy. Keep it on 127.0.0.1 unless you explicitly intend to "
+                                "expose it.");
             }
 
             asio::ip::tcp::endpoint listen_ep(listen_addr, listen_port_);
@@ -357,8 +360,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     // set_keepalive(), so the counter drops exactly when the session object
     // is destroyed — no matter which teardown path ran (handshake failure,
     // EOF, error, idle timeout).
-    if (active_sessions_->fetch_add(1, std::memory_order_relaxed) >=
-        MAX_CLIENT_SESSIONS) {
+    if (active_sessions_->fetch_add(1, std::memory_order_relaxed) >= MAX_CLIENT_SESSIONS) {
         active_sessions_->fetch_sub(1, std::memory_order_relaxed);
         LOG_WARNING("client", fmt::format("connection limit reached ({}), refusing connection",
                                           MAX_CLIENT_SESSIONS));
@@ -366,21 +368,19 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         // well-behaved app can report "proxy overloaded". The socket closes in
         // the write completion -- closing first would cancel the reply write
         // before it ever leaves.
-        send_socks5_error(client, SOCKS5_REPLY_GENERAL_FAILURE,
-            [client] {
-                std::error_code ignored;
-                client->close(ignored);
-            });
+        send_socks5_error(client, SOCKS5_REPLY_GENERAL_FAILURE, [client] {
+            std::error_code ignored;
+            client->close(ignored);
+        });
         return;
     }
     // The ticket's deleter holds shared ownership of the counter itself, not a
     // pointer into the client object, so the decrement stays safe even if the
     // session is destroyed after the client (io_context teardown order is
     // unspecified).
-    auto session_ticket = std::shared_ptr<void>(
-        nullptr, [counter = active_sessions_](void*) {
-            counter->fetch_sub(1, std::memory_order_relaxed);
-        });
+    auto session_ticket = std::shared_ptr<void>(nullptr, [counter = active_sessions_](void*) {
+        counter->fetch_sub(1, std::memory_order_relaxed);
+    });
 
     // Non-throwing overload: a local app that connects and immediately resets
     // the connection can make remote_endpoint() fail. The throwing overload
@@ -389,8 +389,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     std::error_code peer_ec;
     const auto peer_ep = client->remote_endpoint(peer_ec);
     if (peer_ec) {
-        LOG_INFO("client", "new connection (peer endpoint unavailable: " +
-                 peer_ec.message() + ")");
+        LOG_INFO("client", "new connection (peer endpoint unavailable: " + peer_ec.message() + ")");
     } else {
         LOG_INFO("client", fmt::format("new connection from {}:{}", peer_ep.address().to_string(),
                                        peer_ep.port()));
@@ -428,8 +427,7 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         session = std::make_shared<KCPClientSession>(io_, server_endpoint_, crypto, KCP_CONV, fec_,
                                                      adaptive_hooks());
     } catch (const std::exception& e) {
-        LOG_ERROR("client", std::string("session setup failed, closing connection: ") +
-                  e.what());
+        LOG_ERROR("client", std::string("session setup failed, closing connection: ") + e.what());
         std::error_code ignored;
         client->close(ignored);
         return;
@@ -448,44 +446,45 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
     auto self = shared_from_this();
 
     // Cancel handshake on timeout.
-    handshake_deadline->async_wait(
-        [self, client, session, handshake_cancelled](const std::error_code& ec) {
-            if (ec == asio::error::operation_aborted) return;
-            if (handshake_cancelled->exchange(true)) return;
-            // Name the stage. A bare "SOCKS5 handshake timeout" read identically
-            // whether the KCP handshake never completed (wrong key / firewall /
-            // server down) or the tunnel came up and the local SOCKS5 handshake
-            // stalled -- two different fixes. AGENTS.md §4: a failure line must
-            // say which half failed, and never imply the remote is reachable.
-            //
-            // Exactly two states are observable when this 30s deadline fires:
-            // connected_ is set by the handler that receives
-            // KCP_PROXY_HELLO_ACK (see on_connect), so there is no third
-            // "ACK pending" state -- an earlier revision printed one
-            // (KCP_HANDSHAKE_ACK_PENDING), which was unreachable and mislabelled
-            // this case as an ACK problem. Note also that a dead server or a
-            // wrong key is normally caught by the 3s KCP handshake timer, which
-            // aborts the connection (and cancels this deadline) long before it
-            // fires; REMOTE_REACHABLE=false here is therefore the exception, not
-            // the common case.
-            const bool tunnel_up = session->is_connected();
-            const char* stage = tunnel_up ? "SOCKS5_HANDSHAKE" : "KCP_HANDSHAKE";
-            LOG_WARNING("client", fmt::format(
-                "FAIL_STAGE=SOCKS5_HANDSHAKE_TIMEOUT DETAIL={} REMOTE_REACHABLE={}"
-                " timeout={}s",
-                stage, tunnel_up ? "true" : "false", SOCKS5_HANDSHAKE_TIMEOUT_SEC));
-            // Same RST reasoning as abort_handshake: if an error reply is in
-            // flight when the deadline fires, a plain close() would discard
-            // it. self is captured (not this) because the timer can outlive
-            // the call that armed it.
-            self->close_local_socket(client);
-            session->close();
-        });
+    handshake_deadline->async_wait([self, client, session,
+                                    handshake_cancelled](const std::error_code& ec) {
+        if (ec == asio::error::operation_aborted) return;
+        if (handshake_cancelled->exchange(true)) return;
+        // Name the stage. A bare "SOCKS5 handshake timeout" read identically
+        // whether the KCP handshake never completed (wrong key / firewall /
+        // server down) or the tunnel came up and the local SOCKS5 handshake
+        // stalled -- two different fixes. AGENTS.md §4: a failure line must
+        // say which half failed, and never imply the remote is reachable.
+        //
+        // Exactly two states are observable when this 30s deadline fires:
+        // connected_ is set by the handler that receives
+        // KCP_PROXY_HELLO_ACK (see on_connect), so there is no third
+        // "ACK pending" state -- an earlier revision printed one
+        // (KCP_HANDSHAKE_ACK_PENDING), which was unreachable and mislabelled
+        // this case as an ACK problem. Note also that a dead server or a
+        // wrong key is normally caught by the 3s KCP handshake timer, which
+        // aborts the connection (and cancels this deadline) long before it
+        // fires; REMOTE_REACHABLE=false here is therefore the exception, not
+        // the common case.
+        const bool tunnel_up = session->is_connected();
+        const char* stage = tunnel_up ? "SOCKS5_HANDSHAKE" : "KCP_HANDSHAKE";
+        LOG_WARNING("client",
+                    fmt::format("FAIL_STAGE=SOCKS5_HANDSHAKE_TIMEOUT DETAIL={} REMOTE_REACHABLE={}"
+                                " timeout={}s",
+                                stage, tunnel_up ? "true" : "false", SOCKS5_HANDSHAKE_TIMEOUT_SEC));
+        // Same RST reasoning as abort_handshake: if an error reply is in
+        // flight when the deadline fires, a plain close() would discard
+        // it. self is captured (not this) because the timer can outlive
+        // the call that armed it.
+        self->close_local_socket(client);
+        session->close();
+    });
 
     LOG_INFO("client",
              fmt::format("connecting KCP session to {}:{}", server_endpoint_.address().to_string(),
                          server_endpoint_.port()));
-    session->connect([this, self, client, session, handshake_deadline, handshake_cancelled](bool ok) {
+    session->connect([this, self, client, session, handshake_deadline,
+                      handshake_cancelled](bool ok) {
         if (handshake_cancelled->load()) return;
         if (!ok) {
             LOG_ERROR("client", "KCP connect failed");
@@ -495,9 +494,10 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
         LOG_INFO("client", "KCP session connected, reading SOCKS5 greeting");
 
         auto greet_buf = std::make_shared<std::array<uint8_t, 2>>();
-        asio::async_read(*client, asio::buffer(*greet_buf),
-            [this, client, session, greet_buf, handshake_deadline, handshake_cancelled, self]
-            (const std::error_code& ec, size_t) {
+        asio::async_read(
+            *client, asio::buffer(*greet_buf),
+            [this, client, session, greet_buf, handshake_deadline, handshake_cancelled, self](
+                const std::error_code& ec, size_t) {
                 if (handshake_cancelled->load()) return;
                 if (ec) {
                     LOG_DEBUG("client", "read greet header error (" + sock_err(ec) + ")");
@@ -516,9 +516,11 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                     (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
-                        [this, self, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
-                            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
-                        });
+                                      [this, self, client, session, ver_resp, handshake_deadline,
+                                       handshake_cancelled](const std::error_code&, size_t) {
+                                          abort_handshake(client, session, handshake_deadline,
+                                                          handshake_cancelled);
+                                      });
                     return;
                 }
 
@@ -531,20 +533,24 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                     (*ver_resp)[0] = SOCKS5_VERSION;
                     (*ver_resp)[1] = SOCKS5_AUTH_NO_ACCEPTABLE;
                     asio::async_write(*client, asio::buffer(*ver_resp),
-                        [this, self, client, session, ver_resp, handshake_deadline, handshake_cancelled](const std::error_code&, size_t) {
-                            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
-                        });
+                                      [this, self, client, session, ver_resp, handshake_deadline,
+                                       handshake_cancelled](const std::error_code&, size_t) {
+                                          abort_handshake(client, session, handshake_deadline,
+                                                          handshake_cancelled);
+                                      });
                     return;
                 }
 
                 auto methods_buf = std::make_shared<std::vector<uint8_t>>(nmethods);
-                asio::async_read(*client, asio::buffer(*methods_buf),
-                    [this, client, session, methods_buf, handshake_deadline, handshake_cancelled, self]
-                    (const std::error_code& ec2, size_t) {
+                asio::async_read(
+                    *client, asio::buffer(*methods_buf),
+                    [this, client, session, methods_buf, handshake_deadline, handshake_cancelled,
+                     self](const std::error_code& ec2, size_t) {
                         if (handshake_cancelled->load()) return;
                         if (ec2) {
                             LOG_DEBUG("client", "read methods error (" + sock_err(ec2) + ")");
-                            abort_handshake(client, session, handshake_deadline, handshake_cancelled);
+                            abort_handshake(client, session, handshake_deadline,
+                                            handshake_cancelled);
                             return;
                         }
 
@@ -553,46 +559,57 @@ void KCPProxyClient::handle_client_connection(asio::ip::tcp::socket client_socke
                         // and close.
                         bool no_auth_offered = false;
                         for (uint8_t m : *methods_buf) {
-                            if (m == SOCKS5_AUTH_NONE) { no_auth_offered = true; break; }
+                            if (m == SOCKS5_AUTH_NONE) {
+                                no_auth_offered = true;
+                                break;
+                            }
                         }
 
-                        LOG_INFO("client", std::string("sending SOCKS5 greeting response (") +
-                                 (no_auth_offered ? "no auth" : "no acceptable methods") + ")");
+                        LOG_INFO("client",
+                                 std::string("sending SOCKS5 greeting response (") +
+                                     (no_auth_offered ? "no auth" : "no acceptable methods") + ")");
                         auto resp_buf = std::make_shared<std::array<uint8_t, 2>>();
                         (*resp_buf)[0] = SOCKS5_VERSION;
-                        (*resp_buf)[1] = no_auth_offered ? SOCKS5_AUTH_NONE
-                                                         : SOCKS5_AUTH_NO_ACCEPTABLE;
-                        asio::async_write(*client, asio::buffer(*resp_buf),
-                            [this, client, session, resp_buf, handshake_deadline, handshake_cancelled, self, no_auth_offered]
-                            (const std::error_code& ec3, size_t) {
+                        (*resp_buf)[1] =
+                            no_auth_offered ? SOCKS5_AUTH_NONE : SOCKS5_AUTH_NO_ACCEPTABLE;
+                        asio::async_write(
+                            *client, asio::buffer(*resp_buf),
+                            [this, client, session, resp_buf, handshake_deadline,
+                             handshake_cancelled, self,
+                             no_auth_offered](const std::error_code& ec3, size_t) {
                                 if (handshake_cancelled->load()) return;
                                 if (ec3) {
-                                    LOG_DEBUG("client", "send greeting error (" + sock_err(ec3) + ")");
-                                    abort_handshake(client, session, handshake_deadline, handshake_cancelled);
+                                    LOG_DEBUG("client",
+                                              "send greeting error (" + sock_err(ec3) + ")");
+                                    abort_handshake(client, session, handshake_deadline,
+                                                    handshake_cancelled);
                                     return;
                                 }
                                 if (!no_auth_offered) {
-                                    LOG_WARNING("client", "client offered no usable auth method, closing");
-                                    abort_handshake(client, session, handshake_deadline, handshake_cancelled);
+                                    LOG_WARNING("client",
+                                                "client offered no usable auth method, closing");
+                                    abort_handshake(client, session, handshake_deadline,
+                                                    handshake_cancelled);
                                     return;
                                 }
-                                read_socks5_request(client, session, handshake_deadline, handshake_cancelled);
+                                read_socks5_request(client, session, handshake_deadline,
+                                                    handshake_cancelled);
                             });
                     });
             });
     });
 }
 
-void KCPProxyClient::read_socks5_request(
-    std::shared_ptr<asio::ip::tcp::socket> client_socket,
-    std::shared_ptr<KCPClientSession> session,
-    std::shared_ptr<asio::steady_timer> handshake_deadline,
-    std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
-
+void KCPProxyClient::read_socks5_request(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                         std::shared_ptr<KCPClientSession> session,
+                                         std::shared_ptr<asio::steady_timer> handshake_deadline,
+                                         std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
     auto header = std::make_shared<std::array<uint8_t, 4>>();
     auto self = shared_from_this();
-    asio::async_read(*client_socket, asio::buffer(*header),
-        [this, client_socket, session, header, handshake_deadline, handshake_cancelled, self](const std::error_code& ec, size_t) {
+    asio::async_read(
+        *client_socket, asio::buffer(*header),
+        [this, client_socket, session, header, handshake_deadline, handshake_cancelled, self](
+            const std::error_code& ec, size_t) {
             if (handshake_cancelled->load()) return;
             if (ec) {
                 LOG_DEBUG("client", "read request header error (" + sock_err(ec) + ")");
@@ -610,9 +627,11 @@ void KCPProxyClient::read_socks5_request(
                 LOG_ERROR("client", fmt::format("bad version: {}", version));
                 // RFC 1928 expects an error reply, not a bare EOF: the local
                 // app could not otherwise tell its own bug from a dead proxy.
-                send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
+                send_socks5_error(
+                    client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
                     [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
-                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                        abort_handshake(client_socket, session, handshake_deadline,
+                                        handshake_cancelled);
                     });
                 return;
             }
@@ -621,9 +640,11 @@ void KCPProxyClient::read_socks5_request(
             // local app is a malformed request, not an extension we understand.
             if ((*header)[2] != 0x00) {
                 LOG_ERROR("client", fmt::format("bad RSV in SOCKS5 request: {}", (*header)[2]));
-                send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
+                send_socks5_error(
+                    client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
                     [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
-                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                        abort_handshake(client_socket, session, handshake_deadline,
+                                        handshake_cancelled);
                     });
                 return;
             }
@@ -632,26 +653,33 @@ void KCPProxyClient::read_socks5_request(
             // so we can call parse_address() uniformly. For domain, read only
             // the length byte first since the domain name is variable-length.
             size_t addr_bytes = 0;
-            if (atyp == SOCKS5_ATYP_IPV4) addr_bytes = 6;
-            else if (atyp == SOCKS5_ATYP_DOMAIN) addr_bytes = 1;
-            else if (atyp == SOCKS5_ATYP_IPV6) addr_bytes = 18;
+            if (atyp == SOCKS5_ATYP_IPV4)
+                addr_bytes = 6;
+            else if (atyp == SOCKS5_ATYP_DOMAIN)
+                addr_bytes = 1;
+            else if (atyp == SOCKS5_ATYP_IPV6)
+                addr_bytes = 18;
             else {
                 LOG_ERROR("client", fmt::format("bad atyp: {}", atyp));
-                send_socks5_error(client_socket, SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED,
+                send_socks5_error(
+                    client_socket, SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED,
                     [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
-                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                        abort_handshake(client_socket, session, handshake_deadline,
+                                        handshake_cancelled);
                     });
                 return;
             }
 
             auto addr_buf = std::make_shared<std::vector<uint8_t>>(addr_bytes);
-            asio::async_read(*client_socket, asio::buffer(*addr_buf),
-                [this, client_socket, session, cmd, atyp, addr_buf, handshake_deadline, handshake_cancelled, self]
-                (const std::error_code& ec2, size_t) {
+            asio::async_read(
+                *client_socket, asio::buffer(*addr_buf),
+                [this, client_socket, session, cmd, atyp, addr_buf, handshake_deadline,
+                 handshake_cancelled, self](const std::error_code& ec2, size_t) {
                     if (handshake_cancelled->load()) return;
                     if (ec2) {
                         LOG_DEBUG("client", "read addr error (" + sock_err(ec2) + ")");
-                        abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                        abort_handshake(client_socket, session, handshake_deadline,
+                                        handshake_cancelled);
                         return;
                     }
 
@@ -670,19 +698,26 @@ void KCPProxyClient::read_socks5_request(
                             // Same RFC 1928 contract as the other malformed
                             // request paths: an error reply, not a bare EOF.
                             send_socks5_error(client_socket, SOCKS5_REPLY_GENERAL_FAILURE,
-                                [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
-                                    abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
-                                });
+                                              [this, self, client_socket, session,
+                                               handshake_deadline, handshake_cancelled] {
+                                                  abort_handshake(client_socket, session,
+                                                                  handshake_deadline,
+                                                                  handshake_cancelled);
+                                              });
                             return;
                         }
                         auto domain_buf = std::make_shared<std::vector<uint8_t>>(dlen + 2);
-                        asio::async_read(*client_socket, asio::buffer(*domain_buf),
-                            [this, client_socket, session, cmd, domain_buf, dlen, handshake_deadline, handshake_cancelled, self]
-                            (const std::error_code& ec3, size_t) {
+                        asio::async_read(
+                            *client_socket, asio::buffer(*domain_buf),
+                            [this, client_socket, session, cmd, domain_buf, dlen,
+                             handshake_deadline, handshake_cancelled,
+                             self](const std::error_code& ec3, size_t) {
                                 if (handshake_cancelled->load()) return;
                                 if (ec3) {
-                                    LOG_DEBUG("client", "read domain error (" + sock_err(ec3) + ")");
-                                    abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
+                                    LOG_DEBUG("client",
+                                              "read domain error (" + sock_err(ec3) + ")");
+                                    abort_handshake(client_socket, session, handshake_deadline,
+                                                    handshake_cancelled);
                                     return;
                                 }
                                 std::string h(domain_buf->data(), domain_buf->data() + dlen);
@@ -696,13 +731,11 @@ void KCPProxyClient::read_socks5_request(
         });
 }
 
-void KCPProxyClient::handle_sync_request(
-    std::shared_ptr<asio::ip::tcp::socket> client_socket,
-    std::shared_ptr<KCPClientSession> session,
-    uint8_t cmd, const std::string& host, uint16_t port,
-    std::shared_ptr<asio::steady_timer> handshake_deadline,
-    std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
-
+void KCPProxyClient::handle_sync_request(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                         std::shared_ptr<KCPClientSession> session, uint8_t cmd,
+                                         const std::string& host, uint16_t port,
+                                         std::shared_ptr<asio::steady_timer> handshake_deadline,
+                                         std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
     // Every completion below must hold a strong ref: the on_complete closures
     // run inside send_socks5_error's write handler, which otherwise keeps no
     // owner alive for the object whose member function it invokes.
@@ -713,7 +746,8 @@ void KCPProxyClient::handle_sync_request(
         // The deadline stays armed while the error reply is in flight: if the
         // local app stops reading, the reply write can stall forever, and the
         // deadline is what closes the session in that case.
-        send_socks5_error(client_socket, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED,
+        send_socks5_error(
+            client_socket, SOCKS5_REPLY_COMMAND_NOT_SUPPORTED,
             [this, self, client_socket, session, handshake_deadline, handshake_cancelled] {
                 abort_handshake(client_socket, session, handshake_deadline, handshake_cancelled);
             });
@@ -1062,19 +1096,16 @@ void KCPProxyClient::forward_client_to_kcp(std::shared_ptr<asio::ip::tcp::socket
         }));
 }
 
-void KCPProxyClient::forward_kcp_to_client(
-    std::shared_ptr<asio::ip::tcp::socket> client_socket,
-    std::shared_ptr<KCPClientSession> session,
-    std::shared_ptr<std::vector<uint8_t>> buf,
-    std::shared_ptr<HalfCloseGuard> guard,
-    bool fin_check) {
-
+void KCPProxyClient::forward_kcp_to_client(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                           std::shared_ptr<KCPClientSession> session,
+                                           std::shared_ptr<std::vector<uint8_t>> buf,
+                                           std::shared_ptr<HalfCloseGuard> guard, bool fin_check) {
     if (!session->strand().running_in_this_thread()) {
         auto self = shared_from_this();
-        asio::dispatch(session->strand(), [this, self, client_socket, session, buf, guard,
-                                           fin_check]() mutable {
-            forward_kcp_to_client(client_socket, session, buf, guard, fin_check);
-        });
+        asio::dispatch(session->strand(),
+                       [this, self, client_socket, session, buf, guard, fin_check]() mutable {
+                           forward_kcp_to_client(client_socket, session, buf, guard, fin_check);
+                       });
         return;
     }
     if (!buf) buf = std::make_shared<std::vector<uint8_t>>(FWD_BUF_SIZE);
@@ -1212,10 +1243,9 @@ void KCPProxyClient::handle_server_fin(std::shared_ptr<asio::ip::tcp::socket> cl
 // --------------------------------------------------------------------------- //
 // half-close reclamation
 // --------------------------------------------------------------------------- //
-void KCPProxyClient::arm_half_close_grace(
-    const std::shared_ptr<HalfCloseGuard>& guard,
-    std::shared_ptr<asio::ip::tcp::socket> client_socket,
-    std::shared_ptr<KCPClientSession> session) {
+void KCPProxyClient::arm_half_close_grace(const std::shared_ptr<HalfCloseGuard>& guard,
+                                          std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                          std::shared_ptr<KCPClientSession> session) {
     if (!guard) return;
 
     guard->app_eof.store(true);
@@ -1254,10 +1284,9 @@ void KCPProxyClient::arm_half_close_grace(
         });
 }
 
-void KCPProxyClient::on_half_close_check(
-    std::shared_ptr<HalfCloseGuard> guard,
-    std::shared_ptr<asio::ip::tcp::socket> client_socket,
-    std::shared_ptr<KCPClientSession> session) {
+void KCPProxyClient::on_half_close_check(std::shared_ptr<HalfCloseGuard> guard,
+                                         std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                         std::shared_ptr<KCPClientSession> session) {
     if (!guard->app_eof.load()) return;
     // The tunnel may have ended normally (target closed, KCP EOF, write error)
     // between the arm and this tick; there is nothing left to reclaim then.
@@ -1288,19 +1317,19 @@ void KCPProxyClient::on_half_close_check(
     if (session) session->close();
 }
 
-void KCPProxyClient::send_socks5_error(
-    std::shared_ptr<asio::ip::tcp::socket> client_socket, uint8_t reply,
-    std::function<void()> on_complete) {
+void KCPProxyClient::send_socks5_error(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                       uint8_t reply, std::function<void()> on_complete) {
     LOG_WARNING("client", fmt::format("sending SOCKS5 error reply: {}", reply));
     SOCKS5Response resp;
     resp.reply = reply;
     auto data = std::make_shared<std::vector<uint8_t>>(resp.build());
     asio::async_write(*client_socket, asio::buffer(*data),
-        [client_socket, data, on_complete = std::move(on_complete)](const std::error_code&, size_t) {
-            // Best-effort reply: whatever the write outcome, the caller's
-            // cleanup callback must run so the session is always released.
-            if (on_complete) on_complete();
-        });
+                      [client_socket, data, on_complete = std::move(on_complete)](
+                          const std::error_code&, size_t) {
+                          // Best-effort reply: whatever the write outcome, the caller's
+                          // cleanup callback must run so the session is always released.
+                          if (on_complete) on_complete();
+                      });
 }
 
 void KCPProxyClient::log_non_socks5_client(uint8_t first, uint8_t second) {
@@ -1317,8 +1346,8 @@ void KCPProxyClient::log_non_socks5_client(uint8_t first, uint8_t second) {
         // A wildcard bind is not dialable, and the local application reaches
         // this listener over loopback anyway, so name loopback in the advice.
         const std::string host = (listen_host_.empty() || listen_host_ == "0.0.0.0")
-            ? std::string("127.0.0.1")
-            : listen_host_;
+                                     ? std::string("127.0.0.1")
+                                     : listen_host_;
         LOG_ERROR("client",
                   fmt::format("non-SOCKS5 client opened with {}"
                               " -- that is an HTTP proxy request, but this port is "
@@ -1332,8 +1361,7 @@ void KCPProxyClient::log_non_socks5_client(uint8_t first, uint8_t second) {
                                     greeting_preview(first, second), count));
 }
 
-void KCPProxyClient::close_local_socket(
-    const std::shared_ptr<asio::ip::tcp::socket>& sock) {
+void KCPProxyClient::close_local_socket(const std::shared_ptr<asio::ip::tcp::socket>& sock) {
     if (!sock || !sock->is_open()) return;
     std::error_code ec;
 
@@ -1361,8 +1389,8 @@ void KCPProxyClient::close_local_socket(
         const size_t avail = sock->available(ec);
         if (ec || avail == 0) break;
         ec.clear();
-        const size_t got = sock->read_some(
-            asio::buffer(scratch.data(), std::min(avail, scratch.size())), ec);
+        const size_t got =
+            sock->read_some(asio::buffer(scratch.data(), std::min(avail, scratch.size())), ec);
         if (ec || got == 0) break;
         drained += got;
     }
@@ -1382,11 +1410,10 @@ void KCPProxyClient::close_local_socket(
     sock->close(ec);
 }
 
-void KCPProxyClient::abort_handshake(
-    std::shared_ptr<asio::ip::tcp::socket> client_socket,
-    std::shared_ptr<KCPClientSession> session,
-    std::shared_ptr<asio::steady_timer> handshake_deadline,
-    std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
+void KCPProxyClient::abort_handshake(std::shared_ptr<asio::ip::tcp::socket> client_socket,
+                                     std::shared_ptr<KCPClientSession> session,
+                                     std::shared_ptr<asio::steady_timer> handshake_deadline,
+                                     std::shared_ptr<std::atomic<bool>> handshake_cancelled) {
     // Idempotent: several failure paths can converge here (e.g. the deadline
     // fired while an error reply was still being written). The loser of the
     // cancelled-flag race returns immediately. Mark cancelled first so

@@ -20,14 +20,14 @@ namespace kcp_proxy {
 // UDP reordering, not a fault) apart from an AEAD authentication failure
 // (corrupted data or wrong key). No more string-matching exception messages.
 namespace crypto_errors {
-    enum class errc {
-        ok = 0,
-        replay,      // counter rejected by the replay window (normal reordering)
-        auth_failed, // AEAD tag verification failed (corrupted / wrong key)
-    };
-    const std::error_category& category();
-    std::error_code make_error_code(errc e);
-}
+enum class errc {
+    ok = 0,
+    replay,      // counter rejected by the replay window (normal reordering)
+    auth_failed, // AEAD tag verification failed (corrupted / wrong key)
+};
+const std::error_category& category();
+std::error_code make_error_code(errc e);
+} // namespace crypto_errors
 
 // RAII wrapper for OpenSSL EVP context
 class EVPContext {
@@ -40,7 +40,9 @@ public:
     EVPContext(EVPContext&&) = delete;
     EVPContext& operator=(EVPContext&&) = delete;
 
-    operator evp_cipher_ctx_st*() { return ctx_; }
+    operator evp_cipher_ctx_st*() {
+        return ctx_;
+    }
 
 private:
     evp_cipher_ctx_st* ctx_;
@@ -57,7 +59,9 @@ public:
         std::vector<uint8_t> data;
         std::error_code ec;
 
-        explicit operator bool() const { return !ec; }
+        explicit operator bool() const {
+            return !ec;
+        }
     };
 
     // Server mode: bypass replay window for the *first* decrypted packet only
@@ -116,7 +120,9 @@ public:
     // carried in cleartext on every wire datagram), but unique per session.
     // Used to scope the application-layer keepalive sentinel so a real 22-byte
     // payload can never collide with it (see KcpTunnel::is_keepalive).
-    byte_view session_salt() const { return byte_view(session_salt_.data(), session_salt_.size()); }
+    byte_view session_salt() const {
+        return byte_view(session_salt_.data(), session_salt_.size());
+    }
 
 private:
     static std::array<uint8_t, NONCE_SIZE> generate_nonce(uint64_t counter, uint8_t direction);
@@ -147,10 +153,8 @@ private:
     void forget_learned_salt();
 
     // HKDF-Expand for SHA-256 producing exactly OKM_LEN bytes.
-    static void hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
-                            const uint8_t* salt, size_t salt_len,
-                            std::string_view info,
-                            uint8_t* okm, size_t okm_len);
+    static void hkdf_sha256(const uint8_t* ikm, size_t ikm_len, const uint8_t* salt,
+                            size_t salt_len, std::string_view info, uint8_t* okm, size_t okm_len);
 
     // Core encrypt/decrypt: write the wire format into `out` (resized).
     // Returns an empty error_code on success.
@@ -162,8 +166,8 @@ private:
     alignas(64) std::array<uint8_t, AES_KEY_SIZE> decrypt_key_{};
     uint8_t local_direction_;
     uint8_t peer_direction_;
-    bool server_mode_;  // In server mode, skip replay check for first packet only.
-    std::string key_;   // PSK, retained until derive_session_keys; then wiped.
+    bool server_mode_; // In server mode, skip replay check for first packet only.
+    std::string key_;  // PSK, retained until derive_session_keys; then wiped.
 
     std::atomic<uint64_t> encrypt_counter_{0};
 
